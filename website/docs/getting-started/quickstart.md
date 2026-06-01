@@ -102,6 +102,16 @@ hermes setup --portal
 That logs you in, sets Nous as your provider, and turns on the Tool Gateway in one command.
 :::
 
+:::info Setup modes
+On a fresh install, `hermes setup` offers three modes:
+
+- **Quick Setup (Nous Portal)** — free OAuth login, no API keys; sets up a model plus the Tool Gateway tools. The recommended fast path.
+- **Full Setup** — walk through every provider, tool, and option yourself (bring your own keys).
+- **Blank Slate** — everything starts **off** except the bare minimum needed to run an agent: **provider & model, the File Operations toolset, and the Terminal toolset**. No web, browser, code execution, vision, memory, delegation, cron, skills, plugins, or MCP servers — and compression, checkpoints, smart routing, and memory capture are all disabled. The wizard then walks you through opting each capability back in. Pick this when you want a minimal, fully-controlled agent and intend to enable only exactly what you need.
+
+Blank Slate writes an explicit `platform_toolsets.cli` list plus `agent.disabled_toolsets`, so nothing you didn't choose ever loads — not even after `hermes update`. Re-enable anything later with `hermes tools`, seed skills with `hermes skills opt-in --sync`, or tune settings with `hermes setup agent`.
+:::
+
 Good defaults:
 
 | Provider | What it is | How to set up |
