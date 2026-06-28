@@ -2107,6 +2107,53 @@ def _run_browser_command(
             proc.wait()
             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                            command, timeout, task_id, task_socket_dir)
+
+            # Clean up daemon + socket dir on timeout so the next browser call
+            # starts fresh instead of connecting to a hung daemon (which would
+            # cascade into another timeout).  Cloud-mode sessions have no local
+            # daemon so we skip this entirely.
+            if not session_info.get("cdp_url"):
+                # Clear recording state without talking to the hung daemon
+                with _cleanup_lock:
+                    _recording_sessions.discard(task_id)
+
+                # Expand session keys — may include a hybrid-routing sidecar
+                session_keys = [task_id]
+                sidecar_key = f"{task_id}{_LOCAL_SUFFIX}"
+                if sidecar_key in _active_sessions:
+                    session_keys.append(sidecar_key)
+
+                # Cleanup each key; wrap in try/except so a failure on one
+                # key doesn't prevent cleanup of the next or the final pop.
+                for sk in session_keys:
+                    try:
+                        _stop_cdp_supervisor(sk)
+                        with _cleanup_lock:
+                            sinfo = _active_sessions.get(sk)
+                        if sinfo:
+                            sname = sinfo.get("session_name", "")
+                            if sname:
+                                sdir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{sname}")
+                                if os.path.isdir(sdir):
+                                    pid_file = os.path.join(sdir, f"{sname}.pid")
+                                    if os.path.isfile(pid_file):
+                                        try:
+                                            from tools.process_registry import ProcessRegistry
+                                            daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+                                            ProcessRegistry._terminate_host_pid(daemon_pid)
+                                            logger.debug("Killed daemon pid %s for %s", daemon_pid, sname)
+                                        except (ProcessLookupError, ValueError, PermissionError, OSError) as e:
+                                            logger.warning("Could not kill daemon for %s: %s", sname, e)
+                                    shutil.rmtree(sdir, ignore_errors=True)
+                        with _cleanup_lock:
+                            _active_sessions.pop(sk, None)
+                            _session_last_activity.pop(sk, None)
+                    except Exception as e:
+                        logger.warning("Error during browser session cleanup for %s: %s", sk, e)
+
+                # Clear the last-active key to prevent stale lookups
+                _last_active_session_key.pop(task_id, None)
+
             result = {"success": False, "error": f"Command timed out after {timeout} seconds"}
             # Fall through to fallback check below
         else:
