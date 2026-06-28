@@ -390,10 +390,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
 
+    _PART_SEP = "\n\n══════════════════════════════════════════════════════════════════\n\n"
     return {
-        "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
-        "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
-        "volatile": "\n\n".join(p.strip() for p in volatile_parts if p and p.strip()),
+        "stable":   _PART_SEP.join(p.strip() for p in stable_parts   if p and p.strip()),
+        "context":  _PART_SEP.join(p.strip() for p in context_parts  if p and p.strip()),
+        "volatile": _PART_SEP.join(p.strip() for p in volatile_parts if p and p.strip()),
     }
 
 
