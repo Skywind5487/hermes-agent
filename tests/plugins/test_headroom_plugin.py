@@ -115,11 +115,11 @@ def test_allowlisted_search_files_compression_shape_when_enabled(monkeypatch):
     assert data["_headroom"]["compressed"] is True
     assert data["_headroom"]["tool"] == "search_files"
     assert data["_headroom"]["scope"]["session_id"] == "session-1"
-    assert data["_headroom"]["retrieval"] == {
-        "available": False,
-        "reason": "raw_storage_not_enabled_phase1",
-    }
-    assert "handle" not in data["_headroom"]["retrieval"]
+    assert data["_headroom"]["retrieval"]["available"] is True
+    assert isinstance(data["_headroom"]["retrieval"]["handle"], str)
+    assert len(data["_headroom"]["retrieval"]["handle"]) == 24
+    assert data["_headroom"]["retrieval"]["version"] == "redacted"
+    assert data["_headroom"]["retrieval"]["reason"] == "stored_locally"
     assert data["kind"] == "matches"
     assert data["returned_count"] == 12
     assert data["omitted_count"] == 4
@@ -223,3 +223,45 @@ def test_kill_switch_forces_identity(monkeypatch):
     monkeypatch.setenv("HERMES_HEADROOM_DISABLE", "1")
 
     assert _transform("search_files", _search_result()) is None
+
+
+def test_retrieve_valid_hash_roundtrip(monkeypatch):
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+    out = _transform("search_files", _search_result(count=12))
+    data = json.loads(out)
+    handle = data["_headroom"]["retrieval"]["handle"]
+    assert isinstance(handle, str)
+
+    ret = headroom._retrieve_original({"hash": handle})
+    rd = json.loads(ret)
+    assert rd["success"] is True
+    assert "total_count" in rd["content"]
+
+
+def test_retrieve_nonexistent_hash(monkeypatch):
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+    ret = headroom._retrieve_original({"hash": "nonexistent00000000"})
+    rd = json.loads(ret)
+    assert rd == {"success": False, "error": "content not found (may have expired)"}
+
+
+def test_retrieve_empty_hash(monkeypatch):
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+    ret = headroom._retrieve_original({"hash": ""})
+    rd = json.loads(ret)
+    assert rd == {"success": False, "error": "missing or invalid hash parameter"}
+
+
+def test_retrieve_missing_args(monkeypatch):
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+    ret = headroom._retrieve_original({})
+    rd = json.loads(ret)
+    assert rd == {"success": False, "error": "missing or invalid hash parameter"}
+
+
+def test_retrieve_store_unavailable(monkeypatch):
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+    monkeypatch.setattr(headroom, "_get_store", lambda: None)
+    ret = headroom._retrieve_original({"hash": "anything"})
+    rd = json.loads(ret)
+    assert rd == {"success": False, "error": "retrieval store unavailable"}

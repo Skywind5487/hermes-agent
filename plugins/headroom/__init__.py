@@ -1,20 +1,24 @@
-"""Headroom Phase 1 structured tool-result compression experiment.
+"""Headroom Phase 1 structured tool-result compression with retrieval support.
 
 The plugin is bundled but inert unless explicitly enabled. It uses the
 ``transform_tool_result`` hook so the core dispatch path stays untouched.
 
-Phase 1 intentionally does not persist raw tool output. That avoids creating
-retrieval handles until the storage and access story is proven. Compressed
-payloads still include an explicit retrieval-unavailable marker so downstream
-tests and callers do not infer a missing raw handle.
+Phase 1 compresses selected large tool results (search_files, browser_snapshot)
+and persists the redacted content in an in-memory CompressionStore (InMemoryBackend).
+Compressed payloads include a retrieval handle (24-char SHA-256[:24] hash) that the
+LLM can use with the ``headroom_retrieve`` tool to fetch the full original content.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA_VERSION = "hermes.headroom.phase1.v1"
@@ -33,6 +37,51 @@ _EXCLUDED_TOOLS = frozenset({
 })
 _DEFAULT_ALLOWLIST = tuple(sorted(_ALLOWED_TOOLS))
 _UNTRUSTED_CLOSE = "</untrusted_tool_result>"
+
+_store_instance = None
+_store_lock = threading.Lock()
+
+
+def _get_store():
+    global _store_instance
+    if _store_instance is not None:
+        return _store_instance
+    with _store_lock:
+        if _store_instance is None:
+            try:
+                from headroom.cache.compression_store import get_compression_store
+
+                _store_instance = get_compression_store()
+            except Exception:
+                logger.warning("headroom compression store unavailable", exc_info=True)
+                return None
+    return _store_instance
+
+
+def _store_for_retrieval(result: str, tool_name: str, **kwargs) -> Optional[str]:
+    store = _get_store()
+    if store is None:
+        return None
+    try:
+        return store.store(original=result, compressed="", tool_name=tool_name)
+    except Exception:
+        return None
+
+
+def _retrieve_original(args: dict, **kwargs) -> str:
+    hash_key = (args or {}).get("hash", "")
+    if not hash_key or not isinstance(hash_key, str):
+        return '{"success": false, "error": "missing or invalid hash parameter"}'
+    store = _get_store()
+    if store is None:
+        return '{"success": false, "error": "retrieval store unavailable"}'
+    try:
+        entry = store.retrieve(hash_key)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": f"retrieval failed: {exc}"})
+    if entry is None or entry.original_content is None:
+        return '{"success": false, "error": "content not found (may have expired)"}'
+    return json.dumps({"success": True, "content": entry.original_content})
 
 
 @dataclass(frozen=True)
@@ -391,6 +440,10 @@ def _compress_result(
     if payload is None:
         return None
 
+    retrieval_handle = _store_for_retrieval(
+        result=result, tool_name=tool_name, **hook_kwargs
+    )
+
     payload["_headroom"] = {
         "schema_version": SCHEMA_VERSION,
         "compressed": True,
@@ -399,8 +452,12 @@ def _compress_result(
         "redacted": had_redaction,
         "scope": _source_scope(**hook_kwargs),
         "retrieval": {
-            "available": False,
-            "reason": "raw_storage_not_enabled_phase1",
+            "available": retrieval_handle is not None,
+            "handle": retrieval_handle,
+            "version": "redacted",
+            "reason": (
+                "stored_locally" if retrieval_handle is not None else "storage_unavailable"
+            ),
         },
     }
     if parsed_result.suffix:
@@ -453,3 +510,31 @@ def _on_transform_tool_result(
 
 def register(ctx) -> None:
     ctx.register_hook("transform_tool_result", _on_transform_tool_result)
+
+    def _retrieval_tool_available() -> bool:
+        s = _settings()
+        if not s.enabled:
+            return False
+        if _get_store() is None:
+            return False
+        return True
+
+    ctx.register_tool(
+        name="headroom_retrieve",
+        toolset="headroom",
+        check_fn=_retrieval_tool_available,
+        schema={
+            "description": "Retrieve original content that was compressed by headroom. Pass the 24-char hex hash from _headroom.retrieval.handle to get back the full original tool output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hash": {
+                        "type": "string",
+                        "description": "24-char hex hash returned in _headroom.retrieval.handle from a compressed tool result",
+                    }
+                },
+                "required": ["hash"],
+            },
+        },
+        handler=_retrieve_original,
+    )
