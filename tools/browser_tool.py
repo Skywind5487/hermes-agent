@@ -2536,15 +2536,16 @@ def _run_browser_command(
                                         command,
                                     )
                                 shutil.rmtree(sdir, ignore_errors=True)
-                        with _cleanup_lock:
-                            _recording_sessions.discard(sk)
-                            _active_sessions.pop(sk, None)
-                            _session_last_activity.pop(sk, None)
                     except Exception as cleanup_err:
                         logger.warning(
                             "Error during browser session cleanup for %s: %s",
                             sk, cleanup_err,
                         )
+                    finally:
+                        with _cleanup_lock:
+                            _recording_sessions.discard(sk)
+                            _active_sessions.pop(sk, None)
+                            _session_last_activity.pop(sk, None)
                 # Last-active binding cleanup (bare task_id only)
                 _last_active_session_key.pop(task_id, None)
 

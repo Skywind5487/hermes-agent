@@ -627,13 +627,12 @@ class TestScenario9_CrashResilience:
             "Error during browser session cleanup for %s: %s", task_id, ANY
         )
 
-        # First key (test_task) was NOT popped because rmtree crashed inside the try block
-        # before _active_sessions.pop(sk) executed. Only the second key gets properly cleaned up.
-        assert task_id in bt._active_sessions  # crash prevented pop
-        assert local_key not in bt._active_sessions  # second key popped normally
+        # Both keys popped regardless of rmtree crash (finally guarantees dict cleanup)
+        assert task_id not in bt._active_sessions
+        assert local_key not in bt._active_sessions
 
-        # _session_last_activity: same story
-        assert task_id in bt._session_last_activity
+        # _session_last_activity: also cleaned by finally
+        assert task_id not in bt._session_last_activity
         assert local_key not in bt._session_last_activity
 
         # _last_active_session_key.pop still executed (it's outside the for loop)
@@ -711,8 +710,8 @@ class TestScenario10_SupervisorRaise:
         # Only one rmtree call (second key; first key crashed before reaching rmtree)
         assert mock_rmtree.call_count == 1
 
-        # First key NOT popped (exception jumped past pop), second key popped
-        assert task_id in bt._active_sessions
+        # Both keys popped regardless of crash (finally guarantees dict cleanup)
+        assert task_id not in bt._active_sessions
         assert local_key not in bt._active_sessions
 
         # _last_active_session_key.pop still executed
