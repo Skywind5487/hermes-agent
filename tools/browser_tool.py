@@ -279,6 +279,38 @@ def _get_command_timeout() -> int:
     return result
 
 
+# Whether to terminate the browser daemon + Chromium on timeout.  Lazy-cached
+# after the first read, following the same pattern as _get_command_timeout.
+_cached_terminate_daemon: Optional[bool] = None
+_terminate_daemon_resolved = False
+
+
+def _should_terminate_daemon_on_timeout() -> bool:
+    """Return True when ``browser.terminate_daemon_on_timeout`` is true in config.
+
+    When enabled, ``_run_browser_command`` kills the daemon process tree
+    (daemon + Chromium children) and cleans up the socket directory on
+    ``subprocess.TimeoutExpired``, preventing orphaned browser processes from
+    accumulating.  Defaults to ``False`` (only kill the CLI, leave the daemon).
+    """
+    global _cached_terminate_daemon, _terminate_daemon_resolved
+    if _terminate_daemon_resolved and _cached_terminate_daemon is not None:
+        return _cached_terminate_daemon
+
+    result = False
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        val = cfg_get(cfg, "browser", "terminate_daemon_on_timeout")
+        if val is not None:
+            result = bool(val)
+    except Exception as e:
+        logger.debug("Could not read terminate_daemon_on_timeout from config: %s", e)
+    _cached_terminate_daemon = result
+    _terminate_daemon_resolved = True
+    return result
+
+
 def _safe_command_timeout() -> int:
     """Like ``_get_command_timeout`` but guaranteed non-None.
 
@@ -2458,6 +2490,65 @@ def _run_browser_command(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+            # ── Daemon kill + cleanup (config-gated, local mode only) ──
+            if _should_terminate_daemon_on_timeout() and not session_info.get("cdp_url"):
+                # Expand session keys: include ::local sidecar if one exists
+                session_keys = [task_id]
+                sidecar_key = f"{task_id}{_LOCAL_SUFFIX}"
+                with _cleanup_lock:
+                    if sidecar_key in _active_sessions:
+                        session_keys.append(sidecar_key)
+
+                for sk in session_keys:
+                    try:
+                        _stop_cdp_supervisor(sk)
+                        with _cleanup_lock:
+                            sinfo = _active_sessions.get(sk)
+                        if sinfo:
+                            sname = sinfo.get("session_name", "")
+                            if sname:
+                                sdir = os.path.join(
+                                    _socket_safe_tmpdir(), f"agent-browser-{sname}"
+                                )
+                                pid_file = os.path.join(sdir, f"{sname}.pid")
+                                if os.path.isfile(pid_file):
+                                    try:
+                                        from tools.process_registry import ProcessRegistry
+                                        daemon_pid = int(
+                                            Path(pid_file).read_text(encoding="utf-8").strip()
+                                        )
+                                        ProcessRegistry._terminate_host_pid(daemon_pid)
+                                        logger.warning(
+                                            "browser '%s' timed out — daemon pid %d terminated",
+                                            command, daemon_pid,
+                                        )
+                                    except (ProcessLookupError, ValueError,
+                                            PermissionError, OSError) as _kill_err:
+                                        logger.warning(
+                                            "browser '%s' timed out — daemon kill skipped: %s",
+                                            command, _kill_err,
+                                        )
+                                else:
+                                    logger.warning(
+                                        "browser '%s' timed out — no pid file found "
+                                        "(daemon may already be dead)",
+                                        command,
+                                    )
+                                shutil.rmtree(sdir, ignore_errors=True)
+                    except Exception as cleanup_err:
+                        logger.warning(
+                            "Error during browser session cleanup for %s: %s",
+                            sk, cleanup_err,
+                        )
+                    finally:
+                        with _cleanup_lock:
+                            _recording_sessions.discard(sk)
+                            _active_sessions.pop(sk, None)
+                            _session_last_activity.pop(sk, None)
+                # Last-active binding cleanup (bare task_id only)
+                _last_active_session_key.pop(task_id, None)
+
             stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
             _unlink_command_output_files(stdout_path, stderr_path)
             if stderr and stderr.strip():
