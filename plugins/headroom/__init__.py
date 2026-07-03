@@ -524,13 +524,17 @@ def register(ctx) -> None:
         toolset="headroom",
         check_fn=_retrieval_tool_available,
         schema={
-            "properties": {
-                "hash": {
-                    "type": "string",
-                    "description": "24-char hex hash returned in _headroom.retrieval.handle",
-                }
+            "description": "Retrieve original content that was compressed by headroom. Pass the 24-char hex hash from _headroom.retrieval.handle to get back the full original tool output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hash": {
+                        "type": "string",
+                        "description": "24-char hex hash returned in _headroom.retrieval.handle from a compressed tool result",
+                    }
+                },
+                "required": ["hash"],
             },
-            "required": ["hash"],
         },
         handler=_retrieve_original,
     )
