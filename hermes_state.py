@@ -1410,6 +1410,7 @@ class SessionDB:
             self._conn.execute("PRAGMA cache_size=-64000")       # 64 MB page cache
             self._conn.execute("PRAGMA mmap_size=2147483648")     # 2 GB mmap (address space, not RAM)
             self._conn.execute("PRAGMA temp_store=MEMORY")        # temp tables/storage in memory
+            self._conn.execute("PRAGMA synchronous=OFF")          # 實驗性: e2-micro IO wait>90%, 略過 fsync 降低寫入鎖定時間
         except sqlite3.OperationalError as exc:
             logger.debug("read PRAGMAs not fully applied (read-only?): %s", exc)
 
