@@ -2004,6 +2004,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            _send_start = time.time()
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -2081,6 +2082,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                logger.info(
+                    "[%s] API delivered msg_id=%s to %s (%.1fs from send start, chunk %d/%d)",
+                    self.name, msg.id, thread_id or chat_id,
+                    time.time() - _send_start,
+                    i + 1, len(chunks),
+                )
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.

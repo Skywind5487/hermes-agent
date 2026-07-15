@@ -970,8 +970,8 @@ class SessionDB:
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
     _WRITE_MAX_RETRIES = 15
-    _WRITE_RETRY_MIN_S = 0.020   # 20ms
-    _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    _WRITE_RETRY_BASE_S = 0.020   # 20ms base for exponential backoff
+    _WRITE_RETRY_CAP_S = 2.0      # 2s max delay between retries
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Merge fragmented FTS5 segments every N successful writes. The message
@@ -1293,16 +1293,19 @@ class SessionDB:
 
         BEGIN IMMEDIATE acquires the WAL write lock at transaction start
         (not at commit time), so lock contention surfaces immediately.
-        On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
-        SQLite's built-in deterministic backoff creates.
+        On ``database is locked``, we roll back (releasing the write lock),
+        sleep with exponential backoff + jitter (20ms base, 2s cap), and
+        retry — breaking the convoy pattern that SQLite's built-in
+        deterministic backoff creates.
 
         Returns whatever *fn* returns.
         """
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
+                _lock_wait_start = time.time()
                 with self._lock:
+                    _lock_acquired = time.time()
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         result = fn(self._conn)
@@ -1313,7 +1316,14 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                # Success — log if write was slow
+                _total = time.time() - _lock_wait_start
+                if _total > 0.5:
+                    logger.warning(
+                        "Slow write (%.1fs, lock wait %.1fs): %s",
+                        _total, _lock_acquired - _lock_wait_start,
+                        fn.__name__ if hasattr(fn, '__name__') else 'write',
+                    )
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
@@ -1325,11 +1335,15 @@ class SessionDB:
                 if "locked" in err_msg or "busy" in err_msg:
                     last_err = exc
                     if attempt < self._WRITE_MAX_RETRIES - 1:
-                        jitter = random.uniform(
-                            self._WRITE_RETRY_MIN_S,
-                            self._WRITE_RETRY_MAX_S,
+                        delay = min(
+                            self._WRITE_RETRY_BASE_S * (2 ** attempt) + random.uniform(0, self._WRITE_RETRY_BASE_S),
+                            self._WRITE_RETRY_CAP_S,
                         )
-                        time.sleep(jitter)
+                        logger.warning(
+                            "Write lock contention (attempt %d/%d, retry in %.0fms): %s",
+                            attempt + 1, self._WRITE_MAX_RETRIES, delay * 1000, exc,
+                        )
+                        time.sleep(delay)
                         continue
                 # Non-lock error or retries exhausted — propagate.
                 raise
