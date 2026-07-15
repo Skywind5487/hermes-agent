@@ -4241,24 +4241,32 @@ class SessionDB:
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
+        # 子查詢隔離：包一層 SELECT * FROM (... LIMIT ?) 阻止 planner
+        # flattening，讓 ORDER BY rank + LIMIT 在子查詢內完成（~292x）。
+        # 原始 SQL 中 FTS5 ORDER BY rank 阻止 LIMIT pushdown 因為 planner
+        # 不信任 FTS5 黑盒子的排序。把整個查詢包進子查詢後，外部 SELECT *
+        # 無法被 flatten（子查詢有 LIMIT），planner 必須在子查詢內先
+        # ORDER BY rank LIMIT 再吐出結果，實現等效的 LIMIT pushdown。
         sql = f"""
-            SELECT
-                m.id,
-                m.session_id,
-                m.role,
-                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
-                m.content,
-                m.timestamp,
-                m.tool_name,
-                s.source,
-                s.model,
-                s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE {where_sql}
-            {order_by_sql}
-            LIMIT ? OFFSET ?
+            SELECT * FROM (
+                SELECT
+                    m.id,
+                    m.session_id,
+                    m.role,
+                    snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
+                    m.content,
+                    m.timestamp,
+                    m.tool_name,
+                    s.source,
+                    s.model,
+                    s.started_at AS session_started
+                FROM messages_fts
+                JOIN messages m ON m.id = messages_fts.rowid
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {where_sql}
+                {order_by_sql}
+                LIMIT ? OFFSET ?
+            )
         """
 
         # CJK queries bypass the unicode61 FTS5 table.  The default tokenizer
@@ -4314,23 +4322,25 @@ class SessionDB:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
                 tri_sql = f"""
-                    SELECT
-                        m.id,
-                        m.session_id,
-                        m.role,
-                        snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snippet,
-                        m.content,
-                        m.timestamp,
-                        m.tool_name,
-                        s.source,
-                        s.model,
-                        s.started_at AS session_started
-                    FROM messages_fts_trigram
-                    JOIN messages m ON m.id = messages_fts_trigram.rowid
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(tri_where)}
-                    {order_by_sql}
-                    LIMIT ? OFFSET ?
+                    SELECT * FROM (
+                        SELECT
+                            m.id,
+                            m.session_id,
+                            m.role,
+                            snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snippet,
+                            m.content,
+                            m.timestamp,
+                            m.tool_name,
+                            s.source,
+                            s.model,
+                            s.started_at AS session_started
+                        FROM messages_fts_trigram
+                        JOIN messages m ON m.id = messages_fts_trigram.rowid
+                        JOIN sessions s ON s.id = m.session_id
+                        WHERE {' AND '.join(tri_where)}
+                        {order_by_sql}
+                        LIMIT ? OFFSET ?
+                    )
                 """
                 tri_params.extend([limit, offset])
                 with self._lock:
@@ -4399,46 +4409,52 @@ class SessionDB:
                 else:
                     matches = [dict(row) for row in cursor.fetchall()]
 
-        # Add surrounding context (1 message before + after each match).
-        # Done outside the lock so we don't hold it across N sequential queries.
-        for match in matches:
+        # Batch context: N per-match CTE queries inside one lock instead of
+        # N separate lock cycles (~101s → bounded). Each CTE returns exactly
+        # 3 rows (prev/match/next) — bounded memory, no OOM risk. Content
+        # decode is done outside the lock.
+        if matches:
             try:
+                ctx_results: dict = {}
                 with self._lock:
-                    ctx_cursor = self._conn.execute(
-                        """WITH target AS (
-                               SELECT session_id, timestamp, id
+                    for match in matches:
+                        ctx_results[match["id"]] = self._conn.execute(
+                            """WITH target AS (
+                                   SELECT session_id, timestamp, id
+                                   FROM messages
+                                   WHERE id = ?
+                               )
+                               SELECT role, content
+                               FROM (
+                                   SELECT m.id, m.timestamp, m.role, m.content
+                                   FROM messages m
+                                   JOIN target t ON t.session_id = m.session_id
+                                   WHERE (m.timestamp < t.timestamp)
+                                      OR (m.timestamp = t.timestamp AND m.id < t.id)
+                                   ORDER BY m.timestamp DESC, m.id DESC
+                                   LIMIT 1
+                               )
+                               UNION ALL
+                               SELECT role, content
                                FROM messages
                                WHERE id = ?
-                           )
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
-                               ORDER BY m.timestamp DESC, m.id DESC
-                               LIMIT 1
-                           )
-                           UNION ALL
-                           SELECT role, content
-                           FROM messages
-                           WHERE id = ?
-                           UNION ALL
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
-                               ORDER BY m.timestamp ASC, m.id ASC
-                               LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
-                    )
+                               UNION ALL
+                               SELECT role, content
+                               FROM (
+                                   SELECT m.id, m.timestamp, m.role, m.content
+                                   FROM messages m
+                                   JOIN target t ON t.session_id = m.session_id
+                                   WHERE (m.timestamp > t.timestamp)
+                                      OR (m.timestamp = t.timestamp AND m.id > t.id)
+                                   ORDER BY m.timestamp ASC, m.id ASC
+                                   LIMIT 1
+                               )""",
+                            (match["id"], match["id"]),
+                        ).fetchall()
+
+                for match in matches:
                     context_msgs = []
-                    for r in ctx_cursor.fetchall():
+                    for r in ctx_results.get(match["id"], []):
                         raw = r["content"]
                         decoded = self._decode_content(raw)
                         # Multimodal context: render a compact text-only
@@ -4457,9 +4473,10 @@ class SessionDB:
                         context_msgs.append(
                             {"role": r["role"], "content": preview[:200]}
                         )
-                match["context"] = context_msgs
+                    match["context"] = context_msgs
             except Exception:
-                match["context"] = []
+                for match in matches:
+                    match["context"] = []
 
         # Remove full content from result (snippet is enough, saves tokens)
         for match in matches:
