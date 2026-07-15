@@ -917,16 +917,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
 );
 
 CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions BEGIN
-    INSERT INTO sessions_fts(rowid, title) VALUES (new.id, new.title);
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
 END;
 
 CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions BEGIN
-    DELETE FROM sessions_fts WHERE rowid = old.id;
+    DELETE FROM sessions_fts WHERE rowid = old.rowid;
 END;
 
 CREATE TRIGGER IF NOT EXISTS sessions_fts_update AFTER UPDATE ON sessions BEGIN
-    DELETE FROM sessions_fts WHERE rowid = old.id;
-    INSERT INTO sessions_fts(rowid, title) VALUES (new.id, new.title);
+    DELETE FROM sessions_fts WHERE rowid = old.rowid;
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
 END;
 """
 
@@ -937,16 +937,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_trigram USING fts5(
 );
 
 CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_insert AFTER INSERT ON sessions BEGIN
-    INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+    INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.rowid, new.title);
 END;
 
 CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_delete AFTER DELETE ON sessions BEGIN
-    DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+    DELETE FROM sessions_fts_trigram WHERE rowid = old.rowid;
 END;
 
 CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_update AFTER UPDATE ON sessions BEGIN
-    DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
-    INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+    DELETE FROM sessions_fts_trigram WHERE rowid = old.rowid;
+    INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.rowid, new.title);
 END;
 """
 
@@ -1210,7 +1210,7 @@ class SessionDB:
         # Main sessions_fts backfill
         cursor.execute(
             "INSERT OR IGNORE INTO sessions_fts(rowid, title) "
-            "SELECT id, COALESCE(title, '') FROM sessions WHERE title IS NOT NULL"
+            "SELECT _rowid_, COALESCE(title, '') FROM sessions WHERE title IS NOT NULL"
         )
         cursor.connection.commit()
 
@@ -1232,7 +1232,7 @@ class SessionDB:
                     placeholders = ",".join("?" for _ in batch)
                     cursor.execute(
                         f"INSERT OR IGNORE INTO sessions_fts_trigram(rowid, title) "
-                        f"SELECT id, COALESCE(title, '') FROM sessions "
+                        f"SELECT _rowid_, COALESCE(title, '') FROM sessions "
                         f"WHERE id IN ({placeholders})",
                         batch,
                     )
@@ -3308,7 +3308,7 @@ class SessionDB:
                 cursor = self._conn.execute(
                     f"SELECT s.id AS id, s.title, s.started_at "
                     f"FROM {fts_table} f "
-                    f"JOIN sessions s ON s.id = f.rowid "
+                    f"JOIN sessions s ON s._rowid_ = f.rowid "
                     f"WHERE {fts_table} MATCH ? "
                     f"ORDER BY s.started_at DESC",
                     (sanitized,),
