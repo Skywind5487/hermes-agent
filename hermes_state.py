@@ -141,7 +141,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -909,6 +909,47 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON message
     );
 END;
 """
+# ── Sessions FTS5 — title search ────────────────────────────────────────
+SESSIONS_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    title,
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.id, new.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions BEGIN
+    DELETE FROM sessions_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_update AFTER UPDATE ON sessions BEGIN
+    DELETE FROM sessions_fts WHERE rowid = old.id;
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.id, new.title);
+END;
+"""
+
+SESSIONS_FTS_TRIGRAM_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_trigram USING fts5(
+    title,
+    tokenize='simple'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_insert AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_delete AFTER DELETE ON sessions BEGIN
+    DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_update AFTER UPDATE ON sessions BEGIN
+    DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+    INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+END;
+"""
+
 
 
 class SessionDB:
@@ -1151,6 +1192,53 @@ class SessionDB:
             "COALESCE(tool_calls, '') "
             "FROM messages"
         )
+
+
+    @staticmethod
+    def _backfill_sessions_fts(
+        cursor: sqlite3.Cursor,
+        *,
+        include_trigram: bool = True,
+    ) -> None:
+        """Backfill existing session titles into sessions_fts FTS5 tables.
+
+        Progressive batches: larger batches early, smaller batches later,
+        with a sleep between each so the gateway writer can make progress.
+        """
+        import time
+
+        # Main sessions_fts backfill
+        cursor.execute(
+            "INSERT OR IGNORE INTO sessions_fts(rowid, title) "
+            "SELECT id, COALESCE(title, '') FROM sessions WHERE title IS NOT NULL"
+        )
+        cursor.connection.commit()
+
+        # Trigram sessions_fts backfill — progressive batches
+        if include_trigram:
+            cursor.execute(
+                "SELECT id FROM sessions WHERE title IS NOT NULL "
+                "AND id NOT IN (SELECT rowid FROM sessions_fts_trigram)"
+            )
+            missing = [row[0] for row in cursor.fetchall()]
+            if missing:
+                # Progressive batch sizes: 500 → 200 → 100 → 50
+                batch_sizes = [500, 200, 100, 50]
+                remaining = list(missing)
+                while remaining:
+                    bs = batch_sizes.pop(0) if batch_sizes else 50
+                    batch = remaining[:bs]
+                    remaining = remaining[bs:]
+                    placeholders = ",".join("?" for _ in batch)
+                    cursor.execute(
+                        f"INSERT OR IGNORE INTO sessions_fts_trigram(rowid, title) "
+                        f"SELECT id, COALESCE(title, '') FROM sessions "
+                        f"WHERE id IN ({placeholders})",
+                        batch,
+                    )
+                    cursor.connection.commit()
+                    if remaining:
+                        time.sleep(0.05)  # 50ms breather for gateway writer
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
@@ -1749,6 +1837,32 @@ class SessionDB:
                     self._rebuild_fts_indexes(
                         cursor,
                         include_trigram=trigram_enabled,
+                    )
+
+            # ── Sessions FTS5 ──────────────────────────────────────────
+            # Sessions FTS5 tables for title search.  Two tables mirroring
+            # the messages_fts / messages_fts_trigram pattern.
+            # Non-CJK queries → sessions_fts (unicode61 tokenizer).
+            # CJK queries     → sessions_fts_trigram (simple tokenizer).
+            sessions_fts_ok = self._ensure_fts_schema(
+                cursor, "sessions_fts", SESSIONS_FTS_SQL,
+            )
+            if sessions_fts_ok:
+                sessions_trigram_ok = self._ensure_fts_schema(
+                    cursor, "sessions_fts_trigram", SESSIONS_FTS_TRIGRAM_SQL,
+                )
+                # One-time backfill for existing session titles.  Progressive
+                # batches so the gateway writer isn't starved.
+                # current_version is only defined when schema_version was
+                # already set (not a brand-new DB).
+                _needs_backfill = (
+                    "current_version" in dir()
+                    and current_version < 22
+                )
+                if _needs_backfill:
+                    self._backfill_sessions_fts(
+                        cursor,
+                        include_trigram=sessions_trigram_ok,
                     )
 
         self._conn.commit()
@@ -3144,27 +3258,75 @@ class SessionDB:
         If not, searches for "title #N" variants and returns the latest one.
         If the exact title exists AND numbered variants exist, returns the
         latest numbered variant (the most recent continuation).
+
+        Uses FTS5 for the numbered variant search (CJK dispatch matching
+        the search_messages pattern), with LIKE as fallback.
         """
         # First try exact match
         exact = self.get_session_by_title(title)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
-        # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
-            )
-            numbered = cursor.fetchall()
+        # Use FTS5 if available, fall back to LIKE.
+        if not self._fts_enabled:
+            numbers = self._like_numbered_variants(title)
+        else:
+            numbers = self._fts_numbered_variants(title)
+            if numbers is None:
+                numbers = self._like_numbered_variants(title)
 
-        if numbered:
-            # Return the most recent numbered variant
-            return numbered[0]["id"]
+        if numbers:
+            return numbers[0]["id"]
         elif exact:
             return exact["id"]
         return None
+
+    def _like_numbered_variants(self, title: str) -> List[sqlite3.Row]:
+        """Fallback: find numbered continuation variants via LIKE."""
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT id, title, started_at FROM sessions "
+                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
+                (f"{escaped} #%",),
+            ))
+
+    def _fts_numbered_variants(self, title: str) -> Optional[List[sqlite3.Row]]:
+        """Find numbered continuation variants via FTS5 MATCH with CJK dispatch.
+
+        Returns None to signal fallback to LIKE (e.g. FTS5 runtime error).
+        Returns empty list when no matches found.
+        """
+        is_cjk = self._contains_cjk(title)
+        fts_table = "sessions_fts_trigram" if is_cjk else "sessions_fts"
+        sanitized = self._sanitize_fts5_query(title)
+
+        if not sanitized:
+            return None
+
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    f"SELECT s.id AS id, s.title, s.started_at "
+                    f"FROM {fts_table} f "
+                    f"JOIN sessions s ON s.id = f.rowid "
+                    f"WHERE {fts_table} MATCH ? "
+                    f"ORDER BY s.started_at DESC",
+                    (sanitized,),
+                )
+                candidates = list(cursor)
+            except sqlite3.OperationalError:
+                logging.debug(
+                    "sessions_fts MATCH failed for %r, falling back to LIKE",
+                    sanitized, exc_info=True,
+                )
+                return None
+
+        # Post-filter: only keep sessions whose title starts with "{title} #N"
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return [
+            c for c in candidates
+            if c["title"] and c["title"].startswith(f"{escaped} #")
+        ]
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").
