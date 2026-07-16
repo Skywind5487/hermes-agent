@@ -265,3 +265,65 @@ def test_retrieve_store_unavailable(monkeypatch):
     ret = headroom._retrieve_original({"hash": "anything"})
     rd = json.loads(ret)
     assert rd == {"success": False, "error": "retrieval store unavailable"}
+
+
+def test_search_files_compression_with_content_router(monkeypatch):
+    """ContentRouter + SmartCrusher compresses search_files JSON."""
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+
+    # Inject content_router config into the plugin's config loader
+    import plugins.headroom as hr
+
+    _original_load = hr._load_headroom_config
+
+    def _patched_config():
+        cfg = _original_load()
+        cfg["content_router"] = {"enabled": True}
+        return cfg
+
+    monkeypatch.setattr(hr, "_load_headroom_config", _patched_config)
+
+    large = _search_result(count=60)
+    out = _transform("search_files", large)
+    assert out is not None
+    data = json.loads(out)
+
+    assert data["_headroom"]["compressed"] is True
+    assert data["_headroom"]["tool"] == "search_files"
+    assert data["_headroom"]["content_router"] == "CompressionStrategy.SMART_CRUSHER"
+    assert data["_headroom"]["retrieval"]["available"] is True
+    assert isinstance(data["_headroom"]["retrieval"]["handle"], str)
+    assert "total_count" in data
+    assert "matches" in data
+    # SmartCrusher converts matches array to schema+CSV string
+    assert isinstance(data["matches"], str), f"Expected string (schema+CSV), got {type(data['matches'])}"
+
+
+def test_content_router_disabled_falls_back_to_phase1(monkeypatch):
+    """When content_router is disabled, Phase 1 manual compression runs."""
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+    # No content_router config → disabled
+
+    out = _transform("search_files", _search_result(count=12))
+    assert out is not None
+    data = json.loads(out)
+
+    # Phase 1 format: kind/matches is a list, not a string
+    assert data["_headroom"]["compressed"] is True
+    assert "content_router" not in data["_headroom"]
+    assert data["kind"] == "matches"
+    assert isinstance(data["matches"], list)
+    assert data["omitted_count"] > 0
+
+
+def test_compress_via_router_signature(monkeypatch):
+    """_compress_via_router returns expected types."""
+    import plugins.headroom as hr
+
+    result = hr._compress_via_router(_search_result(count=10))
+    if result is not None:
+        compressed, strategy = result
+        assert isinstance(compressed, str)
+        assert isinstance(strategy, str)
+        assert len(strategy) > 0
+
