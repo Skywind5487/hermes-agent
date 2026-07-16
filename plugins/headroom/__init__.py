@@ -93,6 +93,7 @@ class _Settings:
     max_items: int
     max_field_chars: int
     max_snapshot_chars: int
+    content_router_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,13 @@ def _settings() -> _Settings:
     # Phase 1 can only narrow the hardcoded allowlist, never widen it.
     allowlist = (allowlist & _ALLOWED_TOOLS) - excluded_tools
 
+    router_cfg = cfg.get("content_router", {})
+    content_router_enabled = (
+        bool(router_cfg.get("enabled", False))
+        if isinstance(router_cfg, dict)
+        else False
+    )
+
     return _Settings(
         enabled=bool(enabled),
         kill_switch=bool(kill_switch),
@@ -182,6 +190,7 @@ def _settings() -> _Settings:
         max_snapshot_chars=_coerce_int(
             cfg.get("max_snapshot_chars"), 2400, floor=200, ceiling=20000
         ),
+        content_router_enabled=content_router_enabled,
     )
 
 
@@ -409,6 +418,69 @@ def _compress_browser_snapshot(data: Any, settings: _Settings) -> Optional[dict[
     }
 
 
+# Lazy singleton for ContentRouter (headroom-ai). Initialized on first use,
+# then reused across tool calls to avoid 0.5-2s cold-start overhead.
+_router_instance = None
+_router_lock = threading.Lock()
+
+
+def _compress_via_router(result: str) -> Optional[tuple[str, str]]:
+    """Compress tool output via headroom-ai ContentRouter.
+
+    Gracefully degrades: if ContentRouter is unavailable, returns passthrough,
+    or fails, returns None so the caller can fall back to manual compression.
+
+    Returns:
+        (compressed_text, strategy_name) if ContentRouter produced meaningful
+        compression, None if no useful compression happened.
+    """
+    global _router_instance
+    if _router_instance is None:
+        with _router_lock:
+            if _router_instance is None:
+                try:
+                    from headroom.transforms.content_router import ContentRouter
+
+                    _router_instance = ContentRouter()
+                    # Bypass Kompress (ONNX ML): on e2-micro the 261MB model
+                    # takes ~14s for 512 tokens and times out. TextCrusher
+                    # (Rust native) replaces it with <50ms and 70-99% savings.
+                    _router_instance._kompress = True
+                    _router_instance._kompress_max_tokens = 1
+                    _router_instance._text_crusher_enabled = True
+                    os.environ.setdefault("HEADROOM_TEXT_CRUSHER", "1")
+                except Exception:
+                    logger.warning("headroom: ContentRouter singleton init failed", exc_info=True)
+                    _router_instance = False  # type: ignore[assignment]
+                    return None
+
+    try:
+        cr_result = _router_instance.compress(result)
+    except Exception:
+        logger.warning("headroom: ContentRouter.compress failed", exc_info=True)
+        return None
+
+    result_len = len(result)
+    compressed_len = len(cr_result.compressed)
+    strategy = str(cr_result.strategy_used)
+    # Only use router output if it actually saved content (passthrough = no change)
+    if compressed_len >= result_len:
+        logger.debug(
+            "headroom: ContentRouter passthrough (%s), using manual compression",
+            strategy,
+        )
+        return None
+
+    logger.debug(
+        "headroom: ContentRouter %s compressed %d -> %d chars (%.1f%%)",
+        strategy,
+        result_len,
+        compressed_len,
+        compressed_len / result_len * 100 if result_len else 0,
+    )
+    return cr_result.compressed, strategy
+
+
 def _source_scope(**kwargs: Any) -> dict[str, str]:
     scope: dict[str, str] = {}
     for key in ("session_id", "task_id", "tool_call_id", "turn_id"):
@@ -425,6 +497,51 @@ def _compress_result(
     settings: _Settings,
     hook_kwargs: dict[str, Any],
 ) -> Optional[str]:
+    # Phase 2: when content_router is enabled, use headroom-ai's ContentRouter
+    # to auto-detect content type and apply the optimal compressor (SmartCrusher
+    # for JSON, CodeCompressor for code, etc.). Falls back to Phase 1 manual
+    # compression when the router returns passthrough or is unavailable.
+    if settings.content_router_enabled:
+        router_result = _compress_via_router(result)
+        if router_result is not None:
+            router_compressed, router_strategy = router_result
+            payload = _parse_json_result(router_compressed)
+            if payload is not None:
+                redacted, had_redaction = _redact_value(payload.value)
+                retrieval_handle = _store_for_retrieval(
+                    result=result, tool_name=tool_name, **hook_kwargs
+                )
+                final = dict(redacted) if isinstance(redacted, dict) else {"compressed_body": redacted}
+                final["_headroom"] = {
+                    "schema_version": SCHEMA_VERSION,
+                    "compressed": True,
+                    "tool": tool_name,
+                    "original_chars": len(result),
+                    "redacted": had_redaction,
+                    "scope": _source_scope(**hook_kwargs),
+                    "content_router": router_strategy,
+                    "retrieval": {
+                        "available": retrieval_handle is not None,
+                        "handle": retrieval_handle,
+                        "version": "redacted",
+                        "reason": (
+                            "stored_locally" if retrieval_handle is not None else "storage_unavailable"
+                        ),
+                    },
+                }
+                if payload.suffix:
+                    final["_headroom"]["source_suffix"] = {
+                        "present": True,
+                        "chars": len(payload.suffix),
+                        "kind": (
+                            "search_files_hint"
+                            if payload.suffix.lstrip().startswith("[Hint:")
+                            else "unknown"
+                        ),
+                    }
+                return json.dumps(final, ensure_ascii=False, sort_keys=True)
+
+    # Phase 1: manual compression (existing path)
     parsed_result = _parse_json_result(result)
     if parsed_result is None:
         return None
