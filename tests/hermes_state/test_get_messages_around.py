@@ -144,5 +144,5 @@ class TestContentHydration:
         # Find the assistant message with tool_calls
         asst = [m for m in view["window"] if m.get("role") == "assistant"]
         assert asst, "expected an assistant message"
-        # tool_calls should be a list after hydration, not a string
-        assert isinstance(asst[0].get("tool_calls"), list)
+        # tool_calls should be absent after SELECT * → specific columns
+        assert asst[0].get("tool_calls") is None

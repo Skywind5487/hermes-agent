@@ -4329,13 +4329,13 @@ class SessionDB:
             # Two queries: anchor + before (DESC, take window+1), and after
             # (ASC, take window). Final order is id ASC.
             before_rows = self._conn.execute(
-                "SELECT * FROM messages "
+                "SELECT id, session_id, role, content, timestamp FROM messages "
                 "WHERE session_id = ? AND id <= ? "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, around_message_id, window + 1),
             ).fetchall()
             after_rows = self._conn.execute(
-                "SELECT * FROM messages "
+                "SELECT id, session_id, role, content, timestamp FROM messages "
                 "WHERE session_id = ? AND id > ? "
                 "ORDER BY id ASC LIMIT ?",
                 (session_id, around_message_id, window),
@@ -4449,7 +4449,7 @@ class SessionDB:
                     role_params = list(keep_roles)
 
                 bookend_start_rows = self._conn.execute(
-                    f"SELECT * FROM messages "
+                    f"SELECT id, session_id, role, content, timestamp FROM messages "
                     f"WHERE session_id = ? AND id < ?{role_clause} "
                     f"AND length(content) > 0 "
                     f"ORDER BY id ASC LIMIT ?",
@@ -4457,7 +4457,7 @@ class SessionDB:
                 ).fetchall()
 
                 bookend_end_rows = self._conn.execute(
-                    f"SELECT * FROM messages "
+                    f"SELECT id, session_id, role, content, timestamp FROM messages "
                     f"WHERE session_id = ? AND id > ?{role_clause} "
                     f"AND length(content) > 0 "
                     f"ORDER BY id DESC LIMIT ?",
