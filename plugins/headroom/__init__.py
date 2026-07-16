@@ -442,14 +442,22 @@ def _compress_via_router(result: str) -> Optional[tuple[str, str]]:
                     from headroom.transforms.content_router import ContentRouter
 
                     _router_instance = ContentRouter()
+                    # Bypass Kompress (ONNX ML): on e2-micro the 261MB model
+                    # takes ~14s for 512 tokens and times out. TextCrusher
+                    # (Rust native) replaces it with <50ms and 70-99% savings.
+                    _router_instance._kompress = True
+                    _router_instance._kompress_max_tokens = 1
+                    _router_instance._text_crusher_enabled = True
+                    os.environ.setdefault("HEADROOM_TEXT_CRUSHER", "1")
                 except Exception:
-                    logger.debug("headroom: ContentRouter singleton init failed", exc_info=True)
+                    logger.warning("headroom: ContentRouter singleton init failed", exc_info=True)
+                    _router_instance = False  # type: ignore[assignment]
                     return None
 
     try:
         cr_result = _router_instance.compress(result)
     except Exception:
-        logger.debug("headroom: ContentRouter.compress failed", exc_info=True)
+        logger.warning("headroom: ContentRouter.compress failed", exc_info=True)
         return None
 
     result_len = len(result)

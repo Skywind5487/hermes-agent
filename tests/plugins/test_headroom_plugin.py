@@ -327,3 +327,109 @@ def test_compress_via_router_signature(monkeypatch):
         assert isinstance(strategy, str)
         assert len(strategy) > 0
 
+
+# ── Warning E2E tests ──
+
+def test_warning_content_router_compress_fail_logs_warning(caplog, monkeypatch):
+    """When ContentRouter.compress raises, logger.warning is emitted
+    and the function returns None (graceful degradation)."""
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+    import plugins.headroom as hr
+    hr._router_instance = None
+
+    # Mock the router to fail
+    class FailingRouter:
+        def compress(self, result):
+            raise RuntimeError("simulated failure")
+
+    hr._router_instance = FailingRouter()
+
+    with caplog.at_level("WARNING"):
+        result = hr._compress_via_router(_search_result(count=10))
+
+    assert result is None
+    assert any("ContentRouter.compress failed" in msg for msg in caplog.messages)
+
+
+def test_warning_content_router_init_fail_logs_warning(caplog, monkeypatch):
+    """When ContentRouter cannot be imported, logger.warning is emitted
+    and singleton is set to False (no retry)."""
+    monkeypatch.setenv("HERMES_HEADROOM_ENABLED", "1")
+    import plugins.headroom as hr
+    hr._router_instance = None
+
+    # Break the import path
+    import builtins
+    _real_import = builtins.__import__
+
+    def _broken_import(name, *args, **kwargs):
+        if "content_router" in name:
+            raise ImportError("simulated import failure")
+        return _real_import(name, *args, **kwargs)
+
+    with caplog.at_level("WARNING"):
+        builtins.__import__ = _broken_import
+        try:
+            result = hr._compress_via_router(_search_result(count=10))
+        finally:
+            builtins.__import__ = _real_import
+
+    assert result is None
+    assert hr._router_instance is False  # sentinel
+    assert any("ContentRouter singleton init failed" in msg for msg in caplog.messages)
+
+
+def test_warning_store_unavailable_logs_warning(caplog, monkeypatch):
+    """When CompressionStore is unavailable, logger.warning is emitted
+    and retrieval falls through gracefully."""
+    import plugins.headroom as hr
+    hr._store_instance = None
+    hr._store_lock = __import__("threading").Lock()
+
+    # Mock get_compression_store to fail
+    _orig = hr._get_store
+    hr._get_store = lambda: None
+
+    with caplog.at_level("WARNING"):
+        handle = hr._store_for_retrieval(
+            result='{"test": true}', tool_name="search_files",
+            session_id="s", task_id="t", tool_call_id="c", turn_id="t",
+        )
+
+    assert handle is None
+    hr._get_store = _orig  # restore
+
+
+def test_warning_cache_aligner_detects_volatile_content(caplog):
+    """CacheAligner emits warning when system prompt contains volatile
+    content (ISO 8601 timestamps, UUIDs, hex hashes)."""
+    from headroom.transforms import CacheAligner
+    from headroom.config import CacheAlignerConfig
+
+    # Mock tokenizer to avoid heavy imports
+    class MockTokenizer:
+        def count_messages(self, messages):
+            return sum(len(m.get("content", "")) for m in messages if m.get("content"))
+        def count_text(self, text):
+            return len(text.split())
+
+    aligner = CacheAligner(CacheAlignerConfig(enabled=True))
+    tokenizer = MockTokenizer()
+
+    # System prompt with volatile content (ISO date + UUID)
+    messages = [
+        {"role": "system", "content": "Current session started at 2026-07-16T19:30. UUID=550e8400-e29b-41d4-b916-168c7abc"},
+        {"role": "user", "content": "Hello"},
+    ]
+
+    with caplog.at_level("WARNING"):
+        result = aligner.apply(messages, tokenizer)
+
+    # CacheAligner must not mutate messages
+    assert result.messages == messages
+
+    # Should emit warning about volatile content
+    assert any("CacheAligner" in msg for msg in caplog.messages), (
+        f"No CacheAligner warning in: {caplog.messages}"
+    )
+
