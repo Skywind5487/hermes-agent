@@ -1,6 +1,6 @@
 name: headroom
 version: "0.1.0"
-description: "Opt-in Phase 1 experiment for structured compression of selected large tool results. Disabled by default; only search_files and browser_snapshot are eligible. When content_router is enabled, uses headroom-ai ContentRouter + SmartCrusher for content-aware JSON/array compression."
+description: "Opt-in Phase 1 experiment for structured compression of selected large tool results. Disabled by default; search_files, browser_snapshot, terminal, read_file, session_search, lcm_grep, lcm_load_session, lcm_expand, web_search, and browser_console are eligible. Compression is applied only when the complete serialized result, including Headroom metadata, is smaller than the original; otherwise the tool result remains unchanged. When content_router is enabled, uses headroom-ai ContentRouter + SmartCrusher for content-aware JSON/array compression."
 author: "NousResearch"
 hooks:
   - transform_tool_result

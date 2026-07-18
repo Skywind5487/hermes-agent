@@ -3,9 +3,11 @@
 The plugin is bundled but inert unless explicitly enabled. It uses the
 ``transform_tool_result`` hook so the core dispatch path stays untouched.
 
-Phase 1 compresses selected large tool results (search_files, browser_snapshot)
-and persists the redacted content in an in-memory CompressionStore (InMemoryBackend).
-Compressed payloads include a retrieval handle (24-char SHA-256[:24] hash) that the
+Phase 1 compresses selected large tool results (search_files, browser_snapshot,
+terminal, read_file, session_search, lcm_grep, lcm_load_session, lcm_expand,
+web_search, browser_console) and persists the redacted content in an in-memory CompressionStore
+(InMemoryBackend).
+Compressed payloads include a retrieval hash (24-char SHA-256[:24]) that the
 LLM can use with the ``headroom_retrieve`` tool to fetch the full original content.
 """
 
@@ -23,10 +25,19 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "hermes.headroom.phase1.v1"
 
-_ALLOWED_TOOLS = frozenset({"search_files", "browser_snapshot"})
-_EXCLUDED_TOOLS = frozenset({
+_ALLOWED_TOOLS = frozenset({
+    "search_files",
+    "browser_snapshot",
     "terminal",
     "read_file",
+    "session_search",
+    "lcm_grep",
+    "lcm_load_session",
+    "lcm_expand",
+    "web_search",
+    "browser_console",
+})
+_EXCLUDED_TOOLS = frozenset({
     "delegate_task",
     "patch",
     "write_file",
@@ -522,7 +533,7 @@ def _compress_result(
                     "content_router": router_strategy,
                     "retrieval": {
                         "available": retrieval_handle is not None,
-                        "handle": retrieval_handle,
+                        "hash": retrieval_handle,
                         "version": "redacted",
                         "reason": (
                             "stored_locally" if retrieval_handle is not None else "storage_unavailable"
@@ -539,7 +550,8 @@ def _compress_result(
                             else "unknown"
                         ),
                     }
-                return json.dumps(final, ensure_ascii=False, sort_keys=True)
+                serialized = json.dumps(final, ensure_ascii=False, sort_keys=True)
+                return None if len(serialized) >= len(result) else serialized
 
     # Phase 1: manual compression (existing path)
     parsed_result = _parse_json_result(result)
@@ -570,7 +582,7 @@ def _compress_result(
         "scope": _source_scope(**hook_kwargs),
         "retrieval": {
             "available": retrieval_handle is not None,
-            "handle": retrieval_handle,
+            "hash": retrieval_handle,
             "version": "redacted",
             "reason": (
                 "stored_locally" if retrieval_handle is not None else "storage_unavailable"
@@ -587,7 +599,8 @@ def _compress_result(
                 else "unknown"
             ),
         }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return None if len(serialized) >= len(result) else serialized
 
 
 def _on_transform_tool_result(
@@ -641,13 +654,13 @@ def register(ctx) -> None:
         toolset="headroom",
         check_fn=_retrieval_tool_available,
         schema={
-            "description": "Retrieve original content that was compressed by headroom. Pass the 24-char hex hash from _headroom.retrieval.handle to get back the full original tool output.",
+            "description": "Retrieve original content that was compressed by headroom. Pass the 24-char hex hash from _headroom.retrieval.hash to get back the full original tool output.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "hash": {
                         "type": "string",
-                        "description": "24-char hex hash returned in _headroom.retrieval.handle from a compressed tool result",
+                        "description": "24-char hex hash returned in _headroom.retrieval.hash from a compressed tool result",
                     }
                 },
                 "required": ["hash"],
