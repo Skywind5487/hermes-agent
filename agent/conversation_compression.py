@@ -673,6 +673,28 @@ def compress_context(
         finally:
             _release_lock()
 
+    # A context engine can explicitly report a no-op even when it returns a
+    # newly allocated list.  Do not rotate/rewrite the session in that case.
+    if (
+        getattr(
+            agent.context_compressor,
+            "last_compression_status",
+            getattr(agent.context_compressor, "_last_compression_status", ""),
+        )
+        == "noop"
+    ):
+        logger.info(
+            "context compression no-op: session=%s messages=%d unchanged; "
+            "skipping session boundary",
+            agent.session_id or "none",
+            _pre_msg_count,
+        )
+        _existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not _existing_sp:
+            _existing_sp = agent._build_system_prompt(system_message)
+        _release_lock()
+        return compressed, _existing_sp
+
     # A compressor that returns the exact input object made no structural
     # progress. Do not rotate/rewrite the session or arm post-compression
     # deferral in that case; its own anti-thrash counter records the no-op.

@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -24,13 +25,314 @@ import sqlite3
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 
+from agent.diagnostic_config import enabled as diagnostic_enabled
+from agent.kernel_telemetry import capture_snapshot, diff_snapshot
 from agent.memory_manager import sanitize_context
+from agent.sqlite_native_telemetry import SQLiteNativeProbe
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
+
+_DB_TELEMETRY_CONTEXT = contextvars.ContextVar(
+    "hermes_db_telemetry_context", default=None
+)
+
+
+def _telemetry_field(context: Optional[Dict[str, Any]], key: str) -> str:
+    value = (context or {}).get(key)
+    return str(value) if value not in (None, "") else "-"
+
+
+@contextmanager
+def db_telemetry_context(**fields: Any):
+    """Bind upstream turn/API/tool metadata for nested DB telemetry."""
+    parent = dict(_DB_TELEMETRY_CONTEXT.get() or {})
+    parent.update({key: value for key, value in fields.items() if value is not None})
+    token = _DB_TELEMETRY_CONTEXT.set(parent)
+    try:
+        yield
+    finally:
+        _DB_TELEMETRY_CONTEXT.reset(token)
+
+
+def _emit_db_event(event: str, **extra: Any) -> None:
+    """Emit payload-free, correlatable DB lifecycle telemetry."""
+    context = _DB_TELEMETRY_CONTEXT.get() or {}
+    operation_id = _telemetry_field(context, "operation_id")
+    request_id = _telemetry_field(context, "request_id")
+    fields = {
+        "event": event,
+        "trace_id": _telemetry_field(context, "trace_id")
+        if context.get("trace_id")
+        else request_id,
+        "span_id": _telemetry_field(context, "span_id")
+        if context.get("span_id")
+        else operation_id,
+        "parent_span_id": _telemetry_field(context, "parent_span_id")
+        if context.get("parent_span_id")
+        else request_id,
+        "db_operation_id": operation_id,
+        "operation_id": operation_id,
+        "operation_name": _telemetry_field(context, "operation_name"),
+        "caller_name": _telemetry_field(context, "caller_name"),
+        "request_id": request_id,
+        "turn_id": _telemetry_field(context, "turn_id"),
+        "api_request_id": _telemetry_field(context, "api_request_id"),
+        "tool_call_id": _telemetry_field(context, "tool_call_id"),
+        "session_id": _telemetry_field(context, "session_id"),
+        "active_session_id": _telemetry_field(context, "active_session_id"),
+        "target_session_id": _telemetry_field(context, "target_session_id"),
+        "target_lineage_id": _telemetry_field(context, "target_lineage_id"),
+        "connection_id": _telemetry_field(context, "connection_id"),
+        "connection_role": _telemetry_field(context, "connection_role"),
+        "transaction_id": _telemetry_field(context, "transaction_id"),
+        "thread_id": threading.get_ident(),
+    }
+    fields.update(extra)
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info("%s %s", event, payload)
+
+
+class _TelemetryLock:
+    """A threading lock that emits a correlatable owner/waiter graph."""
+
+    _SLOW_WAIT_MS = 100
+
+    def __init__(self, connection_id: str):
+        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self.lock_id = f"lock-{os.getpid()}-{time.time_ns()}"
+        self.connection_id = connection_id
+        self._owner = None
+        self._waiters = 0
+
+    def _emit(self, event: str, scope_id: str, **extra: Any) -> None:
+        context = _DB_TELEMETRY_CONTEXT.get() or {}
+        fields = {
+            "event": event,
+            "lock_scope_id": scope_id,
+            "lock_id": self.lock_id,
+            "operation_id": _telemetry_field(context, "operation_id"),
+            "operation_name": _telemetry_field(context, "operation_name"),
+            "caller_name": _telemetry_field(context, "caller_name"),
+            "request_id": _telemetry_field(context, "request_id"),
+            "turn_id": _telemetry_field(context, "turn_id"),
+            "api_request_id": _telemetry_field(context, "api_request_id"),
+            "tool_call_id": _telemetry_field(context, "tool_call_id"),
+            "session_id": _telemetry_field(context, "session_id"),
+            "write_id": _telemetry_field(context, "write_id"),
+            "compaction_id": _telemetry_field(context, "compaction_id"),
+            "checkpoint_id": _telemetry_field(context, "checkpoint_id"),
+            "active_session_id": _telemetry_field(context, "active_session_id"),
+            "target_session_id": _telemetry_field(context, "target_session_id"),
+            "connection_id": self.connection_id,
+            "connection_role": _telemetry_field(context, "connection_role"),
+            "transaction_id": _telemetry_field(context, "transaction_id"),
+            "thread_id": threading.get_ident(),
+        }
+        fields.update(extra)
+        payload = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.info("%s %s", event, payload)
+        db_event = {
+            "LOCK_REQUESTED": "DB_LOCK_REQUESTED",
+            "LOCK_ACQUIRED": "DB_LOCK_ACQUIRED",
+            "LOCK_RELEASED": "DB_LOCK_RELEASED",
+            "LOCK_NOT_ACQUIRED": "DB_LOCK_ERROR",
+        }.get(event)
+        if db_event:
+            _emit_db_event(
+                db_event,
+                lock_scope_id=scope_id,
+                lock_id=self.lock_id,
+                lock_name="session_db_python_lock",
+                **extra,
+            )
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        requested_ns = time.perf_counter_ns()
+        scope_id = f"scope-{os.getpid()}-{requested_ns}"
+        with self._state_lock:
+            self._waiters += 1
+            queue_depth_at_request = self._waiters
+            owner = dict(self._owner or {})
+        self._emit(
+            "LOCK_REQUESTED",
+            scope_id,
+            requested_monotonic_ns=requested_ns,
+            owner_thread_id=owner.get("thread_id", "-"),
+            owner_operation_id=owner.get("operation_id", "-"),
+            owner_operation_name=owner.get("operation_name", "-"),
+            owner_active_session_id=owner.get("active_session_id", "-"),
+            previous_owner_operation_id=owner.get("operation_id", "-"),
+            previous_owner_operation_name=owner.get("operation_name", "-"),
+            previous_owner_active_session_id=owner.get("active_session_id", "-"),
+            queue_depth_at_request=queue_depth_at_request,
+        )
+        if timeout is None or timeout < 0:
+            acquired = self._lock.acquire(blocking)
+        else:
+            acquired = self._lock.acquire(blocking, timeout)
+        with self._state_lock:
+            self._waiters = max(0, self._waiters - 1)
+            queue_depth_at_acquire = self._waiters
+        if not acquired:
+            wait_ms = int((time.perf_counter_ns() - requested_ns) / 1_000_000)
+            self._emit(
+                "LOCK_NOT_ACQUIRED",
+                scope_id,
+                requested_monotonic_ns=requested_ns,
+                acquired_monotonic_ns="-",
+                wait_ms=wait_ms,
+                queue_depth_at_acquire=queue_depth_at_acquire,
+            )
+            return False
+        acquired_ns = time.perf_counter_ns()
+        context = _DB_TELEMETRY_CONTEXT.get() or {}
+        with self._state_lock:
+            self._owner = {
+                "thread_id": threading.get_ident(),
+                "operation_id": _telemetry_field(context, "operation_id"),
+                "operation_name": _telemetry_field(context, "operation_name"),
+                "active_session_id": _telemetry_field(context, "active_session_id"),
+            }
+        wait_ms = int((acquired_ns - requested_ns) / 1_000_000)
+        self._emit(
+            "LOCK_ACQUIRED",
+            scope_id,
+            requested_monotonic_ns=requested_ns,
+            acquired_monotonic_ns=acquired_ns,
+            wait_ms=wait_ms,
+            previous_owner_operation_id=owner.get("operation_id", "-"),
+            previous_owner_operation_name=owner.get("operation_name", "-"),
+            previous_owner_active_session_id=owner.get("active_session_id", "-"),
+            queue_depth_at_acquire=queue_depth_at_acquire,
+        )
+        if wait_ms >= self._SLOW_WAIT_MS:
+            _emit_db_event(
+                "DB_LOCK_WAIT_SLOW",
+                lock_id=self.lock_id,
+                lock_name="session_db_python_lock",
+                lock_scope_id=scope_id,
+                waiter_operation_id=_telemetry_field(context, "operation_id"),
+                current_owner_operation_id=owner.get("operation_id", "-"),
+                current_owner_operation_name=owner.get("operation_name", "-"),
+                current_owner_active_session_id=owner.get("active_session_id", "-"),
+                current_owner_hold_ms="-",
+                queue_depth=queue_depth_at_request,
+                lock_wait_ms=wait_ms,
+            )
+        self._scope_id = scope_id
+        self._acquired_ns = acquired_ns
+        return True
+
+    def release(self) -> None:
+        released_ns = time.perf_counter_ns()
+        scope_id = getattr(self, "_scope_id", "-")
+        acquired_ns = getattr(self, "_acquired_ns", released_ns)
+        self._emit(
+            "LOCK_RELEASED",
+            scope_id,
+            acquired_monotonic_ns=acquired_ns,
+            released_monotonic_ns=released_ns,
+            hold_ms=int((released_ns - acquired_ns) / 1_000_000),
+        )
+        with self._state_lock:
+            self._owner = None
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+        return False
+
+
+@contextmanager
+def _telemetry_operation(
+    operation_name: str,
+    *,
+    request_id: Optional[str] = None,
+    active_session_id: Optional[str] = None,
+    target_session_id: Optional[str] = None,
+    write_id: Optional[str] = None,
+    compaction_id: Optional[str] = None,
+    checkpoint_id: Optional[str] = None,
+    transaction_id: Optional[str] = None,
+    connection_id: Optional[str] = None,
+    connection_role: Optional[str] = None,
+    caller_name: Optional[str] = None,
+):
+    parent = _DB_TELEMETRY_CONTEXT.get() or {}
+    context = dict(parent)
+    operation_id = f"op-{os.getpid()}-{time.time_ns()}"
+    parent_trace_id = parent.get("trace_id") or parent.get("request_id") or request_id
+    trace_id = parent_trace_id or f"db-trace-{os.getpid()}-{time.time_ns()}"
+    parent_span_id = parent.get("span_id") or parent.get("parent_span_id") or trace_id
+    context.update(
+        {
+            "operation_id": operation_id,
+            "operation_name": operation_name,
+            "trace_id": trace_id,
+            "span_id": operation_id,
+            "parent_span_id": parent_span_id,
+            "request_id": request_id or parent.get("request_id"),
+            "active_session_id": active_session_id or parent.get("active_session_id"),
+            "target_session_id": target_session_id or parent.get("target_session_id"),
+            "write_id": write_id or parent.get("write_id"),
+            "compaction_id": compaction_id or parent.get("compaction_id"),
+            "checkpoint_id": checkpoint_id or parent.get("checkpoint_id"),
+            "transaction_id": transaction_id or parent.get("transaction_id"),
+            "connection_id": connection_id or parent.get("connection_id"),
+            "connection_role": connection_role or parent.get("connection_role"),
+            "caller_name": caller_name or parent.get("caller_name"),
+        }
+    )
+    token = _DB_TELEMETRY_CONTEXT.set(context)
+    _emit_db_event("DB_OPERATION_START", status="started")
+    try:
+        yield context
+    except BaseException as exc:
+        _emit_db_event(
+            "DB_OPERATION_ERROR",
+            status="error",
+            error_type=type(exc).__name__,
+        )
+        raise
+    else:
+        _emit_db_event("DB_OPERATION_END", status="completed")
+    finally:
+        _DB_TELEMETRY_CONTEXT.reset(token)
+
+
+def _telemetry_method(operation_name: str):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapped(self, *args, **kwargs):
+            request_id = kwargs.get("request_id")
+            target_session_id = kwargs.get("session_id")
+            if target_session_id is None and args and operation_name in {
+                "get_messages_around", "get_anchored_view"
+            }:
+                target_session_id = args[0]
+            with _telemetry_operation(
+                operation_name,
+                request_id=request_id,
+                target_session_id=target_session_id,
+                connection_id=self._connection_id,
+                connection_role=self._connection_role,
+            ):
+                return fn(self, *args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
@@ -989,7 +1291,9 @@ class SessionDB:
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
 
-        self._lock = threading.Lock()
+        self._connection_id = f"conn-{os.getpid()}-{time.time_ns()}"
+        self._connection_role = "reader" if read_only else "shared"
+        self._lock = _TelemetryLock(self._connection_id)
         self._write_count = 0
         self._fts_enabled = False
         self._trigram_available = False
@@ -997,6 +1301,9 @@ class SessionDB:
         self._hermes_home = get_hermes_home()
         self._fts_unavailable_warned = False
         self._conn = None
+        self._native_probe = None
+        self._kernel_probe_enabled = diagnostic_enabled("kernel_snapshot")
+        self._sqlite_native_probe_enabled = diagnostic_enabled("sqlite_native")
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -1015,6 +1322,12 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                logger.info(
+                    "DB_CONNECTION_OPEN connection_id=%s connection_role=%s db_path=%s "
+                    "thread_id=%s",
+                    self._connection_id, self._connection_role, self.db_path,
+                    threading.get_ident(),
+                )
                 self._apply_read_pragmas()
                 if self._hermes_home:
                     try:
@@ -1025,6 +1338,7 @@ class SessionDB:
                         self._conn.enable_load_extension(False)
                     except Exception:
                         pass
+                self._attach_diagnostic_probes()
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1043,11 +1357,18 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                logger.info(
+                    "DB_CONNECTION_OPEN connection_id=%s connection_role=%s db_path=%s "
+                    "thread_id=%s",
+                    self._connection_id, self._connection_role, self.db_path,
+                    threading.get_ident(),
+                )
                 apply_wal_with_fallback(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._apply_read_pragmas()
                 self._simple_loaded = self._load_simple_extension()
                 self._init_schema()
+                self._attach_diagnostic_probes()
 
             try:
                 _connect_and_init()
@@ -1090,6 +1411,27 @@ class SessionDB:
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
 
+    def _emit_diagnostic_event(self, fields: Dict[str, Any]) -> None:
+        payload = dict(fields)
+        event = payload.pop("event", "DB_DIAGNOSTIC")
+        _emit_db_event(event, **payload)
+
+    def _attach_diagnostic_probes(self) -> None:
+        if self._conn is None:
+            return
+        if self._sqlite_native_probe_enabled:
+            self._native_probe = SQLiteNativeProbe.try_attach(
+                self._conn, self._emit_diagnostic_event
+            )
+            _emit_db_event(
+                "DB_NATIVE_ATTACH",
+                status="available" if self._native_probe.available else "disabled",
+                native_backend=getattr(self._native_probe, "backend", "unavailable"),
+                native_api_available=getattr(
+                    self._native_probe, "native_api_available", False
+                ),
+            )
+
     # ── Core write helper ──
 
     @staticmethod
@@ -1097,17 +1439,25 @@ class SessionDB:
         err = str(exc).lower()
         if "no such module" in err and "fts5" in err:
             return True
-        # SQLite builds that have FTS5 but lack the optional trigram tokenizer
-        # raise "no such tokenizer: trigram" instead of "no such module".
-        # Scope to trigram specifically to avoid masking unrelated tokenizer errors.
-        if "no such tokenizer: trigram" in err:
+        # SQLite builds that have FTS5 but lack an optional CJK tokenizer
+        # raise "no such tokenizer: trigram" or "no such tokenizer: simple"
+        # instead of "no such module". Scope this to the known optional
+        # tokenizers so unrelated tokenizer errors still propagate.
+        if (
+            "no such tokenizer: trigram" in err
+            or "no such tokenizer: simple" in err
+        ):
             return True
         return False
 
     @staticmethod
     def _is_trigram_unavailable_error(exc: sqlite3.OperationalError) -> bool:
         """True when only the trigram tokenizer is missing (FTS5 itself works)."""
-        return "no such tokenizer: trigram" in str(exc).lower()
+        err = str(exc).lower()
+        return (
+            "no such tokenizer: trigram" in err
+            or "no such tokenizer: simple" in err
+        )
 
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
@@ -1115,8 +1465,8 @@ class SessionDB:
             return
         self._trigram_unavailable_warned = True
         logger.info(
-            "SQLite trigram tokenizer unavailable for %s "
-            "(requires SQLite >= 3.34, this build is %s); "
+            "Optional CJK tokenizer unavailable for %s "
+            "(SQLite build is %s); "
             "CJK/substring search will fall back to LIKE: %s",
             self.db_path,
             sqlite3.sqlite_version,
@@ -1285,6 +1635,28 @@ class SessionDB:
             return False
 
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        write_id = str(time.time_ns())
+        parent = _DB_TELEMETRY_CONTEXT.get() or {}
+        operation_name = parent.get("operation_name") or "write"
+        if parent.get("caller_name"):
+            caller_name = parent["caller_name"]
+        elif operation_name != "write":
+            caller_name = operation_name
+        else:
+            caller_name = sys._getframe(1).f_code.co_name
+        with _telemetry_operation(
+            operation_name,
+            write_id=write_id,
+            transaction_id=write_id,
+            connection_id=self._connection_id,
+            connection_role=self._connection_role,
+            caller_name=caller_name,
+        ):
+            return self._execute_write_impl(fn, write_id)
+
+    def _execute_write_impl(
+        self, fn: Callable[[sqlite3.Connection], T], write_id: str
+    ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
         *fn* receives the connection and should perform INSERT/UPDATE/DELETE
@@ -1303,26 +1675,83 @@ class SessionDB:
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
-                _lock_wait_start = time.time()
+                _write_t0 = time.perf_counter()
+                _lock_wait_start = _write_t0
                 with self._lock:
-                    _lock_acquired = time.time()
+                    _lock_acquired = time.perf_counter()
+                    _lock_wait_ms = (_lock_acquired - _lock_wait_start) * 1000
+                    _begin_t0 = time.perf_counter()
+                    _emit_db_event(
+                        "DB_TRANSACTION_BEGIN_START",
+                        status="started",
+                        transaction_id=write_id,
+                    )
                     self._conn.execute("BEGIN IMMEDIATE")
+                    _begin_ms = (time.perf_counter() - _begin_t0) * 1000
+                    _emit_db_event(
+                        "DB_TRANSACTION_BEGIN_END",
+                        status="completed",
+                        transaction_id=write_id,
+                        execute_ms=int(_begin_ms),
+                    )
+                    logger.info(
+                        "TRANSACTION_BEGIN transaction_id=%s write_id=%s connection_id=%s "
+                        "thread_id=%s",
+                        write_id, write_id, self._connection_id, threading.get_ident(),
+                    )
                     try:
+                        _exec_t0 = time.perf_counter()
                         result = fn(self._conn)
+                        _exec_ms = (time.perf_counter() - _exec_t0) * 1000
+                        _commit_t0 = time.perf_counter()
+                        _emit_db_event(
+                            "DB_COMMIT_START",
+                            status="started",
+                            transaction_id=write_id,
+                        )
                         self._conn.commit()
+                        _commit_ms = (time.perf_counter() - _commit_t0) * 1000
+                        _emit_db_event(
+                            "DB_COMMIT_END",
+                            status="completed",
+                            transaction_id=write_id,
+                            commit_ms=int(_commit_ms),
+                        )
+                        logger.info(
+                            "TRANSACTION_END transaction_id=%s write_id=%s connection_id=%s "
+                            "duration_ms=%d status=committed thread_id=%s",
+                            write_id, write_id, self._connection_id,
+                            int(_begin_ms + _exec_ms + _commit_ms), threading.get_ident(),
+                        )
                     except BaseException:
+                        _emit_db_event(
+                            "DB_ROLLBACK",
+                            status="started",
+                            transaction_id=write_id,
+                        )
                         try:
                             self._conn.rollback()
                         except Exception:
                             pass
                         raise
-                # Success — log if write was slow
-                _total = time.time() - _lock_wait_start
-                if _total > 0.5:
+                # Checkpoint runs after this block, so it is deliberately not
+                # included in this transaction timing.
+                _total_ms = (time.perf_counter() - _write_t0) * 1000
+                _residual_ms = max(
+                    0.0,
+                    _total_ms - _lock_wait_ms - _begin_ms - _exec_ms - _commit_ms,
+                )
+                if _total_ms > 500:
                     logger.warning(
-                        "Slow write (%.1fs, lock wait %.1fs): %s",
-                        _total, _lock_acquired - _lock_wait_start,
+                        "Slow write write_id=%s total_ms=%d lock_wait_ms=%d "
+                        "begin_ms=%d exec_ms=%d commit_ms=%d residual_ms=%d "
+                        "checkpoint=separate op=%s attempt=%d",
+                        write_id,
+                        int(_total_ms), int(_lock_wait_ms),
+                        int(_begin_ms), int(_exec_ms), int(_commit_ms),
+                        int(_residual_ms),
                         fn.__name__ if hasattr(fn, '__name__') else 'write',
+                        attempt + 1,
                     )
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -1353,35 +1782,76 @@ class SessionDB:
         )
 
     def _try_wal_checkpoint(self) -> None:
-        """Best-effort TRUNCATE WAL checkpoint.  Never raises.
+        checkpoint_id = f"checkpoint-{os.getpid()}-{time.time_ns()}"
+        with _telemetry_operation(
+            "wal_checkpoint",
+            checkpoint_id=checkpoint_id,
+            connection_id=self._connection_id,
+            connection_role="checkpoint",
+        ):
+            return self._try_wal_checkpoint_impl(checkpoint_id)
 
-        Flushes committed WAL frames back into the main DB file and
-        truncates the WAL file to zero bytes.  Keeps the WAL from
-        growing unbounded when many processes hold persistent
-        connections.
+    def _try_wal_checkpoint_impl(self, checkpoint_id: str) -> None:
+        wal_path = Path(f"{self.db_path}-wal")
 
-        PASSIVE checkpoint was previously used here, but it never
-        truncates the WAL file — the file stays at its high-water
-        mark until an explicit TRUNCATE is called (which only
-        happened inside the infrequent vacuum()).
+        def _wal_bytes() -> int:
+            try:
+                return wal_path.stat().st_size
+            except OSError:
+                return 0
 
-        TRUNCATE may block writers briefly while checkpointing, but
-        _try_wal_checkpoint is called off the hot path (every 50
-        writes) and already runs under ``self._lock``, so the
-        additional hold time is negligible.
-        """
+        _t0 = time.perf_counter()
+        _lock_t0 = _t0
+        _wal_before = _wal_bytes()
+        _busy = _log_frames = _checkpointed_frames = -1
+        _emit_db_event(
+            "DB_CHECKPOINT_START",
+            status="started",
+            checkpoint_id=checkpoint_id,
+            checkpoint_ms="-",
+        )
         try:
             with self._lock:
+                _lock_wait_ms = (time.perf_counter() - _lock_t0) * 1000
+                _checkpoint_t0 = time.perf_counter()
                 result = self._conn.execute(
                     "PRAGMA wal_checkpoint(TRUNCATE)"
                 ).fetchone()
-                if result and result[1] > 0:
-                    logger.debug(
-                        "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
-                    )
-        except Exception:
-            pass  # Best effort — never fatal.
+                _checkpoint_ms = (time.perf_counter() - _checkpoint_t0) * 1000
+                if result:
+                    _busy, _log_frames, _checkpointed_frames = map(int, result[:3])
+                _wal_after = _wal_bytes()
+                logger.info(
+                    "CHECKPOINT checkpoint_id=%s checkpoint_ms=%d busy=%d log_frames=%d "
+                    "checkpointed_frames=%d wal_before_bytes=%d wal_after_bytes=%d "
+                    "lock_wait_ms=%d python_lock_held=1",
+                    checkpoint_id, int(_checkpoint_ms), _busy, _log_frames, _checkpointed_frames,
+                    _wal_before, _wal_after, int(_lock_wait_ms),
+                )
+                _emit_db_event(
+                    "DB_CHECKPOINT_END",
+                    status="completed",
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_ms=int(_checkpoint_ms),
+                    lock_wait_ms=int(_lock_wait_ms),
+                    rows_returned=_checkpointed_frames,
+                )
+        except Exception as exc:
+            _elapsed_ms = (time.perf_counter() - _t0) * 1000
+            logger.warning(
+                "CHECKPOINT checkpoint_id=%s checkpoint_ms=%d busy=%d log_frames=%d "
+                "checkpointed_frames=%d wal_before_bytes=%d wal_after_bytes=%d "
+                "lock_wait_ms=%d python_lock_held=unknown error=%s",
+                checkpoint_id, int(_elapsed_ms), _busy, _log_frames, _checkpointed_frames,
+                _wal_before, _wal_bytes(), 0, type(exc).__name__,
+            )
+            _emit_db_event(
+                "DB_CHECKPOINT_ERROR",
+                status="error",
+                checkpoint_id=checkpoint_id,
+                checkpoint_ms=int(_elapsed_ms),
+                error_type=type(exc).__name__,
+            )
 
     def _try_optimize_fts(self) -> None:
         """Best-effort FTS5 segment merge. Never raises.
@@ -1407,6 +1877,12 @@ class SessionDB:
         """
         with self._lock:
             if self._conn:
+                if self._native_probe is not None:
+                    try:
+                        self._native_probe.close()
+                    except Exception:
+                        pass
+                    self._native_probe = None
                 try:
                     self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 except Exception:
@@ -1527,6 +2003,14 @@ class SessionDB:
         if not simple_so or not simple_so.exists():
             logger.debug("simple tokenizer not found at %s — CJK FTS5 degrade", simple_so)
             return False
+        if not hasattr(self._conn, "enable_load_extension") or not hasattr(
+            self._conn, "load_extension"
+        ):
+            logger.info(
+                "SQLite runtime does not expose loadable-extension support; "
+                "CJK FTS5 will fall back to LIKE"
+            )
+            return False
         try:
             self._conn.enable_load_extension(True)
             self._conn.load_extension(str(simple_so))
@@ -1538,7 +2022,7 @@ class SessionDB:
         finally:
             try:
                 self._conn.enable_load_extension(False)
-            except sqlite3.OperationalError:
+            except (sqlite3.OperationalError, AttributeError):
                 pass
 
     def _get_libsimple_path(self):
@@ -4214,6 +4698,13 @@ class SessionDB:
         matching what the live load returns. Returns the new active count.
         """
 
+        compaction_id = f"{session_id[:16]}-{time.perf_counter_ns()}"
+        compacted_content_bytes = sum(
+            len(message.get("content", "").encode("utf-8"))
+            for message in compacted_messages
+            if isinstance(message.get("content"), str)
+        )
+
         def _do(conn):
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
@@ -4221,23 +4712,48 @@ class SessionDB:
             # back"). search_messages includes compacted=1 rows by default so
             # the pre-compaction transcript stays discoverable; live-context
             # loads (active=1 only) still exclude them.
-            conn.execute(
+            _archive_t0 = time.perf_counter()
+            archive_cursor = conn.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
+            _archive_ms = (time.perf_counter() - _archive_t0) * 1000
+            archived = max(0, archive_cursor.rowcount)
+
+            _insert_t0 = time.perf_counter()
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
             )
+            _insert_ms = (time.perf_counter() - _insert_t0) * 1000
+
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
+            _session_t0 = time.perf_counter()
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (inserted, tool_calls_total, session_id),
             )
+            _session_update_ms = (time.perf_counter() - _session_t0) * 1000
+            logger.info(
+                "COMPACTION compaction_id=%s sid=%.16s archived_rows=%d "
+                "inserted_rows=%d compacted_content_bytes=%d archive_ms=%d "
+                "insert_ms=%d session_update_ms=%d",
+                compaction_id, session_id, archived, inserted,
+                compacted_content_bytes, int(_archive_ms), int(_insert_ms),
+                int(_session_update_ms),
+            )
             return inserted
 
-        return self._execute_write(_do)
+        with _telemetry_operation(
+            "archive_and_compact",
+            compaction_id=compaction_id,
+            active_session_id=session_id,
+            target_session_id=session_id,
+            connection_id=self._connection_id,
+            connection_role=self._connection_role,
+        ):
+            return self._execute_write(_do)
 
 
     def get_messages(
@@ -4290,11 +4806,13 @@ class SessionDB:
             result.append(msg)
         return result
 
+    @_telemetry_method("get_messages_around")
     def get_messages_around(
         self,
         session_id: str,
         around_message_id: int,
         window: int = 5,
+        request_id: str = None,
     ) -> Dict[str, Any]:
         """Load a window of messages anchored on a specific message id.
 
@@ -4317,32 +4835,51 @@ class SessionDB:
         """
         if window < 0:
             window = 0
+        _request_id = request_id or "-"
+        _t0 = time.perf_counter()
+        _lock_t0 = _t0
+        _anchor_ms = _before_ms = _after_ms = _lock_wait_ms = 0.0
         with self._lock:
+            _lock_wait_ms = (time.perf_counter() - _lock_t0) * 1000
             # Confirm the anchor exists in this session.
+            _sql_t0 = time.perf_counter()
             anchor_exists = self._conn.execute(
                 "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
+            _anchor_ms = (time.perf_counter() - _sql_t0) * 1000
             if not anchor_exists:
+                logger.info(
+                    "GET_MESSAGES_AROUND request_id=%s sid=%.16s anchor_ms=%d "
+                    "before_ms=0 after_ms=0 hydrate_ms=0 total_ms=%d "
+                    "lock_wait_ms=%d rows=0 anchor_found=0",
+                    _request_id, session_id, int(_anchor_ms),
+                    int((time.perf_counter() - _t0) * 1000), int(_lock_wait_ms),
+                )
                 return {"window": [], "messages_before": 0, "messages_after": 0}
 
             # Two queries: anchor + before (DESC, take window+1), and after
             # (ASC, take window). Final order is id ASC.
+            _sql_t0 = time.perf_counter()
             before_rows = self._conn.execute(
                 "SELECT id, session_id, role, content, timestamp FROM messages "
                 "WHERE session_id = ? AND id <= ? "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, around_message_id, window + 1),
             ).fetchall()
+            _before_ms = (time.perf_counter() - _sql_t0) * 1000
+            _sql_t0 = time.perf_counter()
             after_rows = self._conn.execute(
                 "SELECT id, session_id, role, content, timestamp FROM messages "
                 "WHERE session_id = ? AND id > ? "
                 "ORDER BY id ASC LIMIT ?",
                 (session_id, around_message_id, window),
             ).fetchall()
+            _after_ms = (time.perf_counter() - _sql_t0) * 1000
 
         # before_rows is DESC; reverse so it's ASC, then concatenate after_rows.
         rows = list(reversed(before_rows)) + list(after_rows)
+        _hydrate_t0 = time.perf_counter()
         result = []
         for row in rows:
             msg = dict(row)
@@ -4357,17 +4894,26 @@ class SessionDB:
                     )
                     msg["tool_calls"] = []
             result.append(msg)
+        _hydrate_ms = (time.perf_counter() - _hydrate_t0) * 1000
 
         # before_rows includes the anchor itself; subtract 1 for the count of
         # messages strictly before the anchor in the returned slice.
         messages_before = max(0, len(before_rows) - 1)
         messages_after = len(after_rows)
+        logger.info(
+            "GET_MESSAGES_AROUND request_id=%s sid=%.16s anchor_ms=%d before_ms=%d "
+            "after_ms=%d hydrate_ms=%d total_ms=%d lock_wait_ms=%d rows=%d anchor_found=1",
+            _request_id, session_id, int(_anchor_ms), int(_before_ms), int(_after_ms),
+            int(_hydrate_ms), int((time.perf_counter() - _t0) * 1000),
+            int(_lock_wait_ms), len(rows),
+        )
         return {
             "window": result,
             "messages_before": messages_before,
             "messages_after": messages_after,
         }
 
+    @_telemetry_method("get_anchored_view")
     def get_anchored_view(
         self,
         session_id: str,
@@ -4375,6 +4921,7 @@ class SessionDB:
         window: int = 5,
         bookend: int = 3,
         keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+        request_id: str = None,
     ) -> Dict[str, Any]:
         """Return an anchored window plus session bookends.
 
@@ -4405,13 +4952,21 @@ class SessionDB:
         if bookend < 0:
             bookend = 0
 
-        # Reuse the primitive — handles anchor-existence, content decoding,
-        # tool_calls deserialisation, and boundary counts.
+        _request_id = request_id or "-"
+        _view_t0 = time.perf_counter()
         primitive = self.get_messages_around(
-            session_id, around_message_id, window=window
+            session_id, around_message_id, window=window, request_id=_request_id
         )
+        _primitive_ms = (time.perf_counter() - _view_t0) * 1000
         window_rows = primitive["window"]
         if not window_rows:
+            logging.info(
+                "ANCHORED_VIEW request_id=%s sid=%.16s primitive_ms=%d "
+                "bookend_sql_ms=0 bookend_hydrate_ms=0 bookend_lock_wait_ms=0 "
+                "total_ms=%d anchor_found=0",
+                _request_id, session_id, int(_primitive_ms),
+                int((time.perf_counter() - _view_t0) * 1000),
+            )
             return {
                 "window": [],
                 "messages_before": 0,
@@ -4439,8 +4994,12 @@ class SessionDB:
         # don't crowd out actual prose openings/closings.
         bookend_start_rows: List[Any] = []
         bookend_end_rows: List[Any] = []
+        _bookend_sql_ms = 0.0
+        _bookend_lock_wait_ms = 0.0
         if bookend > 0:
+            _bookend_lock_t0 = time.perf_counter()
             with self._lock:
+                _bookend_lock_wait_ms = (time.perf_counter() - _bookend_lock_t0) * 1000
                 role_clause = ""
                 role_params: list = []
                 if keep_roles is not None:
@@ -4448,6 +5007,7 @@ class SessionDB:
                     role_clause = f" AND role IN ({role_placeholders})"
                     role_params = list(keep_roles)
 
+                _bookend_sql_t0 = time.perf_counter()
                 bookend_start_rows = self._conn.execute(
                     f"SELECT id, session_id, role, content, timestamp FROM messages "
                     f"WHERE session_id = ? AND id < ?{role_clause} "
@@ -4463,6 +5023,7 @@ class SessionDB:
                     f"ORDER BY id DESC LIMIT ?",
                     (session_id, window_max_id, *role_params, bookend),
                 ).fetchall()
+                _bookend_sql_ms = (time.perf_counter() - _bookend_sql_t0) * 1000
                 # End rows came back DESC for the LIMIT cap; flip to ASC.
                 bookend_end_rows = list(reversed(bookend_end_rows))
 
@@ -4480,12 +5041,25 @@ class SessionDB:
                     msg["tool_calls"] = []
             return msg
 
+        _bookend_hydrate_t0 = time.perf_counter()
+        _bookend_start = [_hydrate(r) for r in bookend_start_rows]
+        _bookend_end = [_hydrate(r) for r in bookend_end_rows]
+        _bookend_hydrate_ms = (time.perf_counter() - _bookend_hydrate_t0) * 1000
+        logging.info(
+            "ANCHORED_VIEW request_id=%s sid=%.16s primitive_ms=%d "
+            "bookend_sql_ms=%d bookend_hydrate_ms=%d bookend_lock_wait_ms=%d "
+            "total_ms=%d anchor_found=1 window_rows=%d bookend_rows=%d",
+            _request_id, session_id, int(_primitive_ms), int(_bookend_sql_ms),
+            int(_bookend_hydrate_ms), int(_bookend_lock_wait_ms),
+            int((time.perf_counter() - _view_t0) * 1000), len(filtered_window),
+            len(_bookend_start) + len(_bookend_end),
+        )
         return {
             "window": filtered_window,
             "messages_before": primitive["messages_before"],
             "messages_after": primitive["messages_after"],
-            "bookend_start": [_hydrate(r) for r in bookend_start_rows],
-            "bookend_end": [_hydrate(r) for r in bookend_end_rows],
+            "bookend_start": _bookend_start,
+            "bookend_end": _bookend_end,
         }
 
     def resolve_resume_session_id(self, session_id: str) -> str:
@@ -5007,6 +5581,7 @@ class SessionDB:
         """Count CJK characters in text."""
         return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
 
+    @_telemetry_method("search_messages")
     def search_messages(
         self,
         query: str,
@@ -5017,6 +5592,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        request_id: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -5130,6 +5706,247 @@ class SessionDB:
             )
         """
 
+        _request_id = request_id or "-"
+        _route = "unicode61"
+        _search_t0 = time.perf_counter()
+        _execute_ms = 0.0
+        _first_row_ms = 0.0
+        _fetch_ms = 0.0
+        _search_lock_wait_ms = 0.0
+        _search_lock_hold_ms = 0.0
+        _fts_lock_wait_ms = 0.0
+        _fts_lock_hold_ms = 0.0
+        _ctx_lock_wait_ms = 0.0
+        _ctx_lock_hold_ms = 0.0
+        _ctx_sql_ms = 0.0
+        _ctx_execute_ms = 0.0
+        _ctx_execute_thread_cpu_ms = 0.0
+        _ctx_first_row_ms = 0.0
+        _ctx_first_row_thread_cpu_ms = 0.0
+        _ctx_fetch_ms = 0.0
+        _ctx_fetch_thread_cpu_ms = 0.0
+        _ctx_fetch_batch_count = 0
+        _ctx_fetch_batch_max_wall_ms = 0.0
+        _ctx_fetch_batch_max_thread_cpu_ms = 0.0
+        _ctx_materialize_wall_ms = 0.0
+        _ctx_materialize_thread_cpu_ms = 0.0
+        _ctx_decode_ms = 0.0
+        _ctx_build_ms = 0.0
+        _ctx_t0 = time.perf_counter()
+        _context_query_count = 0
+        _context_rows_loaded = 0
+        _context_bytes_loaded = 0
+        _unique_session_count = 0
+        _context_session_ids: list = []
+        _ctx_session_msgs: dict = {}
+        _query_probe_tokens: dict = {}
+        _finished_query_ids: set = set()
+
+        def _query_start(query_fingerprint: str, **extra):
+            query_id = f"cursor-{os.getpid()}-{time.time_ns()}"
+            started_ns = time.perf_counter_ns()
+            _emit_db_event(
+                "DB_QUERY_START",
+                status="started",
+                query_fingerprint=query_fingerprint,
+                cursor_id=query_id,
+                requested_monotonic_ns=started_ns,
+                **extra,
+            )
+            native_token = (
+                self._native_probe.start_query(query_id, query_fingerprint)
+                if self._native_probe is not None
+                else None
+            )
+            kernel_before = (
+                capture_snapshot(
+                    pid=os.getpid(), tid=threading.get_native_id(), db_path=self.db_path
+                )
+                if self._kernel_probe_enabled
+                else None
+            )
+            _query_probe_tokens[query_id] = (native_token, kernel_before)
+            return query_id, started_ns
+
+        def _query_finish(query_id, query_fingerprint, cursor=None):
+            if not query_id or query_id in _finished_query_ids:
+                return
+            _finished_query_ids.add(query_id)
+            native_token, kernel_before = _query_probe_tokens.pop(query_id, (None, None))
+            if self._native_probe is not None:
+                try:
+                    self._native_probe.finish_query(native_token, cursor=cursor)
+                except Exception:
+                    pass
+            if kernel_before is not None:
+                try:
+                    kernel_after = capture_snapshot(
+                        pid=os.getpid(), tid=threading.get_native_id(), db_path=self.db_path
+                    )
+                    _emit_db_event(
+                        "DB_KERNEL_WINDOW",
+                        status="completed",
+                        query_id=query_id,
+                        query_fingerprint=query_fingerprint,
+                        **diff_snapshot(kernel_before, kernel_after),
+                    )
+                except Exception as exc:
+                    _emit_db_event(
+                        "DB_KERNEL_WINDOW",
+                        status="error",
+                        query_id=query_id,
+                        query_fingerprint=query_fingerprint,
+                        error_type=type(exc).__name__,
+                    )
+
+        def _query_abort(query_id, query_fingerprint):
+            _query_finish(query_id, query_fingerprint)
+
+        def _query_executed(query_id, query_fingerprint, started_ns, execute_ms, **extra):
+            _emit_db_event(
+                "DB_QUERY_EXECUTED",
+                status="completed",
+                query_fingerprint=query_fingerprint,
+                cursor_id=query_id,
+                execute_ms=int(execute_ms),
+                **extra,
+            )
+
+        def _fetch_rows_timed(
+            cursor,
+            query_id=None,
+            query_fingerprint=None,
+            query_started_ns=None,
+            record_aggregate=True,
+            metrics_sink=None,
+        ):
+            try:
+                return _fetch_rows_timed_impl(
+                    cursor,
+                    query_id=query_id,
+                    query_fingerprint=query_fingerprint,
+                    query_started_ns=query_started_ns,
+                    record_aggregate=record_aggregate,
+                    metrics_sink=metrics_sink,
+                )
+            finally:
+                if query_id:
+                    _query_abort(query_id, query_fingerprint)
+
+        def _fetch_rows_timed_impl(
+            cursor,
+            query_id=None,
+            query_fingerprint=None,
+            query_started_ns=None,
+            record_aggregate=True,
+            metrics_sink=None,
+        ):
+            """Fetch rows in bounded batches and record wall/CPU attribution."""
+            nonlocal _first_row_ms, _fetch_ms
+            _fetch_batch_size = 256
+            _first_t0 = time.perf_counter_ns()
+            _first_cpu_t0 = time.thread_time_ns()
+            first = cursor.fetchone()
+            first_ms = (time.perf_counter_ns() - _first_t0) / 1_000_000
+            first_cpu_ms = (time.thread_time_ns() - _first_cpu_t0) / 1_000_000
+            if record_aggregate:
+                _first_row_ms = first_ms
+            rows = []
+            if first is not None:
+                rows.append(dict(first))
+            if query_id:
+                _emit_db_event(
+                    "DB_QUERY_FIRST_ROW",
+                    status="completed",
+                    query_fingerprint=query_fingerprint,
+                    cursor_id=query_id,
+                    first_row_ms=int(first_ms),
+                    first_row_thread_cpu_ms=int(first_cpu_ms),
+                    rows_returned=1 if first is not None else 0,
+                )
+
+            fetch_t0 = time.perf_counter_ns()
+            fetch_cpu_t0 = time.thread_time_ns()
+            fetch_batch_count = 0
+            fetch_batch_max_wall_ms = 0.0
+            fetch_batch_max_thread_cpu_ms = 0.0
+            materialize_wall_ms = 0.0
+            materialize_thread_cpu_ms = 0.0
+            while True:
+                batch_t0 = time.perf_counter_ns()
+                batch_cpu_t0 = time.thread_time_ns()
+                batch = cursor.fetchmany(_fetch_batch_size)
+                batch_wall_ms = (time.perf_counter_ns() - batch_t0) / 1_000_000
+                batch_thread_cpu_ms = (
+                    time.thread_time_ns() - batch_cpu_t0
+                ) / 1_000_000
+                if not batch:
+                    break
+                fetch_batch_count += 1
+                fetch_batch_max_wall_ms = max(fetch_batch_max_wall_ms, batch_wall_ms)
+                fetch_batch_max_thread_cpu_ms = max(
+                    fetch_batch_max_thread_cpu_ms, batch_thread_cpu_ms
+                )
+                materialize_t0 = time.perf_counter_ns()
+                materialize_cpu_t0 = time.thread_time_ns()
+                rows.extend(dict(row) for row in batch)
+                materialize_wall_ms += (
+                    time.perf_counter_ns() - materialize_t0
+                ) / 1_000_000
+                materialize_thread_cpu_ms += (
+                    time.thread_time_ns() - materialize_cpu_t0
+                ) / 1_000_000
+
+            fetch_ms = (time.perf_counter_ns() - fetch_t0) / 1_000_000
+            fetch_thread_cpu_ms = (
+                time.thread_time_ns() - fetch_cpu_t0
+            ) / 1_000_000
+            if record_aggregate:
+                _fetch_ms = fetch_ms
+            if query_id:
+                bytes_loaded = sum(
+                    len(value.encode("utf-8"))
+                    if isinstance(value, str)
+                    else len(value)
+                    if isinstance(value, (bytes, bytearray))
+                    else 0
+                    for row in rows
+                    for value in row.values()
+                    if isinstance(value, (str, bytes, bytearray))
+                )
+                _emit_db_event(
+                    "DB_QUERY_FETCH_END",
+                    status="completed",
+                    query_fingerprint=query_fingerprint,
+                    cursor_id=query_id,
+                    fetch_ms=int(fetch_ms),
+                    fetch_thread_cpu_ms=int(fetch_thread_cpu_ms),
+                    fetch_batch_size=_fetch_batch_size,
+                    fetch_batch_count=fetch_batch_count,
+                    fetch_batch_max_wall_ms=int(fetch_batch_max_wall_ms),
+                    fetch_batch_max_thread_cpu_ms=int(fetch_batch_max_thread_cpu_ms),
+                    materialize_wall_ms=int(materialize_wall_ms),
+                    materialize_thread_cpu_ms=int(materialize_thread_cpu_ms),
+                    rows_returned=len(rows),
+                    bytes_loaded=bytes_loaded,
+                )
+            if query_id:
+                _query_finish(query_id, query_fingerprint, cursor=cursor)
+            if metrics_sink is not None:
+                metrics_sink.update(
+                    first_row_ms=first_ms,
+                    first_row_thread_cpu_ms=first_cpu_ms,
+                    fetch_ms=fetch_ms,
+                    fetch_thread_cpu_ms=fetch_thread_cpu_ms,
+                    fetch_batch_count=fetch_batch_count,
+                    fetch_batch_max_wall_ms=fetch_batch_max_wall_ms,
+                    fetch_batch_max_thread_cpu_ms=fetch_batch_max_thread_cpu_ms,
+                    materialize_wall_ms=materialize_wall_ms,
+                    materialize_thread_cpu_ms=materialize_thread_cpu_ms,
+                    rows_returned=len(rows),
+                )
+            return rows
+
         # CJK queries bypass the unicode61 FTS5 table.  The default tokenizer
         # splits CJK characters into individual tokens, so "大别山项目" becomes
         # "大 AND 别 AND 山 AND 项 AND 目" — producing false positives and
@@ -5207,14 +6024,45 @@ class SessionDB:
                     )
                 """
                 tri_params.extend([limit, offset])
+                _lock_t0 = time.perf_counter()
                 with self._lock:
+                    _lock_acquired_t0 = time.perf_counter()
+                    _fts_lock_wait_ms += (_lock_acquired_t0 - _lock_t0) * 1000
                     try:
+                        _query_fingerprint = "session_search_fts_trigram"
+                        _query_id, _query_started_ns = _query_start(_query_fingerprint)
+                        _execute_t0 = time.perf_counter()
                         tri_cursor = self._conn.execute(tri_sql, tri_params)
-                    except sqlite3.OperationalError:
+                        _query_execute_ms = (time.perf_counter() - _execute_t0) * 1000
+                        _execute_ms += _query_execute_ms
+                        _query_executed(
+                            _query_id,
+                            _query_fingerprint,
+                            _query_started_ns,
+                            _query_execute_ms,
+                        )
+                    except sqlite3.OperationalError as exc:
+                        _emit_db_event(
+                            "DB_QUERY_EXECUTED",
+                            status="error",
+                            query_fingerprint="session_search_fts_trigram",
+                            cursor_id=locals().get("_query_id", "-"),
+                            error_type=type(exc).__name__,
+                        )
+                        _query_abort(
+                            locals().get("_query_id"), "session_search_fts_trigram"
+                        )
                         # Trigram query failed at runtime — fall through to LIKE.
                         pass
                     else:
-                        matches = [dict(row) for row in tri_cursor.fetchall()]
+                        matches = _fetch_rows_timed(
+                            tri_cursor,
+                            query_id=_query_id,
+                            query_fingerprint=_query_fingerprint,
+                            query_started_ns=_query_started_ns,
+                        )
+                        _fts_lock_hold_ms += (time.perf_counter() - _lock_acquired_t0) * 1000
+                        _route = "trigram"
                         _trigram_succeeded = True
             if not _trigram_succeeded:
                 # Short / mixed CJK query, trigram unavailable, or trigram
@@ -5260,50 +6108,173 @@ class SessionDB:
                 like_params.extend([limit, offset])
                 # instr() for snippet uses first search token
                 like_params = [non_op_tokens[0]] + like_params
+                _lock_t0 = time.perf_counter()
                 with self._lock:
-                    like_cursor = self._conn.execute(like_sql, like_params)
-                    matches = [dict(row) for row in like_cursor.fetchall()]
+                    _lock_acquired_t0 = time.perf_counter()
+                    _fts_lock_wait_ms += (_lock_acquired_t0 - _lock_t0) * 1000
+                    _query_fingerprint = "session_search_like"
+                    _query_id, _query_started_ns = _query_start(_query_fingerprint)
+                    _execute_t0 = time.perf_counter()
+                    try:
+                        like_cursor = self._conn.execute(like_sql, like_params)
+                    except Exception:
+                        _query_abort(_query_id, _query_fingerprint)
+                        raise
+                    _query_execute_ms = (time.perf_counter() - _execute_t0) * 1000
+                    _execute_ms += _query_execute_ms
+                    _query_executed(
+                        _query_id,
+                        _query_fingerprint,
+                        _query_started_ns,
+                        _query_execute_ms,
+                    )
+                    matches = _fetch_rows_timed(
+                        like_cursor,
+                        query_id=_query_id,
+                        query_fingerprint=_query_fingerprint,
+                        query_started_ns=_query_started_ns,
+                    )
+                    _fts_lock_hold_ms += (time.perf_counter() - _lock_acquired_t0) * 1000
+                    _route = "like"
         else:
+            _lock_t0 = time.perf_counter()
             with self._lock:
+                _lock_acquired_t0 = time.perf_counter()
+                _fts_lock_wait_ms += (_lock_acquired_t0 - _lock_t0) * 1000
                 try:
+                    _query_fingerprint = "session_search_fts"
+                    _query_id, _query_started_ns = _query_start(_query_fingerprint)
+                    _execute_t0 = time.perf_counter()
                     cursor = self._conn.execute(sql, params)
-                except sqlite3.OperationalError:
+                    _query_execute_ms = (time.perf_counter() - _execute_t0) * 1000
+                    _execute_ms += _query_execute_ms
+                    _query_executed(
+                        _query_id,
+                        _query_fingerprint,
+                        _query_started_ns,
+                        _query_execute_ms,
+                    )
+                except sqlite3.OperationalError as exc:
                     # FTS5 query syntax error despite sanitization — return empty
+                    logger.warning(
+                        "SEARCH_PHASE request_id=%s route=unicode61 status=error error=%s",
+                        _request_id, type(exc).__name__,
+                    )
+                    _query_abort(locals().get("_query_id"), "session_search_fts")
                     return []
                 else:
-                    matches = [dict(row) for row in cursor.fetchall()]
+                    matches = _fetch_rows_timed(
+                        cursor,
+                        query_id=_query_id,
+                        query_fingerprint=_query_fingerprint,
+                        query_started_ns=_query_started_ns,
+                    )
+                    _fts_lock_hold_ms += (time.perf_counter() - _lock_acquired_t0) * 1000
 
         # Batch context: chunked session_id batches inside one lock.
         # Each chunk loads all messages from ≤20 sessions — bounded memory,
-        # fast SQL (~76ms for 153 sessions via 8 queries), and the lock is
-        # released after all chunks so gateway writer stays responsive.
+        # fast SQL, and the lock is released after all chunks.
+        _ctx_t0 = time.perf_counter()
         if matches:
             try:
-                ctx_session_ids = list({m["session_id"] for m in matches})
-                _ctx_session_msgs: dict = {}
+                _context_session_ids = list({m["session_id"] for m in matches})
+                _unique_session_count = len(_context_session_ids)
                 _BATCH_SIZE = 20
 
-                with self._lock:
-                    for chunk_start in range(0, len(ctx_session_ids), _BATCH_SIZE):
-                        chunk = ctx_session_ids[chunk_start:chunk_start + _BATCH_SIZE]
-                        placeholders = ",".join("?" for _ in chunk)
-                        chunk_rows = self._conn.execute(
-                            f"SELECT id, session_id, role, content "
-                            f"FROM messages WHERE session_id IN ({placeholders}) "
-                            f"ORDER BY session_id, timestamp, id",
-                            chunk,
-                        ).fetchall()
-                        for row in chunk_rows:
-                            sid = row["session_id"]
-                            if sid not in _ctx_session_msgs:
-                                _ctx_session_msgs[sid] = []
-                            _ctx_session_msgs[sid].append({
-                                "id": row["id"],
-                                "role": row["role"],
-                                "content": row["content"],
-                            })
+                for chunk_start in range(0, len(_context_session_ids), _BATCH_SIZE):
+                    chunk = _context_session_ids[chunk_start:chunk_start + _BATCH_SIZE]
+                    placeholders = ",".join("?" for _ in chunk)
+                    _context_query_count += 1
+                    _lock_t0 = time.perf_counter()
+                    with self._lock:
+                        _lock_acquired_t0 = time.perf_counter()
+                        _ctx_lock_wait_ms += (_lock_acquired_t0 - _lock_t0) * 1000
+                        _sql_t0 = time.perf_counter()
+                        _execute_cpu_t0 = time.thread_time_ns()
+                        _query_fingerprint = "session_search_context"
+                        _query_id, _query_started_ns = _query_start(
+                            _query_fingerprint,
+                            batch_index=chunk_start // _BATCH_SIZE,
+                            batch_session_count=len(chunk),
+                        )
+                        try:
+                            chunk_cursor = self._conn.execute(
+                                f"SELECT id, session_id, role, content "
+                                f"FROM messages WHERE session_id IN ({placeholders}) "
+                                f"ORDER BY session_id, timestamp, id",
+                                chunk,
+                            )
+                        except Exception:
+                            _query_abort(_query_id, _query_fingerprint)
+                            raise
+                        _query_execute_ms = (time.perf_counter() - _sql_t0) * 1000
+                        _query_execute_thread_cpu_ms = (
+                            time.thread_time_ns() - _execute_cpu_t0
+                        ) / 1_000_000
+                        _ctx_sql_ms += _query_execute_ms
+                        _ctx_execute_ms += _query_execute_ms
+                        _ctx_execute_thread_cpu_ms += _query_execute_thread_cpu_ms
+                        _query_executed(
+                            _query_id,
+                            _query_fingerprint,
+                            _query_started_ns,
+                            _query_execute_ms,
+                            execute_thread_cpu_ms=int(_query_execute_thread_cpu_ms),
+                        )
+                        _context_fetch_metrics = {}
+                        chunk_rows = _fetch_rows_timed(
+                            chunk_cursor,
+                            query_id=_query_id,
+                            query_fingerprint=_query_fingerprint,
+                            query_started_ns=_query_started_ns,
+                            record_aggregate=False,
+                            metrics_sink=_context_fetch_metrics,
+                        )
+                        _ctx_first_row_ms += _context_fetch_metrics.get("first_row_ms", 0.0)
+                        _ctx_first_row_thread_cpu_ms += _context_fetch_metrics.get(
+                            "first_row_thread_cpu_ms", 0.0
+                        )
+                        _ctx_fetch_ms += _context_fetch_metrics.get("fetch_ms", 0.0)
+                        _ctx_fetch_thread_cpu_ms += _context_fetch_metrics.get(
+                            "fetch_thread_cpu_ms", 0.0
+                        )
+                        _ctx_fetch_batch_count += _context_fetch_metrics.get(
+                            "fetch_batch_count", 0
+                        )
+                        _ctx_fetch_batch_max_wall_ms = max(
+                            _ctx_fetch_batch_max_wall_ms,
+                            _context_fetch_metrics.get("fetch_batch_max_wall_ms", 0.0),
+                        )
+                        _ctx_fetch_batch_max_thread_cpu_ms = max(
+                            _ctx_fetch_batch_max_thread_cpu_ms,
+                            _context_fetch_metrics.get(
+                                "fetch_batch_max_thread_cpu_ms", 0.0
+                            ),
+                        )
+                        _ctx_materialize_wall_ms += _context_fetch_metrics.get(
+                            "materialize_wall_ms", 0.0
+                        )
+                        _ctx_materialize_thread_cpu_ms += _context_fetch_metrics.get(
+                            "materialize_thread_cpu_ms", 0.0
+                        )
+                        _ctx_sql_ms += (time.perf_counter() - _sql_t0) * 1000 - _query_execute_ms
+                        _ctx_lock_hold_ms += (time.perf_counter() - _lock_acquired_t0) * 1000
+                    _context_rows_loaded += len(chunk_rows)
+                    for row in chunk_rows:
+                        raw_content = row["content"]
+                        if isinstance(raw_content, (str, bytes, bytearray)):
+                            _context_bytes_loaded += len(raw_content)
+                        sid = row["session_id"]
+                        if sid not in _ctx_session_msgs:
+                            _ctx_session_msgs[sid] = []
+                        _ctx_session_msgs[sid].append({
+                            "id": row["id"],
+                            "role": row["role"],
+                            "content": raw_content,
+                        })
 
-                # Build position index outside lock
+                # Build position index and previews outside lock.
+                _ctx_build_t0 = time.perf_counter()
                 _ctx_positions: dict = {}
                 for sid, msgs in _ctx_session_msgs.items():
                     _ctx_positions[sid] = {m["id"]: i for i, m in enumerate(msgs)}
@@ -5322,7 +6293,9 @@ class SessionDB:
                         idx = pos + offset
                         if 0 <= idx < len(msgs):
                             raw = msgs[idx]["content"]
+                            _decode_t0 = time.perf_counter()
                             decoded = self._decode_content(raw)
+                            _ctx_decode_ms += (time.perf_counter() - _decode_t0) * 1000
                             if isinstance(decoded, list):
                                 text_parts = [
                                     p.get("text", "") for p in decoded
@@ -5339,9 +6312,89 @@ class SessionDB:
                                 "content": preview[:200],
                             })
                     match["context"] = context_msgs
-            except Exception:
+                _ctx_build_ms = (time.perf_counter() - _ctx_build_t0) * 1000
+            except Exception as exc:
+                logger.warning(
+                    "SEARCH_CONTEXT request_id=%s error=%s", _request_id, type(exc).__name__
+                )
                 for match in matches:
                     match["context"] = []
+
+        _ctx_ms = (time.perf_counter() - _ctx_t0) * 1000
+        _search_lock_wait_ms = _fts_lock_wait_ms + _ctx_lock_wait_ms
+        _search_lock_hold_ms = _fts_lock_hold_ms + _ctx_lock_hold_ms
+        _search_end_ns = time.perf_counter_ns()
+        _search_total_ms = (_search_end_ns - int(_search_t0 * 1_000_000_000)) / 1_000_000
+        _search_accounted_ms = (
+            _fts_lock_wait_ms + _execute_ms + _first_row_ms + _fetch_ms
+            + _ctx_lock_wait_ms + _ctx_sql_ms + _ctx_decode_ms + _ctx_build_ms
+        )
+        _search_residual_ms = max(
+            0, int(_search_total_ms) - int(_search_accounted_ms)
+        )
+        if matches:
+            raw_hits_by_session = {}
+            for match in matches:
+                raw_hits_by_session[match["session_id"]] = (
+                    raw_hits_by_session.get(match["session_id"], 0) + 1
+                )
+            for session_id in _context_session_ids:
+                session_rows = _ctx_session_msgs.get(session_id, [])
+                session_bytes = sum(
+                    len(row["content"])
+                    for row in session_rows
+                    if isinstance(row.get("content"), (str, bytes, bytearray))
+                )
+                anchor_ids = [
+                    match["id"] for match in matches
+                    if match["session_id"] == session_id
+                ]
+                logger.info(
+                    "SEARCH_CONTEXT_SESSION request_id=%s target_session_id=%s "
+                    "raw_hit_count=%d rows_loaded=%d bytes_loaded=%d "
+                    "query_ms=%d batch_query_ms=%d query_scope=batch decode_ms=%d "
+                    "survived_lineage_dedup=unknown selected_anchor_message_id=%s",
+                    _request_id,
+                    session_id,
+                    raw_hits_by_session.get(session_id, 0),
+                    len(session_rows),
+                    session_bytes,
+                    int(_ctx_sql_ms),
+                    int(_ctx_sql_ms),
+                    int(_ctx_decode_ms),
+                    anchor_ids[0] if anchor_ids else "-",
+                )
+        logger.info(
+            "SEARCH_PHASE request_id=%s route=%s execute_ms=%d first_row_ms=%d fetch_ms=%d "
+            "lock_wait_ms=%d lock_hold_ms=%d fts_lock_wait_ms=%d fts_execute_ms=%d "
+            "fts_first_row_ms=%d fts_fetch_ms=%d fts_lock_hold_ms=%d "
+            "ctx_lock_wait_ms=%d ctx_execute_ms=%d ctx_execute_thread_cpu_ms=%d "
+            "ctx_first_row_ms=%d ctx_first_row_thread_cpu_ms=%d ctx_fetch_ms=%d "
+            "ctx_fetch_thread_cpu_ms=%d ctx_fetch_batch_count=%d "
+            "ctx_fetch_batch_max_wall_ms=%d ctx_fetch_batch_max_thread_cpu_ms=%d "
+            "ctx_materialize_wall_ms=%d ctx_materialize_thread_cpu_ms=%d "
+            "ctx_lock_hold_ms=%d search_total_ms=%d search_accounted_ms=%d "
+            "search_residual_ms=%d fts_ms=%d ctx_ms=%d ctx_sql_ms=%d "
+            "ctx_decode_ms=%d ctx_build_ms=%d ctx_query_count=%d ctx_rows=%d "
+            "ctx_bytes_loaded=%d raw_hits=%d unique_sessions=%d "
+            "context_query_count=%d context_rows_loaded=%d context_bytes_loaded=%d",
+            _request_id, _route, int(_execute_ms), int(_first_row_ms), int(_fetch_ms),
+            int(_search_lock_wait_ms), int(_search_lock_hold_ms),
+            int(_fts_lock_wait_ms), int(_execute_ms), int(_first_row_ms), int(_fetch_ms),
+            int(_fts_lock_hold_ms), int(_ctx_lock_wait_ms), int(_ctx_execute_ms),
+            int(_ctx_execute_thread_cpu_ms), int(_ctx_first_row_ms),
+            int(_ctx_first_row_thread_cpu_ms), int(_ctx_fetch_ms),
+            int(_ctx_fetch_thread_cpu_ms), int(_ctx_fetch_batch_count),
+            int(_ctx_fetch_batch_max_wall_ms), int(_ctx_fetch_batch_max_thread_cpu_ms),
+            int(_ctx_materialize_wall_ms), int(_ctx_materialize_thread_cpu_ms),
+            int(_ctx_lock_hold_ms), int(_search_total_ms), int(_search_accounted_ms),
+            int(_search_residual_ms),
+            int(_execute_ms + _first_row_ms + _fetch_ms), int(_ctx_ms), int(_ctx_sql_ms),
+            int(_ctx_decode_ms), int(_ctx_build_ms), int(_context_query_count),
+            int(_context_rows_loaded), int(_context_bytes_loaded), len(matches),
+            _unique_session_count, _context_query_count, _context_rows_loaded,
+            _context_bytes_loaded,
+        )
 
         # Remove full content from result (snippet is enough, saves tokens)
         for match in matches:

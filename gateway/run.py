@@ -16780,6 +16780,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        telemetry_context=lambda: {
+                            "session_id": session_id,
+                            "platform": source.platform.value if source.platform else None,
+                        },
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -18118,6 +18122,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
                             run_still_current=_run_still_current,
+                            telemetry_context=lambda: {
+                                "trace_id": (
+                                    getattr(agent_holder[0], "_current_turn_id", "") or None
+                                    if agent_holder and agent_holder[0] is not None
+                                    else None
+                                ),
+                                "turn_id": (
+                                    getattr(agent_holder[0], "_current_turn_id", "") or None
+                                    if agent_holder and agent_holder[0] is not None
+                                    else None
+                                ),
+                                "task_id": (
+                                    getattr(agent_holder[0], "_current_task_id", "") or None
+                                    if agent_holder and agent_holder[0] is not None
+                                    else None
+                                ),
+                                "api_request_id": (
+                                    getattr(agent_holder[0], "_current_api_request_id", "") or None
+                                    if agent_holder and agent_holder[0] is not None
+                                    else None
+                                ),
+                                "session_id": session_id,
+                                "platform": source.platform.value if source.platform else None,
+                            },
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:

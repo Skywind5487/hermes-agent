@@ -126,6 +126,7 @@ from gateway.platforms.base import (
     validate_inbound_media_size,
 )
 from tools.url_safety import is_safe_url
+from agent.lifecycle_telemetry import emit_lifecycle
 
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
@@ -1985,6 +1986,57 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    def _emit_delivery_event(
+        self,
+        event: str,
+        *,
+        operation_name: str,
+        status: str,
+        started_ns: int,
+        metadata: Optional[Dict[str, Any]],
+        chat_id: str,
+        message_id: Optional[str] = None,
+        chunk_count: Optional[int] = None,
+        char_count: Optional[int] = None,
+        byte_count: Optional[int] = None,
+        error_type: Optional[str] = None,
+        reason: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+    ) -> None:
+        """Emit payload-free Discord delivery telemetry."""
+        safe_metadata = metadata if isinstance(metadata, dict) else {}
+        fields = {
+            key: safe_metadata.get(key)
+            for key in (
+                "trace_id", "turn_id", "task_id", "api_request_id",
+                "session_id", "platform", "station",
+            )
+            if safe_metadata.get(key) is not None
+        }
+        fields.setdefault("trace_id", fields.get("turn_id") or chat_id)
+        fields["span_id"] = f"delivery:{time.monotonic_ns()}"
+        fields["parent_span_id"] = parent_span_id or safe_metadata.get("parent_span_id")
+        fields.update(
+            operation_kind="delivery",
+            operation_name=operation_name,
+            status=status,
+            chat_id=chat_id,
+            duration_ms=int((time.monotonic_ns() - started_ns) / 1_000_000),
+        )
+        if message_id is not None:
+            fields["message_id"] = message_id
+        if chunk_count is not None:
+            fields["chunk_count"] = chunk_count
+        if char_count is not None:
+            fields["char_count"] = char_count
+        if byte_count is not None:
+            fields["byte_count"] = byte_count
+        if error_type is not None:
+            fields["error_type"] = error_type
+        if reason is not None:
+            fields["reason"] = reason
+        emit_lifecycle(event, **fields)
+
     async def send(
         self,
         chat_id: str,
@@ -2000,7 +2052,27 @@ class DiscordAdapter(BasePlatformAdapter):
         Forum channels (type 15) reject direct messages — a thread post is
         created automatically.
         """
+        _delivery_started_ns = time.monotonic_ns()
+        _delivery_operation = "discord_send"
+        self._emit_delivery_event(
+            "DELIVERY_START",
+            operation_name=_delivery_operation,
+            status="started",
+            started_ns=_delivery_started_ns,
+            metadata=metadata,
+            chat_id=chat_id,
+        )
         if not self._client:
+            self._emit_delivery_event(
+                "DELIVERY_END",
+                operation_name=_delivery_operation,
+                status="error",
+                reason="not_connected",
+                error_type="NotConnected",
+                started_ns=_delivery_started_ns,
+                metadata=metadata,
+                chat_id=chat_id,
+            )
             return SendResult(success=False, error="Not connected")
 
         try:
@@ -2028,7 +2100,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                return await self._send_to_forum(channel, content)
+                result = await self._send_to_forum(channel, content)
+                self._emit_delivery_event(
+                    "DELIVERY_END",
+                    operation_name=_delivery_operation,
+                    status="completed" if result.success else "error",
+                    reason=None if result.success else "forum_send_failed",
+                    error_type=None if result.success else "ForumSendError",
+                    started_ns=_delivery_started_ns,
+                    metadata=metadata,
+                    chat_id=chat_id,
+                    message_id=result.message_id,
+                )
+                return result
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -2098,6 +2182,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
 
+            _send_char_count = sum(len(chunk) for chunk in chunks)
+            _send_byte_count = sum(len(chunk.encode("utf-8")) for chunk in chunks)
+            self._emit_delivery_event(
+                "DELIVERY_END",
+                operation_name=_delivery_operation,
+                status="completed",
+                started_ns=_delivery_started_ns,
+                metadata=metadata,
+                chat_id=chat_id,
+                message_id=message_ids[0] if message_ids else None,
+                chunk_count=len(chunks),
+                char_count=_send_char_count,
+                byte_count=_send_byte_count,
+            )
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -2105,6 +2203,16 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
+            self._emit_delivery_event(
+                "DELIVERY_END",
+                operation_name=_delivery_operation,
+                status="error",
+                reason="send_failed",
+                error_type=type(e).__name__,
+                started_ns=_delivery_started_ns,
+                metadata=metadata,
+                chat_id=chat_id,
+            )
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
@@ -2231,6 +2339,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Discord message.
 
@@ -2247,6 +2356,17 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        _delivery_started_ns = time.monotonic_ns()
+        _delivery_operation = "discord_edit"
+        self._emit_delivery_event(
+            "DELIVERY_START",
+            operation_name=_delivery_operation,
+            status="started",
+            started_ns=_delivery_started_ns,
+            metadata=metadata,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
         try:
             channel = self._client.get_channel(int(chat_id))
             if not channel:
@@ -2265,9 +2385,21 @@ class DiscordAdapter(BasePlatformAdapter):
             # streaming edits truncate a one-message preview in place.
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 if finalize:
-                    return await self._edit_overflow_split(
+                    result = await self._edit_overflow_split(
                         channel, msg, message_id, content,
                     )
+                    self._emit_delivery_event(
+                        "DELIVERY_END",
+                        operation_name=_delivery_operation,
+                        status="completed" if result.success else "error",
+                        reason=None if result.success else "overflow_split_failed",
+                        error_type=None if result.success else "EditOverflowError",
+                        started_ns=_delivery_started_ns,
+                        metadata=metadata,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                    )
+                    return result
                 formatted = self.truncate_message(
                     formatted, self.MAX_MESSAGE_LENGTH,
                 )[0]
@@ -2278,6 +2410,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 # skip silently until finalize (mirrors the Telegram #58563
                 # fix).
                 if self._last_overflow_preview.get(_preview_key) == formatted:
+                    self._emit_delivery_event(
+                        "DELIVERY_END",
+                        operation_name=_delivery_operation,
+                        status="completed",
+                        reason="deduplicated_preview",
+                        started_ns=_delivery_started_ns,
+                        metadata=metadata,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                    )
                     return SendResult(success=True, message_id=message_id)
             elif not finalize:
                 # Content shrank back under the cap (segment break / new
@@ -2296,22 +2438,66 @@ class DiscordAdapter(BasePlatformAdapter):
                 # as "error code: 50035 ... Must be 2000 or fewer in length".
                 if self._is_length_overflow_error(edit_err):
                     if finalize:
-                        return await self._edit_overflow_split(
+                        result = await self._edit_overflow_split(
                             channel, msg, message_id, content,
                         )
+                        self._emit_delivery_event(
+                            "DELIVERY_END",
+                            operation_name=_delivery_operation,
+                            status="completed" if result.success else "error",
+                            reason=None if result.success else "overflow_split_failed",
+                            error_type=None if result.success else "EditOverflowError",
+                            started_ns=_delivery_started_ns,
+                            metadata=metadata,
+                            chat_id=chat_id,
+                            message_id=message_id,
+                        )
+                        return result
                     # Mid-stream: truncate and retry in place (no split).
                     truncated = self.truncate_message(
                         formatted, self.MAX_MESSAGE_LENGTH,
                     )[0]
                     if self._last_overflow_preview.get(_preview_key) == truncated:
                         # Saturated-preview dedup (see pre-flight path above).
+                        self._emit_delivery_event(
+                            "DELIVERY_END",
+                            operation_name=_delivery_operation,
+                            status="completed",
+                            reason="deduplicated_preview",
+                            started_ns=_delivery_started_ns,
+                            metadata=metadata,
+                            chat_id=chat_id,
+                            message_id=message_id,
+                        )
                         return SendResult(success=True, message_id=message_id)
                     await msg.edit(content=truncated)
                     self._last_overflow_preview[_preview_key] = truncated
                 else:
                     raise
+            self._emit_delivery_event(
+                "DELIVERY_END",
+                operation_name=_delivery_operation,
+                status="completed",
+                started_ns=_delivery_started_ns,
+                metadata=metadata,
+                chat_id=chat_id,
+                message_id=message_id,
+                char_count=len(formatted),
+                byte_count=len(formatted.encode("utf-8")),
+            )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
+            self._emit_delivery_event(
+                "DELIVERY_END",
+                operation_name=_delivery_operation,
+                status="error",
+                reason="edit_failed",
+                error_type=type(e).__name__,
+                started_ns=_delivery_started_ns,
+                metadata=metadata,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 

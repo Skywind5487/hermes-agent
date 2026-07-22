@@ -32,6 +32,8 @@ support.
 import json
 import logging
 import time
+import uuid
+from functools import wraps
 from typing import Any, Dict, List, Optional, Union
 
 # Sources that are excluded from session browsing/searching by default.
@@ -513,6 +515,7 @@ def _discover(
     current_session_id: str = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
+    _request_id = uuid.uuid4().hex[:12]
     _t0 = time.perf_counter()
     role_list = role_filter if role_filter else ["user", "assistant"]
     _resolve_t0 = time.perf_counter()
@@ -533,8 +536,11 @@ def _discover(
             # of cron rows are still in hand for the demotion pass below.
             offset=0,
             sort=sort,
+            request_id=_request_id,
         )
         _search_ms = (time.perf_counter() - _search_t0) * 1000
+        _raw_hits = len(raw_results)
+        _unique_raw_sessions = len({r.get("session_id") for r in raw_results if r.get("session_id")})
     except Exception as e:
         _elapsed = (time.perf_counter() - _t0) * 1000
         logging.error("DISCOVER_FAIL total_ms=%d resolve_ms=%d title_ms=%d error=%s",
@@ -553,8 +559,11 @@ def _discover(
     if not raw_results and not title_result:
         _elapsed = (time.perf_counter() - _t0) * 1000
         logging.info(
-            "DISCOVER_DONE total_ms=%d resolve_ms=%d title_ms=%d search_ms=%d order_ms=%d results=0",
-            int(_elapsed), int(_resolve_ms), int(_title_ms), int(_search_ms), int(_order_ms),
+            "DISCOVER_DONE request_id=%s total_ms=%d resolve_ms=%d title_ms=%d "
+            "search_ms=%d order_ms=%d view_ms=0 json_ms=0 results=0 "
+            "raw_hits=%d unique_raw_sessions=%d unique_lineages=0",
+            _request_id, int(_elapsed), int(_resolve_ms), int(_title_ms),
+            int(_search_ms), int(_order_ms), _raw_hits, _unique_raw_sessions,
         )
         return json.dumps({
             "success": True,
@@ -601,7 +610,9 @@ def _discover(
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
-            view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+            view = db.get_anchored_view(
+                hit_sid, msg_id, window=5, bookend=3, request_id=_request_id
+            )
         except Exception as e:
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
@@ -645,14 +656,44 @@ def _discover(
     _json_ms = (time.perf_counter() - _json_t0) * 1000
     _elapsed = (time.perf_counter() - _t0) * 1000
     logging.info(
-        "DISCOVER_DONE total_ms=%d resolve_ms=%d title_ms=%d search_ms=%d "
-        "order_ms=%d view_ms=%d json_ms=%d results=%d",
-        int(_elapsed), int(_resolve_ms), int(_title_ms), int(_search_ms),
-        int(_order_ms), int(_view_ms), int(_json_ms), len(results),
+        "DISCOVER_DONE request_id=%s total_ms=%d resolve_ms=%d title_ms=%d search_ms=%d "
+        "order_ms=%d view_ms=%d json_ms=%d results=%d raw_hits=%d "
+        "unique_raw_sessions=%d unique_lineages=%d",
+        _request_id, int(_elapsed), int(_resolve_ms), int(_title_ms), int(_search_ms),
+        int(_order_ms), int(_view_ms), int(_json_ms), len(results), _raw_hits,
+        _unique_raw_sessions, len(seen_sessions),
     )
     return _json
 
 
+def _bind_upstream_db_context(fn):
+    """Carry agent turn/API/tool IDs into the DB black-box boundary."""
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            from agent.lifecycle_telemetry import get_lifecycle_context
+            from hermes_state import db_telemetry_context
+            upstream = get_lifecycle_context()
+        except Exception:
+            upstream = {}
+            db_telemetry_context = None
+        if not upstream or db_telemetry_context is None:
+            return fn(*args, **kwargs)
+        with db_telemetry_context(
+            trace_id=upstream.get("trace_id") or upstream.get("turn_id"),
+            span_id=upstream.get("tool_call_id"),
+            parent_span_id=upstream.get("api_request_id") or upstream.get("turn_id"),
+            turn_id=upstream.get("turn_id"),
+            api_request_id=upstream.get("api_request_id"),
+            tool_call_id=upstream.get("tool_call_id"),
+            session_id=upstream.get("session_id"),
+            active_session_id=upstream.get("session_id"),
+        ):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+@_bind_upstream_db_context
 def session_search(
     query: str = "",
     role_filter: str = None,
