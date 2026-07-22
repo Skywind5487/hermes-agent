@@ -4756,6 +4756,21 @@ class SessionDB:
             return self._execute_write(_do)
 
 
+    def get_first_message_id(
+        self,
+        session_id: str,
+        include_inactive: bool = False,
+    ) -> Optional[int]:
+        """Return the first message id without hydrating message content."""
+        active_clause = "" if include_inactive else " AND active = 1"
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM messages WHERE session_id = ?"
+                f"{active_clause} ORDER BY id LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return int(row["id"]) if row else None
+
     def get_messages(
         self,
         session_id: str,
@@ -5580,6 +5595,408 @@ class SessionDB:
     def _count_cjk(cls, text: str) -> int:
         """Count CJK characters in text."""
         return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
+
+    @_telemetry_method("search_session_winners")
+    def search_session_winners(
+        self,
+        query: str,
+        role_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        source_filter: List[str] = None,
+        candidate_limit: int = 300,
+        result_limit: int = 3,
+        sort: str = None,
+        include_inactive: bool = False,
+        excluded_lineage_roots: Tuple[str, ...] = (),
+        current_lineage_root: Optional[str] = None,
+        lineage_depth_cap: int = 64,
+        request_id: str = None,
+    ) -> Dict[str, Any]:
+        """Select discovery winners in SQLite without candidate hydration.
+
+        The candidate scan deliberately remains wider than the requested result
+        limit. SQLite first ranks up to ``candidate_limit`` lightweight FTS/LIKE
+        rows, resolves their parent chains with a recursive CTE, keeps one hit
+        per lineage, and only then applies ``result_limit``. The returned rows
+        contain no full message content and no candidate context.
+        """
+        empty = {"winners": [], "stats": {
+            "candidate_count": 0,
+            "candidate_unique_sessions": 0,
+            "lineage_count": 0,
+            "winner_count": 0,
+            "route": "none",
+        }}
+        if not self._fts_enabled or not query or not query.strip():
+            return empty
+
+        query = self._sanitize_fts5_query(query)
+        if not query:
+            return empty
+        candidate_limit = max(1, min(int(candidate_limit), 1000))
+        result_limit = max(0, min(int(result_limit), 100))
+        lineage_depth_cap = max(1, min(int(lineage_depth_cap), 256))
+        role_filter = list(role_filter or ("user", "assistant"))
+        exclude_sources = list(exclude_sources or ())
+        source_filter = list(source_filter or ())
+        excluded_lineage_roots = tuple(
+            root for root in (excluded_lineage_roots or ()) if root
+        )
+
+        sort_norm = sort.strip().lower() if isinstance(sort, str) else None
+        if sort_norm not in ("newest", "oldest"):
+            sort_norm = None
+
+        if sort_norm == "newest":
+            candidate_order = "timestamp DESC, fts_rank ASC, message_id ASC"
+        elif sort_norm == "oldest":
+            candidate_order = "timestamp ASC, fts_rank ASC, message_id ASC"
+        else:
+            candidate_order = "fts_rank ASC, message_id ASC"
+
+        def _where(prefix: str, params: list) -> str:
+            clauses = [f"{prefix} MATCH ?"]
+            params.append(query)
+            if not include_inactive:
+                clauses.append("(m.active = 1 OR m.compacted = 1)")
+            if source_filter:
+                clauses.append(
+                    f"s.source IN ({','.join('?' for _ in source_filter)})"
+                )
+                params.extend(source_filter)
+            if exclude_sources:
+                clauses.append(
+                    f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})"
+                )
+                params.extend(exclude_sources)
+            if role_filter:
+                clauses.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                params.extend(role_filter)
+            return " AND ".join(clauses)
+
+        route = "unicode61"
+        params: list = []
+        candidate_from: str
+        candidate_select: str
+        candidate_where: str
+        if self._contains_cjk(query) and self._trigram_available:
+            route = "trigram"
+            raw_query = query.strip('"').strip()
+            parts = []
+            for token in raw_query.split():
+                if token.upper() in {"AND", "OR", "NOT"}:
+                    parts.append(token)
+                elif any(ord(char) > 127 for char in token):
+                    parts.append(token)
+                else:
+                    parts.append('"' + token.replace('"', '""') + '"')
+            candidate_select = (
+                "snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40)"
+            )
+            candidate_from = "messages_fts_trigram"
+            candidate_where = _where("messages_fts_trigram", params)
+            # Replace the query value inserted by _where with the tokenized form.
+            params[0] = " ".join(parts)
+        elif self._contains_cjk(query):
+            route = "like"
+            raw_query = query.strip('"').strip()
+            tokens = [
+                token for token in raw_query.split()
+                if token.upper() not in {"AND", "OR", "NOT"}
+            ] or [raw_query]
+            token_clauses = []
+            like_values = []
+            for token in tokens:
+                escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                token_clauses.append(
+                    "(m.content LIKE ? ESCAPE '\\' OR "
+                    "m.tool_name LIKE ? ESCAPE '\\' OR "
+                    "m.tool_calls LIKE ? ESCAPE '\\')"
+                )
+                like_values.extend([f"%{escaped}%"] * 3)
+            params = [tokens[0]]
+            clauses = [f"({' OR '.join(token_clauses)})"]
+            if not include_inactive:
+                clauses.append("(m.active = 1 OR m.compacted = 1)")
+            if source_filter:
+                clauses.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                like_values.extend(source_filter)
+            if exclude_sources:
+                clauses.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                like_values.extend(exclude_sources)
+            if role_filter:
+                clauses.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                like_values.extend(role_filter)
+            params.extend(like_values)
+            params.extend([candidate_limit, 0])
+            candidate_from = ""
+            candidate_where = " AND ".join(clauses)
+            candidate_select = (
+                "substr(m.content, max(1, instr(m.content, ?) - 40), 120)"
+            )
+            candidate_order = "timestamp DESC, message_id ASC"
+        else:
+            params = []
+            candidate_select = "snippet(messages_fts, 0, '>>>', '<<<', '...', 40)"
+            candidate_from = "messages_fts"
+            candidate_where = _where("messages_fts", params)
+
+        if route != "like":
+            params.extend([candidate_limit, 0])
+
+        source_priority = (
+            "CASE WHEN COALESCE(source, '') IN ('cron') THEN 1 ELSE 0 END"
+        )
+        if route == "like":
+            candidate_base = f"""
+                SELECT
+                    m.id AS message_id,
+                    m.session_id AS owning_session_id,
+                    m.role,
+                    {candidate_select} AS snippet,
+                    m.timestamp,
+                    s.source,
+                    s.model,
+                    s.started_at AS session_started,
+                    0.0 AS fts_rank,
+                    {source_priority} AS source_priority
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {candidate_where}
+            """
+        else:
+            candidate_base = f"""
+                SELECT
+                    m.id AS message_id,
+                    m.session_id AS owning_session_id,
+                    m.role,
+                    {candidate_select} AS snippet,
+                    m.timestamp,
+                    s.source,
+                    s.model,
+                    s.started_at AS session_started,
+                    rank AS fts_rank,
+                    {source_priority} AS source_priority
+                FROM {candidate_from}
+                JOIN messages m ON m.id = {candidate_from}.rowid
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {candidate_where}
+            """
+
+        exclusion_parts = []
+        exclusion_params: list = []
+        if excluded_lineage_roots:
+            exclusion_parts.append(
+                "lineage_root_id NOT IN "
+                f"({','.join('?' for _ in excluded_lineage_roots)})"
+            )
+            exclusion_params.extend(excluded_lineage_roots)
+        if current_lineage_root:
+            exclusion_parts.append("lineage_root_id != ?")
+            exclusion_params.append(current_lineage_root)
+        exclusion_sql = " AND ".join(exclusion_parts) or "1 = 1"
+
+        sql = f"""
+            WITH
+            candidate_base AS (
+                {candidate_base}
+            ),
+            candidate_hits AS (
+                SELECT
+                    candidate_base.*,
+                    ROW_NUMBER() OVER (ORDER BY {candidate_order}) AS candidate_order
+                FROM candidate_base
+                ORDER BY {candidate_order}
+                LIMIT ? OFFSET ?
+            ),
+            candidate_stats AS (
+                SELECT
+                    COUNT(*) AS candidate_count,
+                    COUNT(DISTINCT owning_session_id) AS candidate_unique_sessions
+                FROM candidate_hits
+            ),
+            lineage_seeds AS (
+                SELECT DISTINCT owning_session_id AS seed_session_id
+                FROM candidate_hits
+            ),
+            lineage_walk(seed_session_id, session_id, parent_session_id, depth, path) AS (
+                SELECT
+                    seeds.seed_session_id,
+                    s.id,
+                    s.parent_session_id,
+                    0,
+                    printf('|%s|', s.id)
+                FROM lineage_seeds seeds
+                JOIN sessions s ON s.id = seeds.seed_session_id
+                UNION ALL
+                SELECT
+                    walk.seed_session_id,
+                    parent.id,
+                    parent.parent_session_id,
+                    walk.depth + 1,
+                    walk.path || parent.id || '|'
+                FROM lineage_walk walk
+                JOIN sessions parent ON parent.id = walk.parent_session_id
+                WHERE walk.depth < {lineage_depth_cap}
+                  AND instr(walk.path, printf('|%s|', parent.id)) = 0
+            ),
+            lineage_resolution AS (
+                SELECT
+                    seeds.seed_session_id,
+                    COALESCE(
+                        (
+                            SELECT walk.parent_session_id
+                            FROM lineage_walk walk
+                            WHERE walk.seed_session_id = seeds.seed_session_id
+                              AND walk.parent_session_id IS NOT NULL
+                              AND instr(
+                                  walk.path,
+                                  printf('|%s|', walk.parent_session_id)
+                              ) > 0
+                            ORDER BY walk.depth DESC
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT walk.session_id
+                            FROM lineage_walk walk
+                            WHERE walk.seed_session_id = seeds.seed_session_id
+                            ORDER BY walk.depth DESC
+                            LIMIT 1
+                        ),
+                        seeds.seed_session_id
+                    ) AS lineage_root_id
+                FROM lineage_seeds seeds
+            ),
+            lineage_ranked AS (
+                SELECT
+                    hits.*,
+                    resolution.lineage_root_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY resolution.lineage_root_id
+                        ORDER BY hits.source_priority, hits.candidate_order
+                    ) AS lineage_rank
+                FROM candidate_hits hits
+                JOIN lineage_resolution resolution
+                  ON resolution.seed_session_id = hits.owning_session_id
+            )
+            SELECT
+                ranked.message_id AS id,
+                ranked.owning_session_id AS session_id,
+                ranked.role,
+                ranked.snippet,
+                ranked.timestamp,
+                ranked.source,
+                ranked.model,
+                ranked.session_started,
+                ranked.lineage_root_id,
+                ranked.candidate_order,
+                ranked.source_priority,
+                stats.candidate_count,
+                stats.candidate_unique_sessions
+            FROM lineage_ranked ranked
+            CROSS JOIN candidate_stats stats
+            WHERE ranked.lineage_rank = 1
+              AND {exclusion_sql}
+            ORDER BY ranked.source_priority, ranked.candidate_order
+            LIMIT ?
+        """
+        # The LIKE candidate SELECT has an extra snippet parameter before the
+        # WHERE values; candidate_limit/offset were already appended above for
+        # that route and must not be duplicated.
+        if route == "like":
+            sql_params = params + exclusion_params + [result_limit]
+        else:
+            sql_params = params + exclusion_params + [result_limit]
+
+        request_value = request_id or "-"
+        query_id = f"cursor-winners-{os.getpid()}-{time.time_ns()}"
+        started = time.perf_counter()
+        try:
+            with self._lock:
+                _emit_db_event(
+                    "DB_QUERY_START",
+                    status="started",
+                    query_fingerprint="session_search_winners",
+                    cursor_id=query_id,
+                    request_id=request_value,
+                )
+                execute_started = time.perf_counter()
+                cursor = self._conn.execute(sql, sql_params)
+                _emit_db_event(
+                    "DB_QUERY_EXECUTED",
+                    status="completed",
+                    query_fingerprint="session_search_winners",
+                    cursor_id=query_id,
+                    execute_ms=int((time.perf_counter() - execute_started) * 1000),
+                )
+                fetch_started = time.perf_counter()
+                rows = [dict(row) for row in cursor.fetchall()]
+                _emit_db_event(
+                    "DB_QUERY_FETCH_END",
+                    status="completed",
+                    query_fingerprint="session_search_winners",
+                    cursor_id=query_id,
+                    rows_returned=len(rows),
+                    fetch_ms=int((time.perf_counter() - fetch_started) * 1000),
+                    bytes_loaded=0,
+                )
+        except sqlite3.OperationalError as exc:
+            _emit_db_event(
+                "DB_QUERY_ERROR",
+                status="error",
+                query_fingerprint="session_search_winners",
+                cursor_id=query_id,
+                error_type=type(exc).__name__,
+            )
+            # Match search_messages() behavior: malformed FTS input is a
+            # no-result search, not a tool-level failure. This also preserves
+            # title-only discovery when the title contains FTS punctuation.
+            logger.warning(
+                "SESSION_WINNERS query failed request_id=%s route=%s error=%s",
+                request_value,
+                route,
+                type(exc).__name__,
+            )
+            return {
+                "winners": [],
+                "stats": {
+                    "candidate_count": 0,
+                    "candidate_unique_sessions": 0,
+                    "lineage_count": 0,
+                    "winner_count": 0,
+                    "route": route,
+                },
+            }
+
+        if rows:
+            stats = {
+                "candidate_count": int(rows[0].pop("candidate_count", 0)),
+                "candidate_unique_sessions": int(
+                    rows[0].pop("candidate_unique_sessions", 0)
+                ),
+            }
+        else:
+            stats = {"candidate_count": 0, "candidate_unique_sessions": 0}
+        winners = rows
+        stats.update({
+            "lineage_count": len({row["lineage_root_id"] for row in winners}),
+            "winner_count": len(winners),
+            "route": route,
+        })
+        logger.info(
+            "SESSION_WINNERS request_id=%s route=%s candidate_count=%d "
+            "candidate_unique_sessions=%d lineage_count=%d winner_count=%d "
+            "query_ms=%d context_query_count=0 context_rows_loaded=0 "
+            "context_bytes_loaded=0",
+            request_value,
+            route,
+            stats["candidate_count"],
+            stats["candidate_unique_sessions"],
+            stats["lineage_count"],
+            stats["winner_count"],
+            int((time.perf_counter() - started) * 1000),
+        )
+        return {"winners": winners, "stats": stats}
 
     @_telemetry_method("search_messages")
     def search_messages(

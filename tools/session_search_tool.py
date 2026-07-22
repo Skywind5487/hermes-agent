@@ -84,16 +84,10 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
-_PARENT_CACHE: dict = {}  # session_id → lineage root
-
-
 def _resolve_to_parent(db, session_id: str) -> str:
-    """Walk parent_session_id chain to the lineage root. Falls back to input on errors."""
+    """Walk parent_session_id chain to the lineage root without global caching."""
     if not session_id:
         return session_id
-    cached = _PARENT_CACHE.get(session_id)
-    if cached is not None:
-        return cached
     visited = set()
     cur = session_id
     while cur and cur not in visited:
@@ -109,7 +103,6 @@ def _resolve_to_parent(db, session_id: str) -> str:
         except Exception as e:
             logging.debug("Error resolving parent for %s: %s", cur, e, exc_info=True)
             break
-    _PARENT_CACHE[session_id] = cur
     return cur
 
 
@@ -470,12 +463,11 @@ def _title_match_result(
         return None
 
     try:
-        messages = db.get_messages(session_id)
+        anchor_id = db.get_first_message_id(session_id)
     except Exception:
-        logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
-        messages = []
+        logging.debug("get_first_message_id failed for title match %s", session_id, exc_info=True)
+        anchor_id = None
 
-    anchor_id = messages[0].get("id") if messages else None
     if anchor_id is not None:
         try:
             view = db.get_anchored_view(session_id, anchor_id, window=5, bookend=3)
@@ -485,6 +477,7 @@ def _title_match_result(
     else:
         view = {}
 
+    fallback_count = max(int(session_meta.get("message_count") or 0) - 5, 0)
     entry = {
         "session_id": session_id,
         "when": _format_timestamp(session_meta.get("started_at")),
@@ -494,11 +487,11 @@ def _title_match_result(
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
-        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
-        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
-        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
+        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or [])],
+        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or [])],
+        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or [])],
         "messages_before": view.get("messages_before", 0),
-        "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
+        "messages_after": view.get("messages_after", fallback_count),
         "_lineage_root": lineage_root,
     }
     if lineage_root and lineage_root != session_id:
@@ -514,56 +507,69 @@ def _discover(
     sort: Optional[str],
     current_session_id: str = None,
 ) -> str:
-    """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
+    """Discovery shape: SQL winner selection plus bounded views per winner."""
     _request_id = uuid.uuid4().hex[:12]
     _t0 = time.perf_counter()
     role_list = role_filter if role_filter else ["user", "assistant"]
+
     _resolve_t0 = time.perf_counter()
     current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
     _resolve_ms = (time.perf_counter() - _resolve_t0) * 1000
+
     _title_t0 = time.perf_counter()
     title_result = _title_match_result(db, query, current_lineage_root)
+    title_lineage = title_result.get("_lineage_root") if title_result else None
     _title_ms = (time.perf_counter() - _title_t0) * 1000
 
-    try:
-        _search_t0 = time.perf_counter()
-        raw_results = db.search_messages(
-            query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
-            # distinct sessions AND so interactive matches buried under a wall
-            # of cron rows are still in hand for the demotion pass below.
-            offset=0,
-            sort=sort,
-            request_id=_request_id,
-        )
-        _search_ms = (time.perf_counter() - _search_t0) * 1000
-        _raw_hits = len(raw_results)
-        _unique_raw_sessions = len({r.get("session_id") for r in raw_results if r.get("session_id")})
-    except Exception as e:
-        _elapsed = (time.perf_counter() - _t0) * 1000
-        logging.error("DISCOVER_FAIL total_ms=%d resolve_ms=%d title_ms=%d error=%s",
-                       int(_elapsed), int(_resolve_ms), int(_title_ms), e)
-        logging.error("FTS5 search failed: %s", e, exc_info=True)
-        return tool_error(f"Search failed: {e}", success=False)
+    excluded_lineages = (title_lineage,) if title_lineage else ()
+    _search_t0 = time.perf_counter()
+    if title_result and limit <= 1:
+        winner_response = {
+            "winners": [],
+            "stats": {
+                "candidate_count": 0,
+                "candidate_unique_sessions": 0,
+                "lineage_count": 0,
+                "winner_count": 0,
+                "route": "none",
+            },
+        }
+    else:
+        try:
+            winner_response = db.search_session_winners(
+                query=query,
+                role_filter=role_list,
+                exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                candidate_limit=_DISCOVER_SCAN_LIMIT,
+                result_limit=max(0, limit - (1 if title_result else 0)),
+                sort=sort,
+                excluded_lineage_roots=excluded_lineages,
+                current_lineage_root=current_lineage_root,
+                request_id=_request_id,
+            )
+        except Exception as e:
+            _elapsed = (time.perf_counter() - _t0) * 1000
+            logging.error(
+                "DISCOVER_FAIL total_ms=%d resolve_ms=%d title_ms=%d error=%s",
+                int(_elapsed), int(_resolve_ms), int(_title_ms), e,
+            )
+            logging.error("SQL session winner search failed: %s", e, exc_info=True)
+            return tool_error(f"Search failed: {e}", success=False)
+    _search_ms = (time.perf_counter() - _search_t0) * 1000
+    winner_rows = winner_response.get("winners", [])
+    winner_stats = winner_response.get("stats", {})
+    _raw_hits = int(winner_stats.get("candidate_count", 0))
+    _unique_raw_sessions = int(winner_stats.get("candidate_unique_sessions", 0))
+    _order_ms = 0
 
-    # Demote automation (cron) rows below interactive ones before dedup, so a
-    # high-volume cron corpus can't starve the user's own sessions out of the
-    # top `limit` results (#19434). Stable — preserves BM25/recency order
-    # within each class.
-    _order_t0 = time.perf_counter()
-    raw_results = _order_for_recall(raw_results)
-    _order_ms = (time.perf_counter() - _order_t0) * 1000
-
-    if not raw_results and not title_result:
+    if not winner_rows and not title_result:
         _elapsed = (time.perf_counter() - _t0) * 1000
         logging.info(
             "DISCOVER_DONE request_id=%s total_ms=%d resolve_ms=%d title_ms=%d "
-            "search_ms=%d order_ms=%d view_ms=0 json_ms=0 results=0 "
+            "search_ms=%d order_ms=0 view_ms=0 json_ms=0 results=0 "
             "raw_hits=%d unique_raw_sessions=%d unique_lineages=0",
             _request_id, int(_elapsed), int(_resolve_ms), int(_title_ms),
-            int(_search_ms), int(_order_ms), _raw_hits, _unique_raw_sessions,
+            int(_search_ms), _raw_hits, _unique_raw_sessions,
         )
         return json.dumps({
             "success": True,
@@ -574,39 +580,14 @@ def _discover(
             "message": "No matching sessions found.",
         }, ensure_ascii=False)
 
-    # Dedupe by lineage. Keep the raw owning session_id on the surviving
-    # row — only that pairs validly with the FTS5 match id for the anchored
-    # window. parent_session_id is exposed separately when different.
-    _dedup_t0 = time.perf_counter()
-    seen_sessions = {}
+    _view_t0 = time.perf_counter()
     results = []
-
     if title_result:
-        title_lineage = title_result.pop("_lineage_root", None)
-        if title_lineage:
-            seen_sessions[title_lineage] = {"_title_only": True}
+        title_result.pop("_lineage_root", None)
         results.append(title_result)
 
-    for r in raw_results:
-        if len(seen_sessions) >= limit:
-            break
-        raw_sid = r["session_id"]
-        resolved_sid = _resolve_to_parent(db, raw_sid)
-        # Skip the current session lineage
-        if current_lineage_root and resolved_sid == current_lineage_root:
-            continue
-        if current_session_id and raw_sid == current_session_id:
-            continue
-        if resolved_sid not in seen_sessions:
-            row = dict(r)
-            row["_lineage_root"] = resolved_sid
-            seen_sessions[resolved_sid] = row
-        if len(seen_sessions) >= limit:
-            break
-
-    for lineage_root, match_info in seen_sessions.items():
-        if match_info.get("_title_only"):
-            continue
+    for match_info in winner_rows:
+        lineage_root = match_info.get("lineage_root_id") or match_info.get("session_id")
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
@@ -614,7 +595,10 @@ def _discover(
                 hit_sid, msg_id, window=5, bookend=3, request_id=_request_id
             )
         except Exception as e:
-            logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
+            logging.warning(
+                "get_anchored_view failed for %s/%s: %s",
+                hit_sid, msg_id, e, exc_info=True,
+            )
             continue
 
         try:
@@ -643,7 +627,7 @@ def _discover(
             entry["parent_session_id"] = lineage_root
         results.append(entry)
 
-    _view_ms = (time.perf_counter() - _dedup_t0) * 1000
+    _view_ms = (time.perf_counter() - _view_t0) * 1000
     _json_t0 = time.perf_counter()
     _json = json.dumps({
         "success": True,
@@ -651,7 +635,7 @@ def _discover(
         "query": query,
         "results": results,
         "count": len(results),
-        "sessions_searched": len(seen_sessions),
+        "sessions_searched": len(winner_rows) + (1 if title_result else 0),
     }, ensure_ascii=False)
     _json_ms = (time.perf_counter() - _json_t0) * 1000
     _elapsed = (time.perf_counter() - _t0) * 1000
@@ -660,8 +644,9 @@ def _discover(
         "order_ms=%d view_ms=%d json_ms=%d results=%d raw_hits=%d "
         "unique_raw_sessions=%d unique_lineages=%d",
         _request_id, int(_elapsed), int(_resolve_ms), int(_title_ms), int(_search_ms),
-        int(_order_ms), int(_view_ms), int(_json_ms), len(results), _raw_hits,
-        _unique_raw_sessions, len(seen_sessions),
+        _order_ms, int(_view_ms), int(_json_ms), len(results), _raw_hits,
+        _unique_raw_sessions,
+        int(winner_stats.get("lineage_count", 0)) + (1 if title_result else 0),
     )
     return _json
 
