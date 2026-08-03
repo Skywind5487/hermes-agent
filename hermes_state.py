@@ -5690,9 +5690,11 @@ class SessionDB:
                     parts.append(token)
                 else:
                     parts.append('"' + token.replace('"', '""') + '"')
-            candidate_select = (
-                "snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40)"
-            )
+            # Snippets are display data, not candidate-ranking data.  Computing
+            # one for every FTS hit forces SQLite to materialize a wide result
+            # set before the candidate LIMIT can take effect.  Recompute it
+            # only for the final lineage winners below.
+            candidate_select = "NULL"
             candidate_from = "messages_fts_trigram"
             candidate_where = _where("messages_fts_trigram", params)
             # Replace the query value inserted by _where with the tokenized form.
@@ -5737,7 +5739,9 @@ class SessionDB:
             candidate_order = "timestamp DESC, message_id ASC"
         else:
             params = []
-            candidate_select = "snippet(messages_fts, 0, '>>>', '<<<', '...', 40)"
+            # See the trigram route: defer snippet generation until winners are
+            # known so the FTS candidate scan stays narrow.
+            candidate_select = "NULL"
             candidate_from = "messages_fts"
             candidate_where = _where("messages_fts", params)
 
@@ -5795,6 +5799,21 @@ class SessionDB:
             exclusion_parts.append("lineage_root_id != ?")
             exclusion_params.append(current_lineage_root)
         exclusion_sql = " AND ".join(exclusion_parts) or "1 = 1"
+
+        if route == "like":
+            final_snippet_expr = "ranked.snippet"
+            final_snippet_join = ""
+        else:
+            # FTS5's snippet() needs the MATCH expression on the same table
+            # cursor.  Keep the exact tokenized query used for candidate
+            # selection and apply it only after lineage winners are selected.
+            final_snippet_expr = (
+                f"snippet({candidate_from}, 0, '>>>', '<<<', '...', 40)"
+            )
+            final_snippet_join = (
+                f"JOIN {candidate_from} ON {candidate_from}.rowid = ranked.message_id "
+                f"AND {candidate_from} MATCH ?"
+            )
 
         sql = f"""
             WITH
@@ -5883,7 +5902,7 @@ class SessionDB:
                 ranked.message_id AS id,
                 ranked.owning_session_id AS session_id,
                 ranked.role,
-                ranked.snippet,
+                {final_snippet_expr} AS snippet,
                 ranked.timestamp,
                 ranked.source,
                 ranked.model,
@@ -5894,6 +5913,7 @@ class SessionDB:
                 stats.candidate_count,
                 stats.candidate_unique_sessions
             FROM lineage_ranked ranked
+            {final_snippet_join}
             CROSS JOIN candidate_stats stats
             WHERE ranked.lineage_rank = 1
               AND {exclusion_sql}
@@ -5906,7 +5926,10 @@ class SessionDB:
         if route == "like":
             sql_params = params + exclusion_params + [result_limit]
         else:
-            sql_params = params + exclusion_params + [result_limit]
+            # params[0] is the tokenized FTS query; candidate_limit/offset are
+            # already at the tail of params.  The final MATCH cursor needs the
+            # same query before the result LIMIT parameter.
+            sql_params = params + [params[0]] + exclusion_params + [result_limit]
 
         request_value = request_id or "-"
         query_id = f"cursor-winners-{os.getpid()}-{time.time_ns()}"
