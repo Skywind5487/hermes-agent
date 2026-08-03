@@ -1102,6 +1102,21 @@ def run_conversation(
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
+        from agent.lifecycle_telemetry import emit_lifecycle
+        emit_lifecycle(
+            "API_CALL_START",
+            operation_kind="api_call",
+            trace_id=turn_id,
+            span_id=api_request_id,
+            parent_span_id=turn_id,
+            session_id=agent.session_id or "",
+            turn_id=turn_id,
+            task_id=effective_task_id,
+            api_request_id=api_request_id,
+            platform=agent.platform or "",
+            status="started",
+        )
+
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
@@ -1381,6 +1396,19 @@ def run_conversation(
                 )
                 
                 api_duration = time.time() - api_start_time
+                emit_lifecycle(
+                    "API_CALL_RESPONSE",
+                    operation_kind="api_call",
+                    trace_id=turn_id,
+                    span_id=api_request_id,
+                    parent_span_id=turn_id,
+                    session_id=agent.session_id or "",
+                    turn_id=turn_id,
+                    task_id=effective_task_id,
+                    api_request_id=api_request_id,
+                    status="response_received",
+                    duration_ms=int(api_duration * 1000),
+                )
                 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
@@ -1479,6 +1507,22 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    emit_lifecycle(
+                        "API_CALL_ERROR",
+                        operation_kind="api_call",
+                        trace_id=turn_id,
+                        span_id=api_request_id,
+                        parent_span_id=turn_id,
+                        session_id=agent.session_id or "",
+                        turn_id=turn_id,
+                        task_id=effective_task_id,
+                        api_request_id=api_request_id,
+                        status="retryable",
+                        reason="invalid_response",
+                        error_type="InvalidAPIResponse",
+                        retry_count=retry_count,
+                        duration_ms=int(api_duration * 1000),
+                    )
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -2638,6 +2682,22 @@ def run_conversation(
                     classified.reason.value, classified.status_code,
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
+                )
+                emit_lifecycle(
+                    "API_CALL_ERROR",
+                    operation_kind="api_call",
+                    trace_id=turn_id,
+                    span_id=api_request_id,
+                    parent_span_id=turn_id,
+                    session_id=agent.session_id or "",
+                    turn_id=turn_id,
+                    task_id=effective_task_id,
+                    api_request_id=api_request_id,
+                    status="retryable" if classified.retryable else "terminal",
+                    reason=classified.reason.value,
+                    error_type=type(api_error).__name__,
+                    retry_count=retry_count,
+                    duration_ms=int((time.time() - api_start_time) * 1000),
                 )
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,

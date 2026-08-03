@@ -30,6 +30,7 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.lifecycle_telemetry import emit_lifecycle, lifecycle_context
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
@@ -140,6 +141,31 @@ def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return "cannot schedule new futures after interpreter shutdown" in str(exc)
 
 
+def _emit_tool_start(
+    agent,
+    *,
+    function_name: str,
+    effective_task_id: str,
+    tool_call_id: str,
+) -> None:
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
+    api_request_id = getattr(agent, "_current_api_request_id", "") or ""
+    emit_lifecycle(
+        "TOOL_START",
+        operation_kind="tool_call",
+        trace_id=turn_id or getattr(agent, "session_id", "") or "session",
+        span_id=tool_call_id or f"{turn_id}:tool:{function_name}",
+        parent_span_id=api_request_id or turn_id,
+        session_id=getattr(agent, "session_id", "") or "",
+        turn_id=turn_id,
+        task_id=effective_task_id,
+        api_request_id=api_request_id,
+        tool_call_id=tool_call_id or "",
+        function_name=function_name,
+        status="started",
+    )
+
+
 def _emit_terminal_post_tool_call(
     agent,
     *,
@@ -154,6 +180,25 @@ def _emit_terminal_post_tool_call(
     error_message: str | None = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None,
 ) -> None:
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
+    api_request_id = getattr(agent, "_current_api_request_id", "") or ""
+    emit_lifecycle(
+        "TOOL_END",
+        operation_kind="tool_call",
+        trace_id=turn_id or getattr(agent, "session_id", "") or "session",
+        span_id=tool_call_id or f"{turn_id}:tool:{function_name}",
+        parent_span_id=api_request_id or turn_id,
+        session_id=getattr(agent, "session_id", "") or "",
+        turn_id=turn_id,
+        task_id=effective_task_id,
+        api_request_id=api_request_id,
+        tool_call_id=tool_call_id or "",
+        function_name=function_name,
+        status=status or "success",
+        reason=error_type,
+        error_type=error_type,
+        duration_ms=duration_ms,
+    )
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(
@@ -594,18 +639,34 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ContextVars are propagated by propagate_context_to_thread() at the
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
+        _emit_tool_start(
+            agent,
+            function_name=function_name,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(tool_call, "id", "") or "",
+        )
         try:
             try:
-                result = agent._invoke_tool(
-                    function_name,
-                    function_args,
-                    effective_task_id,
-                    tool_call.id,
-                    messages=messages,
-                    pre_tool_block_checked=True,
-                    skip_tool_request_middleware=True,
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+                with lifecycle_context(
+                    trace_id=getattr(agent, "_current_turn_id", "") or getattr(agent, "session_id", "") or "session",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    task_id=effective_task_id,
+                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    operation_kind="tool_call",
+                    operation_name=function_name,
+                ):
+                    result = agent._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                        pre_tool_block_checked=True,
+                        skip_tool_request_middleware=True,
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
             except KeyboardInterrupt:
                 try:
                     agent.interrupt("keyboard interrupt")
@@ -1200,6 +1261,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
 
+        if _block_msg is None and _guardrail_block_decision is None:
+            _emit_tool_start(
+                agent,
+                function_name=function_name,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+            )
+
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
@@ -1270,14 +1339,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     db=session_db,
                     current_session_id=agent.session_id,
                 )
-            function_result, function_args = _run_agent_tool_execution_middleware(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                effective_task_id=effective_task_id,
+            with lifecycle_context(
+                trace_id=getattr(agent, "_current_turn_id", "") or getattr(agent, "session_id", "") or "session",
+                session_id=getattr(agent, "session_id", "") or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                task_id=effective_task_id,
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 tool_call_id=getattr(tool_call, "id", "") or "",
-                execute=_execute,
-            )
+                operation_kind="tool_call",
+                operation_name=function_name,
+            ):
+                function_result, function_args = _run_agent_tool_execution_middleware(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    execute=_execute,
+                )
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")

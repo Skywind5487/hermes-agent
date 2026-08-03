@@ -20,7 +20,9 @@ import inspect
 import logging
 import queue
 import re
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -36,6 +38,7 @@ from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
 )
+from agent.lifecycle_telemetry import emit_lifecycle
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -190,6 +193,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        telemetry_context: Optional[Callable[[], dict]] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -267,6 +271,22 @@ class GatewayStreamConsumer:
         # continuing to edit and deliver stale deltas.
         self._run_still_current = run_still_current or (lambda: True)
 
+        # Lifecycle telemetry is independent from platform routing metadata.
+        # The callback is evaluated lazily because the agent creates its
+        # turn/API identifiers after this consumer is built.
+        self._telemetry_context = telemetry_context
+        self._telemetry_span_id = f"stream:{uuid.uuid4().hex[:12]}"
+        self._telemetry_lock = threading.Lock()
+        self._stream_started = False
+        self._stream_terminal = False
+        self._stream_start_ns = time.monotonic_ns()
+        self._stream_delta_count = 0
+        self._stream_char_count = 0
+        self._stream_byte_count = 0
+        self._stream_flush_count = 0
+        self._stream_terminal_status = "completed"
+        self._stream_error_type: Optional[str] = None
+
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
         self._think_buffer = ""
@@ -308,6 +328,14 @@ class GatewayStreamConsumer:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+        lifecycle = self._lifecycle_context()
+        for key in (
+            "trace_id", "turn_id", "task_id", "api_request_id",
+            "session_id", "platform", "station",
+        ):
+            if lifecycle.get(key) is not None:
+                meta[key] = lifecycle[key]
+        meta["parent_span_id"] = lifecycle["span_id"]
         return meta or None
 
     @property
@@ -369,7 +397,16 @@ class GatewayStreamConsumer:
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    edit_metadata = dict(self.metadata)
+                    lifecycle = self._lifecycle_context()
+                    for key in (
+                        "trace_id", "turn_id", "task_id", "api_request_id",
+                        "session_id", "platform", "station",
+                    ):
+                        if lifecycle.get(key) is not None:
+                            edit_metadata[key] = lifecycle[key]
+                    edit_metadata["parent_span_id"] = lifecycle["span_id"]
+                    kwargs["metadata"] = edit_metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -402,6 +439,90 @@ class GatewayStreamConsumer:
             cb()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _lifecycle_context(self) -> dict:
+        """Return safe correlation fields without copying platform payload."""
+        context = {}
+        if self._telemetry_context is not None:
+            try:
+                candidate = self._telemetry_context()
+                if isinstance(candidate, dict):
+                    context = candidate
+            except Exception:
+                logger.debug("stream telemetry context lookup failed", exc_info=True)
+        fields = {
+            key: context.get(key)
+            for key in (
+                "trace_id", "turn_id", "task_id", "api_request_id",
+                "session_id", "platform", "station",
+            )
+            if context.get(key) is not None
+        }
+        fields.setdefault(
+            "trace_id",
+            fields.get("turn_id") or fields.get("session_id") or self._telemetry_span_id,
+        )
+        fields["span_id"] = self._telemetry_span_id
+        fields.setdefault("parent_span_id", fields.get("api_request_id") or fields.get("turn_id"))
+        fields["chat_id"] = self.chat_id
+        return fields
+
+    def _emit_stream_event(self, event: str, **fields: Any) -> None:
+        payload = self._lifecycle_context()
+        payload.update(fields)
+        emit_lifecycle(event, **payload)
+
+    def _ensure_stream_started(self) -> None:
+        with self._telemetry_lock:
+            if self._stream_started:
+                return
+            self._stream_started = True
+        self._emit_stream_event(
+            "STREAM_START",
+            operation_kind="stream",
+            operation_name="gateway_stream",
+            status="started",
+        )
+
+    def _emit_stream_flush(self, *, phase: str = "delivery_attempt") -> None:
+        with self._telemetry_lock:
+            self._stream_flush_count += 1
+            flush_count = self._stream_flush_count
+            delta_count = self._stream_delta_count
+            char_count = self._stream_char_count
+            byte_count = self._stream_byte_count
+        self._emit_stream_event(
+            "STREAM_FLUSH",
+            operation_kind="stream",
+            operation_name="gateway_stream",
+            phase=phase,
+            status="attempted",
+            chunk_count=flush_count,
+            char_count=char_count,
+            byte_count=byte_count,
+            retry_count=delta_count,
+        )
+
+    def _emit_stream_terminal(self, status: str, *, error_type: Optional[str] = None) -> None:
+        with self._telemetry_lock:
+            if self._stream_terminal:
+                return
+            self._stream_terminal = True
+            duration_ms = int((time.monotonic_ns() - self._stream_start_ns) / 1_000_000)
+            delta_count = self._stream_delta_count
+            char_count = self._stream_char_count
+            byte_count = self._stream_byte_count
+        self._emit_stream_event(
+            "STREAM_ERROR" if status == "error" else "STREAM_END",
+            operation_kind="stream",
+            operation_name="gateway_stream",
+            status=status,
+            error_type=error_type,
+            duration_ms=duration_ms,
+            chunk_count=delta_count,
+            char_count=char_count,
+            byte_count=byte_count,
+        )
 
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
@@ -438,13 +559,28 @@ class GatewayStreamConsumer:
         is finalized and subsequent text will be sent as a new message so it
         appears below any tool-progress messages the gateway sent in between.
         """
+        self._ensure_stream_started()
         if text:
+            with self._telemetry_lock:
+                self._stream_delta_count += 1
+                self._stream_char_count += len(text)
+                self._stream_byte_count += len(text.encode("utf-8"))
+                first_delta = self._stream_delta_count == 1
+            if first_delta:
+                self._emit_stream_event(
+                    "STREAM_FIRST_DELTA",
+                    operation_kind="stream",
+                    operation_name="gateway_stream",
+                    phase="first_delta",
+                    status="started",
+                )
             self._queue.put(text)
         elif text is None:
             self.on_segment_break()
 
     def finish(self) -> None:
         """Signal that the stream is complete."""
+        self._ensure_stream_started()
         self._queue.put(_DONE)
 
     # ── Think-block filtering ────────────────────────────────────────
@@ -603,6 +739,7 @@ class GatewayStreamConsumer:
 
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
+        self._ensure_stream_started()
         # Platform message length limit — leave room for cursor + formatting.
         # Use the adapter's length function (e.g. utf16_len for Telegram) so
         # overflow detection matches what the platform actually enforces.
@@ -923,6 +1060,7 @@ class GatewayStreamConsumer:
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
         except asyncio.CancelledError:
+            self._stream_terminal_status = "cancelled"
             # Best-effort final edit on cancellation.  finalize=True so
             # REQUIRES_EDIT_FINALIZE platforms (Telegram) apply final
             # formatting — a plain edit here would leave the entire reply
@@ -951,7 +1089,14 @@ class GatewayStreamConsumer:
                 self._final_response_sent = True
                 self._final_content_delivered = True
         except Exception as e:
+            self._stream_terminal_status = "error"
+            self._stream_error_type = type(e).__name__
             logger.error("Stream consumer error: %s", e)
+        finally:
+            self._emit_stream_terminal(
+                self._stream_terminal_status,
+                error_type=self._stream_error_type,
+            )
 
     # Strip MEDIA:<path> tags before display. Uses the shared anchored
     # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose
@@ -1709,6 +1854,8 @@ class GatewayStreamConsumer:
         ``finalize`` is True when this is the last edit in a streaming
         sequence.
         """
+        self._ensure_stream_started()
+        self._emit_stream_flush()
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).

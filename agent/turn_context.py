@@ -219,6 +219,20 @@ def build_turn_context(
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
 
+    from agent.lifecycle_telemetry import emit_lifecycle
+    emit_lifecycle(
+        "TURN_START",
+        operation_kind="turn",
+        trace_id=turn_id,
+        span_id=turn_id,
+        session_id=agent.session_id or "",
+        turn_id=turn_id,
+        task_id=effective_task_id,
+        platform=agent.platform or "unknown",
+        station=getattr(agent, "station", None),
+        status="started",
+    )
+
     # Reset retry counters and iteration budget at the start of each turn.
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0

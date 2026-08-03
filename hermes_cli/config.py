@@ -978,6 +978,13 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
+    # Diagnostic telemetry is opt-in. Native SQLite probing falls back to the
+    # public progress handler when the Python build bundles a different SQLite
+    # library; kernel snapshots remain request-window and payload-free.
+    "observability": {
+        "sqlite_native": {"enabled": False},
+        "kernel_snapshot": {"enabled": False},
+    },
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
@@ -2805,16 +2812,20 @@ DEFAULT_CONFIG = {
 
     # Headroom Phase 1 structured tool-output compression experiment.
     # Disabled by default and also gated by the bundled standalone
-    # ``headroom`` plugin being present in plugins.enabled. Phase 1 only
-    # permits search_files and browser_snapshot; config can narrow that
-    # allowlist but cannot widen it.
+    # ``headroom`` plugin being present in plugins.enabled. Phase 1 permits
+    # selected large read-only tool results; config can narrow that allowlist
+    # but cannot widen it.
     "headroom": {
         "enabled": False,
         "kill_switch": False,
-        "allowlist": ["search_files", "browser_snapshot"],
+        "allowlist": [
+            "search_files", "browser_snapshot", "terminal", "read_file",
+            "session_search", "lcm_grep", "lcm_load_session", "lcm_expand",
+            "web_search", "browser_console",
+        ],
         "excluded_tools": [
-            "terminal", "read_file", "delegate_task", "patch", "write_file",
-            "memory", "send_message", "clarify", "cronjob",
+            "delegate_task", "patch", "write_file", "memory", "send_message",
+            "clarify", "cronjob",
         ],
         "max_items": 8,
         "max_field_chars": 240,

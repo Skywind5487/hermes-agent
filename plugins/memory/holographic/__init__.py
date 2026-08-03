@@ -120,6 +120,7 @@ class HolographicMemoryProvider(MemoryProvider):
         self._store = None
         self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        self._prefetch_enabled = bool(self._config.get("prefetch_enabled", True))
 
     @property
     def name(self) -> str:
@@ -204,6 +205,8 @@ class HolographicMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if not self._prefetch_enabled:
+            return ""
         if not self._retriever or not query:
             return ""
         try:
