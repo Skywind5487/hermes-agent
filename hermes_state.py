@@ -5751,6 +5751,12 @@ class SessionDB:
         source_priority = (
             "CASE WHEN COALESCE(source, '') IN ('cron') THEN 1 ELSE 0 END"
         )
+        # Ranked Top-N pre-limit is only safe when the primary ordering key is
+        # the FTS rank (relevance sort).  For newest/oldest the ordering key is
+        # timestamp, which FTS5 cannot stream in rank order, so pre-limiting by
+        # rank would drop the freshest candidates before timestamp ordering.
+        # The LIKE route has no FTS rank at all and is left untouched.
+        use_ranked_prelimit = route != "like" and sort_norm is None
         if route == "like":
             candidate_base = f"""
                 SELECT
@@ -5769,7 +5775,7 @@ class SessionDB:
                 WHERE {candidate_where}
             """
         else:
-            candidate_base = f"""
+            fts_candidate = f"""
                 SELECT
                     m.id AS message_id,
                     m.session_id AS owning_session_id,
@@ -5786,6 +5792,30 @@ class SessionDB:
                 JOIN sessions s ON s.id = m.session_id
                 WHERE {candidate_where}
             """
+            if use_ranked_prelimit:
+                # Relevance sort: rank the full filtered FTS match set inside
+                # the candidate CTE, keep only the top candidate_limit rows,
+                # and only then run the JOIN / lineage / window machinery.
+                # SQLite streams this CTE (CO-ROUTINE + LIMIT pushdown, INDEX
+                # 0:M1) instead of materializing every hit before ordering,
+                # which is what makes high-hit queries pathological.  The
+                # message_id tie-break mirrors production's candidate_order
+                # (fts_rank ASC, message_id ASC), so the top-N set is
+                # identical; candidate_hits below re-derives the same
+                # candidate_order for lineage ranking.
+                ranked_candidates = f"""
+            ranked_candidates AS (
+                {fts_candidate}
+                ORDER BY rank, m.id
+                LIMIT {candidate_limit} OFFSET 0
+            ),
+            """
+                candidate_base = """
+                SELECT * FROM ranked_candidates
+            """
+            else:
+                ranked_candidates = ""
+                candidate_base = fts_candidate
 
         exclusion_parts = []
         exclusion_params: list = []
@@ -5817,6 +5847,7 @@ class SessionDB:
 
         sql = f"""
             WITH
+            {ranked_candidates}
             candidate_base AS (
                 {candidate_base}
             ),
