@@ -5758,6 +5758,7 @@ class SessionDB:
         # The LIKE route has no FTS rank at all and is left untouched.
         use_ranked_prelimit = route != "like" and sort_norm is None
         if route == "like":
+            ranked_candidates = ""  # LIKE route has no FTS rank; no pre-limit
             candidate_base = f"""
                 SELECT
                     m.id AS message_id,
