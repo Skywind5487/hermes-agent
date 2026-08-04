@@ -2307,6 +2307,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             exc,
         )
 
+    @staticmethod
+    def _backfill_sessions_fts(
+        cursor,
+        *,
+        include_cjk: bool = True,
+    ) -> None:
+        """Backfill existing session titles into the sessions FTS5 tables.
+
+        ``cursor`` may be a Cursor or a Connection (both expose ``execute``).
+        The cjk table backfill runs in progressive batches with a short
+        breather so the gateway writer is not starved.
+        """
+        conn = getattr(cursor, "connection", cursor)
+
+        # Main sessions_fts backfill (unicode61 — one shot).
+        cursor.execute(
+            "INSERT OR IGNORE INTO sessions_fts(rowid, title) "
+            "SELECT _rowid_, COALESCE(title, '') FROM sessions WHERE title IS NOT NULL"
+        )
+        conn.commit()
+
+        # CJK sessions_fts_cjk backfill (cjk_unicode61) — progressive batches.
+        if include_cjk:
+            cursor.execute(
+                "SELECT _rowid_ FROM sessions WHERE title IS NOT NULL "
+                "AND _rowid_ NOT IN (SELECT rowid FROM sessions_fts_cjk)"
+            )
+            missing = [row[0] for row in cursor.fetchall()]
+            if missing:
+                batch_sizes = [500, 200, 100, 50]
+                remaining = list(missing)
+                while remaining:
+                    bs = batch_sizes.pop(0) if batch_sizes else 50
+                    batch = remaining[:bs]
+                    remaining = remaining[bs:]
+                    placeholders = ",".join("?" for _ in batch)
+                    cursor.execute(
+                        f"INSERT OR IGNORE INTO sessions_fts_cjk(rowid, title) "
+                        f"SELECT _rowid_, COALESCE(title, '') FROM sessions "
+                        f"WHERE _rowid_ IN ({placeholders})",
+                        batch,
+                    )
+                    conn.commit()
+                    if remaining:
+                        time.sleep(0.05)  # 50ms breather for gateway writer
+
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
 
@@ -5416,27 +5462,77 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         If not, searches for "title #N" variants and returns the latest one.
         If the exact title exists AND numbered variants exist, returns the
         latest numbered variant (the most recent continuation).
+
+        Uses FTS5 for the numbered variant search (CJK dispatch matching
+        the search_messages pattern), with LIKE as fallback.
         """
         # First try exact match
         exact = self.get_session_by_title(title)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
-        # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
-            )
-            numbered = cursor.fetchall()
+        # Use FTS5 if available, fall back to LIKE.
+        if not self._fts_enabled:
+            numbers = self._like_numbered_variants(title)
+        else:
+            numbers = self._fts_numbered_variants(title)
+            if numbers is None:
+                numbers = self._like_numbered_variants(title)
 
-        if numbered:
-            # Return the most recent numbered variant
-            return numbered[0]["id"]
+        if numbers:
+            return numbers[0]["id"]
         elif exact:
             return exact["id"]
         return None
+
+    def _like_numbered_variants(self, title: str) -> List[sqlite3.Row]:
+        """Fallback: find numbered continuation variants via LIKE."""
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT id, title, started_at FROM sessions "
+                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
+                (f"{escaped} #%",),
+            ))
+
+    def _fts_numbered_variants(self, title: str) -> Optional[List[sqlite3.Row]]:
+        """Find numbered continuation variants via FTS5 MATCH with CJK dispatch.
+
+        Returns None to signal fallback to LIKE (e.g. FTS5 runtime error or
+        the target table unavailable). Returns empty list when no matches.
+        """
+        is_cjk = self._contains_cjk(title)
+        if is_cjk and not getattr(self, "_sessions_cjk_available", False):
+            return None
+        fts_table = "sessions_fts_cjk" if is_cjk else "sessions_fts"
+        sanitized = self._sanitize_fts5_query(title)
+
+        if not sanitized:
+            return None
+
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    f"SELECT s.id AS id, s.title, s.started_at "
+                    f"FROM {fts_table} f "
+                    f"JOIN sessions s ON s._rowid_ = f.rowid "
+                    f"WHERE {fts_table} MATCH ? "
+                    f"ORDER BY s.started_at DESC",
+                    (sanitized,),
+                )
+                candidates = list(cursor)
+            except sqlite3.OperationalError:
+                logging.debug(
+                    "%s MATCH failed for %r, falling back to LIKE",
+                    fts_table, sanitized, exc_info=True,
+                )
+                return None
+
+        # Post-filter: only keep sessions whose title starts with "{title} #N"
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return [
+            c for c in candidates
+            if c["title"] and c["title"].startswith(f"{escaped} #")
+        ]
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").

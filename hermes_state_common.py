@@ -546,6 +546,51 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 # (which would create the external-content trigram source VIEW and leave the
 # DB in a mixed, broken state). `optimize_fts_storage()` is what migrates a
 # legacy DB to the v23 shape.
+# ── Sessions FTS5 — title search ────────────────────────────────────────
+SESSIONS_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    title,
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions BEGIN
+    DELETE FROM sessions_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_update AFTER UPDATE ON sessions BEGIN
+    DELETE FROM sessions_fts WHERE rowid = old.rowid;
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
+END;
+"""
+
+# CJK title search — cjk_unicode61 loadable tokenizer, mirroring
+# messages_fts_cjk. Requires libfts5_cjk.so (native/fts5_cjk/build.sh);
+# callers gate table creation on the extension being loaded and fall back
+# to LIKE when it is absent.
+SESSIONS_FTS_CJK_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_cjk USING fts5(
+    title,
+    tokenize='cjk_unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_insert AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts_cjk(rowid, title) VALUES (new.rowid, new.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_delete AFTER DELETE ON sessions BEGIN
+    DELETE FROM sessions_fts_cjk WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_update AFTER UPDATE ON sessions BEGIN
+    DELETE FROM sessions_fts_cjk WHERE rowid = old.rowid;
+    INSERT INTO sessions_fts_cjk(rowid, title) VALUES (new.rowid, new.title);
+END;
+"""
+
 LEGACY_FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content

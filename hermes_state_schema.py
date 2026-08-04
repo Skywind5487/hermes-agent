@@ -24,6 +24,8 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSIONS_FTS_CJK_SQL,
+    SESSIONS_FTS_SQL,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
 )
@@ -1021,6 +1023,27 @@ class SessionSchemaMixin:
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)
+
+                # ── Sessions FTS5 (title search) ────────────────────────
+                # unicode61 table for non-CJK titles; cjk_unicode61 table
+                # for CJK titles, gated on the loadable tokenizer (LIKE
+                # fallback otherwise). Mirrors the messages FTS pattern.
+                sessions_fts_ok = self._ensure_fts_schema(
+                    cursor, "sessions_fts", SESSIONS_FTS_SQL,
+                )
+                sessions_cjk_ok = False
+                if sessions_fts_ok and self._fts_cjk_loaded:
+                    sessions_cjk_ok = self._ensure_fts_schema(
+                        cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL,
+                    )
+                self._sessions_fts_available = sessions_fts_ok
+                self._sessions_cjk_available = sessions_cjk_ok
+                if sessions_fts_ok:
+                    # One-time backfill of pre-existing session titles.
+                    self._backfill_sessions_fts(
+                        cursor,
+                        include_cjk=sessions_cjk_ok,
+                    )
 
             # Replace any pre-existing broad AFTER UPDATE triggers with
             # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
