@@ -2544,6 +2544,13 @@ def terminal_tool(
                         metadata = local_path.stat()
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
+                            if b"\x00" in data:
+                                # Binary (ELF/Mach-O/PE), not a referenced
+                                # shell script. Mirror _read_referenced_script's
+                                # NUL check so binary content can never re-enter
+                                # the scan through this fallback (same bug class
+                                # as #76762).
+                                return None
                             if len(data) <= 1024 * 1024:
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
