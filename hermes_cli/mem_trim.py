@@ -3,6 +3,15 @@
 On Linux/glibc, ``malloc_trim(0)`` can return pages from freed Python/C
 allocations to the OS.  Other platforms and allocators are safe no-ops.
 Behavior is configured under ``context.memory_trim`` in ``config.yaml``.
+
+Instrumentation (branch mem-trim-instrumentation, 2026-08-05):
+- T1: split gc.collect() and malloc_trim(0) timing (gc_ms / trim_ms) so the
+  freeze mechanism can be attributed (GIL-holding gc vs C-level trim).
+- T2: malloc_info heap stats (system/free bytes -> frag_pct) for fragment
+  rate measurement.
+- T3: VmSwap before/after so swap pressure can be correlated with duration.
+- threshold_mb: RSS low-water gate — skip trim entirely below the threshold
+  (config ``context.memory_trim.threshold_mb``).
 """
 
 from __future__ import annotations
@@ -10,7 +19,9 @@ from __future__ import annotations
 import ctypes
 import gc
 import logging
+import os
 import platform
+import re
 import sys
 import threading
 import time
@@ -23,6 +34,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_COOLDOWN_SECONDS = 60.0
 _DEFAULT_LOG_EVERY_N = 1
 _DEFAULT_INFO_LOG_MIN_DELTA_MB = 0.0
+_DEFAULT_THRESHOLD_MB = None  # None = gate disabled (trim always allowed)
 _trim_lock = threading.Lock()
 _last_trim_monotonic = 0.0
 _probe_done = False
@@ -30,12 +42,13 @@ _malloc_trim: Callable[[int], int] | None = None
 _trim_call_count = 0
 
 
-def _config_settings() -> tuple[bool, float, int, float]:
+def _config_settings() -> tuple[bool, float, int, float, float | None]:
     """Return fail-open settings from the normal Hermes config path."""
     enabled = True
     cooldown: Any = _DEFAULT_COOLDOWN_SECONDS
     log_every_n: Any = _DEFAULT_LOG_EVERY_N
     info_log_min_delta_mb: Any = _DEFAULT_INFO_LOG_MIN_DELTA_MB
+    threshold_mb: Any = _DEFAULT_THRESHOLD_MB
     try:
         # Read-only access: settings are only .get()ed and coerced, never
         # mutated — use the no-deepcopy variant. This runs on EVERY trim
@@ -56,6 +69,7 @@ def _config_settings() -> tuple[bool, float, int, float]:
             info_log_min_delta_mb = settings.get(
                 "info_log_min_delta_mb", _DEFAULT_INFO_LOG_MIN_DELTA_MB
             )
+            threshold_mb = settings.get("threshold_mb", _DEFAULT_THRESHOLD_MB)
     except Exception:
         pass
     return (
@@ -63,7 +77,19 @@ def _config_settings() -> tuple[bool, float, int, float]:
         _cooldown_seconds(cooldown),
         _log_every_n(log_every_n),
         _nonnegative_float(info_log_min_delta_mb, _DEFAULT_INFO_LOG_MIN_DELTA_MB),
+        _threshold_mb(threshold_mb),
     )
+
+
+def _threshold_mb(value: Any) -> float | None:
+    """Coerce threshold_mb; non-positive or non-numeric -> disabled (None)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
 
 
 def _cooldown_seconds(value: Any) -> float:
@@ -106,26 +132,74 @@ def _read_proc_status() -> str | None:
 def collect_memory_snapshot(history_bytes: int | None = None) -> dict[str, int | None]:
     """Return lightweight process-memory telemetry for trim logs and canaries.
 
-    ``VmRSS`` and ``RssAnon`` are Linux-only best effort fields.  The helper is
-    intentionally dependency-free so allocation recovery never requires psutil.
+    ``VmRSS``, ``RssAnon`` and ``VmSwap`` are Linux-only best effort fields.
+    The helper is intentionally dependency-free so allocation recovery never
+    requires psutil.
     """
     snapshot: dict[str, int | None] = {
         "rss_kib": None,
         "rss_anon_kib": None,
+        "vm_swap_kib": None,
         "thread_count": threading.active_count(),
     }
     status = _read_proc_status()
     if status:
         for line in status.splitlines():
             key, separator, raw_value = line.partition(":")
-            if not separator or key not in {"VmRSS", "RssAnon"}:
+            if not separator or key not in {"VmRSS", "RssAnon", "VmSwap"}:
                 continue
             value = raw_value.strip().split(maxsplit=1)
             if value and value[0].isdigit():
-                snapshot["rss_kib" if key == "VmRSS" else "rss_anon_kib"] = int(value[0])
+                if key == "VmRSS":
+                    snapshot["rss_kib"] = int(value[0])
+                elif key == "RssAnon":
+                    snapshot["rss_anon_kib"] = int(value[0])
+                elif key == "VmSwap":
+                    snapshot["vm_swap_kib"] = int(value[0])
     if isinstance(history_bytes, int) and history_bytes >= 0:
         snapshot["history_bytes"] = history_bytes
     return snapshot
+
+
+def _malloc_info_stats() -> dict[str, float | None] | None:
+    """Collect glibc heap stats via malloc_info(3): system/free bytes -> frag%.
+
+    T2 instrumentation (branch mem-trim-instrumentation). Best effort; returns
+    None on any failure (non-glibc, permissions, parse error).
+    """
+    try:
+        libc = ctypes.CDLL(None)
+        libc.malloc_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        libc.malloc_info.restype = ctypes.c_int
+        libc.fopen.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        libc.fopen.restype = ctypes.c_void_p
+        libc.fclose.argtypes = [ctypes.c_void_p]
+        libc.fclose.restype = ctypes.c_int
+        path = f"/tmp/hermes_malloc_info_{os.getpid()}.xml"
+        f = libc.fopen(path.encode(), b"wb")
+        if not f:
+            return None
+        try:
+            if libc.malloc_info(0, f) != 0:
+                return None
+        finally:
+            libc.fclose(f)
+        try:
+            txt = Path(path).read_text(encoding="utf-8", errors="replace")
+        finally:
+            Path(path).unlink(missing_ok=True)
+        m_sys = re.findall(r'<system type="current" size="(\d+)"/>', txt)
+        m_free = re.findall(r'<total type="(?:fast|rest)" size="(\d+)"/>', txt)
+        system = sum(int(s) for s in m_sys) if m_sys else 0
+        free = sum(int(s) for s in m_free) if m_free else 0
+        frag_pct = round(free * 100.0 / system, 1) if system else None
+        return {
+            "system_bytes": system,
+            "free_bytes": free,
+            "frag_pct": frag_pct,
+        }
+    except Exception:
+        return None
 
 
 def _should_log_trim(
@@ -175,14 +249,16 @@ def trim_memory(
     """Collect cycles and ask glibc to release free heap pages.
 
     Returns ``True`` only when ``malloc_trim(0)`` ran and reported success.
-    Unsupported allocators, the config kill switch, cooldown suppression, and all
-    runtime errors return ``False`` without affecting the caller.
+    Unsupported allocators, the config kill switch, cooldown suppression,
+    the RSS low-water threshold (``threshold_mb``), and all runtime errors
+    return ``False`` without affecting the caller.
     """
     (
         enabled,
         configured_cooldown,
         log_every_n,
         info_log_min_delta_mb,
+        threshold_mb,
     ) = _config_settings()
     if not enabled:
         return False
@@ -217,12 +293,25 @@ def trim_memory(
         _last_trim_monotonic = now
         try:
             before = collect_memory_snapshot()
+            # RSS low-water gate (T-instrumentation): skip when the process is
+            # small — a sub-300MB heap trims in ~0.3s and releases 1-17MB, i.e.
+            # pure busywork on every 60s housekeeping tick.
+            if (
+                not force
+                and threshold_mb is not None
+                and (before.get("rss_kib") or 0) < threshold_mb * 1024
+            ):
+                return False
             started = time.perf_counter()
             gc.collect()
+            gc_ms = (time.perf_counter() - started) * 1000
+            t0 = time.perf_counter()
             trim_result = trim(0)
+            trim_ms = (time.perf_counter() - t0) * 1000
+            duration_ms = gc_ms + trim_ms
             released = bool(trim_result)
             after = collect_memory_snapshot()
-            duration_ms = (time.perf_counter() - started) * 1000
+            heap = _malloc_info_stats()
             _trim_call_count += 1
             if released and _should_log_trim(
                 force=force,
@@ -234,15 +323,24 @@ def trim_memory(
             ):
                 logger.info(
                     "memory trim: reason=%s malloc_trim=%s rss_kib=%s->%s "
-                    "rss_anon_kib=%s->%s threads=%s duration_ms=%.1f",
+                    "rss_anon_kib=%s->%s swap_kib=%s->%s threads=%s "
+                    "duration_ms=%.1f gc_ms=%.1f trim_ms=%.1f "
+                    "heap_system_mb=%s heap_free_mb=%s frag_pct=%s",
                     reason or "cleanup",
                     trim_result,
                     before.get("rss_kib"),
                     after.get("rss_kib"),
                     before.get("rss_anon_kib"),
                     after.get("rss_anon_kib"),
+                    before.get("vm_swap_kib"),
+                    after.get("vm_swap_kib"),
                     after.get("thread_count"),
                     duration_ms,
+                    gc_ms,
+                    trim_ms,
+                    (heap["system_bytes"] / (1024 * 1024)) if heap else None,
+                    (heap["free_bytes"] / (1024 * 1024)) if heap else None,
+                    heap["frag_pct"] if heap else None,
                 )
             return released
         except Exception as exc:
