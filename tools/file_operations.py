@@ -908,7 +908,15 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # One false positive: the sample is cut with ``head -c 1000``,
+            # which slices on byte boundaries and may land mid-character in a
+            # multi-byte UTF-8 sequence. The decoder then emits a *fake*
+            # trailing U+FFFD for that half character. A byte cut can only
+            # corrupt the sample's LAST character (everything before it is
+            # complete), so strip trailing replacement chars before checking —
+            # a genuine U+FFFD in the middle of the file is still caught.
+            if "\ufffd" in content_sample[:1000].rstrip("\ufffd"):
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')

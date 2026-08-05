@@ -673,3 +673,21 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_replacement_char_from_byte_cut_not_flagged(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # ``head -c 1000`` cuts on byte boundaries; when the 1000th byte lands
+        # mid-character in a multi-byte UTF-8 sequence, the decoder turns the
+        # half character into a FAKE trailing U+FFFD. That is a sampling
+        # artifact, not binary content — it must not be flagged.
+        # Regression for: /tmp/handoff-a-jemalloc.md (valid UTF-8 CJK doc read
+        # as binary because byte 999 sat inside a 3-byte character).
+        sample = "這是一段正常的中文內容，最後一個字元被切斷" + "\ufffd"
+        assert ops._is_likely_binary("notes.txt", sample) is False
+
+    def test_genuine_replacement_char_mid_sample_still_flagged(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # rstrip only ignores TRAILING replacement chars. A real U+FFFD in the
+        # middle of the sample (actual non-UTF-8 bytes) must stay binary.
+        sample = "前段正常" + "\ufffd" + "後段也正常"
+        assert ops._is_likely_binary("notes.txt", sample) is True
