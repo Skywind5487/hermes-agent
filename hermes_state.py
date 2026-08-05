@@ -1161,6 +1161,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # Without it, this probe sees the DB exactly as a tokenizer-less
         # SessionDB open would (which drops the cjk triggers to keep writes
         # working), so tokenizer absence must never classify as corruption.
+        load_simple_extension(conn)
         load_fts5_cjk_extension(conn)
         conn.execute("PRAGMA journal_mode").fetchone()
         rows = conn.execute("PRAGMA integrity_check").fetchall()
@@ -1569,6 +1570,44 @@ def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def simple_tokenizer_so_path() -> Path:
+    """Location of the simple (jieba CJK) loadable FTS5 tokenizer."""
+    env = os.getenv("HERMES_LIBSIMPLE_PATH")
+    if env:
+        return Path(env).expanduser()
+    return get_hermes_home() / "libsimple" / "libsimple.so"
+
+
+def load_simple_extension(conn: sqlite3.Connection) -> bool:
+    """Best-effort load of the simple (jieba CJK) FTS5 tokenizer into ``conn``.
+
+    Legacy state.db installs (pre-v23 dev builds) created
+    ``messages_fts_trigram`` / ``sessions_fts_trigram`` with
+    ``tokenize='simple'``. Current code no longer creates simple tables, but an
+    existing DB still carries them — any statement touching those tables
+    (trigger-driven writes, MATCH queries) needs the tokenizer, otherwise the
+    whole session store fails to open with ``no such tokenizer: simple``.
+    Load best-effort like :func:`load_fts5_cjk_extension`; returns False
+    (never raises) when the .so is absent or loading fails.
+    """
+    path = simple_tokenizer_so_path()
+    if not path.exists():
+        logger.warning("simple tokenizer .so missing: %s", path)
+        return False
+    try:
+        conn.enable_load_extension(True)
+        try:
+            conn.load_extension(str(path))
+        finally:
+            conn.enable_load_extension(False)
+        return True
+    except Exception:
+        logger.warning(
+            "simple tokenizer extension load failed (%s)", path, exc_info=True
+        )
+        return False
+
+
 class CompressionSessionClosedError(RuntimeError):
     """A durable write targeted a parent already closed by compression."""
 
@@ -1935,6 +1974,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_usermerge_floor_applied = False
         self._fts_enabled = False
         self._trigram_available = False
+        # simple (jieba CJK) tokenizer loaded on the writer connection —
+        # legacy DBs carry messages_fts_trigram / sessions_fts_trigram with
+        # tokenize='simple' and any touch needs the extension loaded.
+        self._simple_loaded = False
         # CJK-bigram index (cjk_unicode61 loadable tokenizer). _fts_cjk_loaded:
         # extension present on the writer connection; _fts_cjk_available: the
         # messages_fts_cjk table is queryable AND not marked stale. Set during
@@ -2059,6 +2102,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
+                self._simple_loaded = load_simple_extension(self._conn)
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
 
@@ -2181,10 +2225,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             conn.row_factory = sqlite3.Row
             apply_database_pragmas(conn, db_label="state.db")
-            # Load the CJK tokenizer extension on this connection so
-            # messages_fts_cjk queries work on the read path. The .so
-            # registers the tokenizer in the connection's in-memory
-            # registry, not the database file, so mode=ro is fine.
+            # Load the simple tokenizer (legacy trigram tables are
+            # tokenize='simple' on pre-v23 DBs) and the CJK tokenizer so
+            # MATCH queries work on the read path. The .so registers the
+            # tokenizer in the connection's in-memory registry, not the
+            # database file, so mode=ro is fine.
+            if self._simple_loaded:
+                load_simple_extension(conn)
             if self._fts_cjk_loaded:
                 load_fts5_cjk_extension(conn)
             with self._read_conns_lock:
