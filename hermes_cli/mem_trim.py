@@ -12,6 +12,10 @@ Instrumentation (branch mem-trim-instrumentation, 2026-08-05):
 - T3: VmSwap before/after so swap pressure can be correlated with duration.
 - threshold_mb: RSS low-water gate — skip trim entirely below the threshold
   (config ``context.memory_trim.threshold_mb``).
+- gc_cooldown_seconds: measured 2026-08-05 — gc.collect() is the freeze
+  culprit (99.7% of duration, 2.7-4s at 270MB RSS) while malloc_trim is 3-14ms.
+  Gate gc.collect() behind its own cooldown so the housekeeping tick only
+  runs the cheap trim; gc runs at most every gc_cooldown_seconds.
 """
 
 from __future__ import annotations
@@ -32,20 +36,23 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _DEFAULT_COOLDOWN_SECONDS = 60.0
+_DEFAULT_GC_COOLDOWN_SECONDS = 300.0
 _DEFAULT_LOG_EVERY_N = 1
 _DEFAULT_INFO_LOG_MIN_DELTA_MB = 0.0
 _DEFAULT_THRESHOLD_MB = None  # None = gate disabled (trim always allowed)
 _trim_lock = threading.Lock()
 _last_trim_monotonic = 0.0
+_last_gc_monotonic = 0.0
 _probe_done = False
 _malloc_trim: Callable[[int], int] | None = None
 _trim_call_count = 0
 
 
-def _config_settings() -> tuple[bool, float, int, float, float | None]:
+def _config_settings() -> tuple[bool, float, float, int, float, float | None]:
     """Return fail-open settings from the normal Hermes config path."""
     enabled = True
     cooldown: Any = _DEFAULT_COOLDOWN_SECONDS
+    gc_cooldown: Any = _DEFAULT_GC_COOLDOWN_SECONDS
     log_every_n: Any = _DEFAULT_LOG_EVERY_N
     info_log_min_delta_mb: Any = _DEFAULT_INFO_LOG_MIN_DELTA_MB
     threshold_mb: Any = _DEFAULT_THRESHOLD_MB
@@ -65,6 +72,9 @@ def _config_settings() -> tuple[bool, float, int, float, float | None]:
             if isinstance(configured_enabled, bool):
                 enabled = configured_enabled
             cooldown = settings.get("cooldown_seconds", _DEFAULT_COOLDOWN_SECONDS)
+            gc_cooldown = settings.get(
+                "gc_cooldown_seconds", _DEFAULT_GC_COOLDOWN_SECONDS
+            )
             log_every_n = settings.get("log_every_n", _DEFAULT_LOG_EVERY_N)
             info_log_min_delta_mb = settings.get(
                 "info_log_min_delta_mb", _DEFAULT_INFO_LOG_MIN_DELTA_MB
@@ -75,6 +85,7 @@ def _config_settings() -> tuple[bool, float, int, float, float | None]:
     return (
         enabled,
         _cooldown_seconds(cooldown),
+        _cooldown_seconds(gc_cooldown),
         _log_every_n(log_every_n),
         _nonnegative_float(info_log_min_delta_mb, _DEFAULT_INFO_LOG_MIN_DELTA_MB),
         _threshold_mb(threshold_mb),
@@ -256,6 +267,7 @@ def trim_memory(
     (
         enabled,
         configured_cooldown,
+        gc_cooldown,
         log_every_n,
         info_log_min_delta_mb,
         threshold_mb,
@@ -263,7 +275,7 @@ def trim_memory(
     if not enabled:
         return False
 
-    global _last_trim_monotonic, _trim_call_count
+    global _last_trim_monotonic, _last_gc_monotonic, _trim_call_count
     with _trim_lock:
         trim = _probe_glibc_malloc_trim()
         if trim is None:
@@ -302,8 +314,21 @@ def trim_memory(
                 and (before.get("rss_kib") or 0) < threshold_mb * 1024
             ):
                 return False
+            # gc.collect() is the freeze culprit (measured 99.7% of duration,
+            # 2.7-4s at 270MB RSS); malloc_trim is 3-14ms. Run gc at most every
+            # gc_cooldown_seconds; the cheap trim runs every tick.
+            heap = _malloc_info_stats()  # before-trim heap stats (frag rate)
+            should_gc = True
+            if (
+                not force
+                and _last_gc_monotonic
+                and time.monotonic() - _last_gc_monotonic < gc_cooldown
+            ):
+                should_gc = False
             started = time.perf_counter()
-            gc.collect()
+            if should_gc:
+                gc.collect()
+                _last_gc_monotonic = time.monotonic()
             gc_ms = (time.perf_counter() - started) * 1000
             t0 = time.perf_counter()
             trim_result = trim(0)
@@ -311,7 +336,6 @@ def trim_memory(
             duration_ms = gc_ms + trim_ms
             released = bool(trim_result)
             after = collect_memory_snapshot()
-            heap = _malloc_info_stats()
             _trim_call_count += 1
             if released and _should_log_trim(
                 force=force,
