@@ -326,8 +326,9 @@ def trim_memory(
             ):
                 should_gc = False
             started = time.perf_counter()
+            freed_objs = 0
             if should_gc:
-                gc.collect()
+                freed_objs = gc.collect()
                 _last_gc_monotonic = time.monotonic()
             gc_ms = (time.perf_counter() - started) * 1000
             t0 = time.perf_counter()
@@ -349,6 +350,7 @@ def trim_memory(
                     "memory trim: reason=%s malloc_trim=%s rss_kib=%s->%s "
                     "rss_anon_kib=%s->%s swap_kib=%s->%s threads=%s "
                     "duration_ms=%.1f gc_ms=%.1f trim_ms=%.1f "
+                    "freed_objects=%s "
                     "heap_system_mb=%s heap_free_mb=%s frag_pct=%s",
                     reason or "cleanup",
                     trim_result,
@@ -362,6 +364,7 @@ def trim_memory(
                     duration_ms,
                     gc_ms,
                     trim_ms,
+                    freed_objs,
                     (heap["system_bytes"] / (1024 * 1024)) if heap else None,
                     (heap["free_bytes"] / (1024 * 1024)) if heap else None,
                     heap["frag_pct"] if heap else None,
