@@ -143,6 +143,7 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${LD_LIBRARY_PATH:+LD_LIBRARY_PATH="$LD_LIBRARY_PATH"} \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
