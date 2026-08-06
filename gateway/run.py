@@ -26573,6 +26573,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
+    # Freeze startup-time objects (framework, config, MCP tools) so periodic
+    # gc.collect() passes in mem_trim skip them — in a long-lived gateway these
+    # objects never become garbage, so scanning them every 5 minutes is pure
+    # waste. gc.freeze() marks everything alive right now as permanent; only
+    # objects created after this point remain in the GC's scan set.
+    try:
+        import gc as _gc
+        _gc.freeze()
+    except Exception:
+        pass
+
     # Start the gateway
     try:
         success = await runner.start()
