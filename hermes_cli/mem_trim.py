@@ -338,7 +338,7 @@ def trim_memory(
             released = bool(trim_result)
             after = collect_memory_snapshot()
             _trim_call_count += 1
-            if released and _should_log_trim(
+            if (released or should_gc) and _should_log_trim(
                 force=force,
                 log_every_n=log_every_n,
                 call_count=_trim_call_count,
