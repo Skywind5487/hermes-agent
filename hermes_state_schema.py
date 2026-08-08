@@ -24,9 +24,15 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSION_FTS_CJK_STALE_KEY,
+    SESSION_TABLE_REBUILD_SQL,
+    SESSIONS_FTS_CJK_LEGACY_SQL,
     SESSIONS_FTS_CJK_SQL,
+    SESSIONS_FTS_LEGACY_SQL,
     SESSIONS_FTS_SQL,
     _FTS_TRIGGERS,
+    _SESSION_FTS_CJK_TRIGGERS,
+    _SESSION_FTS_TRIGGERS,
     _ephemeral_child_sql,
 )
 
@@ -112,12 +118,21 @@ class SessionSchemaMixin:
         # destructive candidates so the legacy branch never drops a trigger
         # it does not recreate.
         legacy_layout = self._db_has_legacy_inline_fts(cursor)
+        # v26: session-title triggers narrow to title-only ONLY on the
+        # external-content layout. A legacy internal-content sessions_fts
+        # keeps its broad trigger until optimize-storage converts it.
+        session_legacy = self._db_has_legacy_session_inline_fts(cursor)
         update_names = (
             "messages_fts_update",
             "messages_fts_trigram_update",
         )
         if not legacy_layout and hasattr(self, "_ensure_fts_cjk_schema"):
             update_names += ("messages_fts_cjk_update",)
+        if not session_legacy:
+            update_names += (
+                "sessions_fts_update",
+                "sessions_fts_cjk_update",
+            )
         placeholders = ", ".join("?" for _ in update_names)
         rows = cursor.execute(
             "SELECT name, sql FROM sqlite_master "
@@ -171,6 +186,19 @@ class SessionSchemaMixin:
                         "CJK FTS UPDATE trigger missing or still broad after "
                         "UPDATE OF migration; marked stale and unavailable"
                     )
+            # v26: re-apply the session-title DDL for any session trigger this
+            # migration dropped (external-content layout only — legacy layout
+            # never selects the session triggers above).
+            if "sessions_fts_update" in to_drop:
+                self._ensure_fts_schema(
+                    cursor, "sessions_fts", SESSIONS_FTS_SQL
+                )
+            if "sessions_fts_cjk_update" in to_drop and getattr(
+                self, "_fts_cjk_loaded", False
+            ):
+                self._ensure_fts_schema(
+                    cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL
+                )
 
         logger.info(
             "Migrated %d broad FTS UPDATE trigger(s) to AFTER UPDATE OF "
@@ -364,6 +392,14 @@ class SessionSchemaMixin:
 
             for col_name, col_type in declared_cols.items():
                 if col_name not in live_cols:
+                    if col_name == "row_id":
+                        # ``row_id`` is the named INTEGER PRIMARY KEY rowid
+                        # alias (issue #12). SQLite cannot ALTER ADD a
+                        # PRIMARY KEY / rowid-alias column — adding it is a
+                        # table rebuild handled by
+                        # ``_maybe_rebuild_sessions_row_id`` (v26), which runs
+                        # before this reconciler. Never attempt ALTER here.
+                        continue
                     safe_name = col_name.replace('"', '""')
                     try:
                         cursor.execute(
@@ -377,6 +413,83 @@ class SessionSchemaMixin:
                         logger.debug(
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
+
+    def _maybe_rebuild_sessions_row_id(self, cursor: sqlite3.Cursor) -> None:
+        """v26: give ``sessions`` a named ``row_id`` INTEGER PRIMARY KEY alias.
+
+        Session-title FTS is migrating to external-content backed by the
+        canonical ``sessions`` table (issue #12), which needs a stable integer
+        document identity. SQLite cannot ALTER a PRIMARY KEY, so this rebuilds
+        the table with ``row_id INTEGER PRIMARY KEY AUTOINCREMENT`` while
+        keeping the text ``id`` as ``NOT NULL UNIQUE`` — the public/logical
+        session identity every SessionDB API, relationship, and
+        ``messages.session_id`` reference continues to use.
+
+        Idempotent: no-op when ``row_id`` already exists (fresh installs and
+        already-migrated DBs). Runs BEFORE ``_reconcile_columns`` (which must
+        not ALTER-ADD a PK column) and before any DML starts a transaction
+        (``PRAGMA foreign_keys`` can only toggle outside a transaction, and the
+        DROP TABLE swap requires FKs off).
+
+        Rows are copied in rowid order so the new AUTOINCREMENT ``row_id``
+        values equal the old hidden rowids — the pre-v26 internal-content
+        session-title indexes (which key on the old hidden rowid) stay
+        coherent through the rebuild, and all logical ``id`` values and
+        ``messages.session_id -> sessions.id`` relationships are preserved.
+        """
+        if getattr(self, "read_only", False):
+            return
+        try:
+            rows = cursor.execute('PRAGMA table_info("sessions")').fetchall()
+        except sqlite3.OperationalError:
+            return
+        names = {
+            (r[1] if isinstance(r, (tuple, list)) else r["name"]) for r in rows
+        }
+        if "row_id" in names:
+            return
+        logger.warning(
+            "Migrating sessions table to named row_id (v26, issue #12); "
+            "rebuilding in place (preserves every logical session id)"
+        )
+        try:
+            # Drop any partial table from an interrupted earlier attempt.
+            cursor.execute("DROP TABLE IF EXISTS sessions_new")
+            cursor.execute("PRAGMA foreign_keys=OFF")
+            cursor.executescript(SESSION_TABLE_REBUILD_SQL)
+            new_cols = {
+                (r[1] if isinstance(r, (tuple, list)) else r["name"])
+                for r in cursor.execute(
+                    'PRAGMA table_info("sessions_new")'
+                ).fetchall()
+            }
+            # Copy only columns the new table actually declares (guards against
+            # drift if an old table ever carries a stray extra column).
+            shared = (names & new_cols) - {"row_id"}
+            cols_sql = ", ".join(f'"{c}"' for c in sorted(shared))
+            # Copy in rowid order: AUTOINCREMENT then assigns 1..N, equal to
+            # the old hidden rowids, so any legacy internal-content
+            # sessions_fts* indexes stay coherent.
+            cursor.execute(
+                f"INSERT INTO sessions_new ({cols_sql}) "
+                f"SELECT {cols_sql} FROM sessions ORDER BY rowid"
+            )
+            # DROP TABLE sessions removes the old table + its triggers and
+            # indexes (the sessions_fts* triggers are re-ensured later).
+            cursor.execute("DROP TABLE sessions")
+            cursor.execute("ALTER TABLE sessions_new RENAME TO sessions")
+            # Recreate the sessions indexes that DROP TABLE removed. SCHEMA_SQL
+            # is all IF NOT EXISTS and recreates them against the new table;
+            # every other table/messages index no-ops.
+            cursor.executescript(SCHEMA_SQL)
+        except sqlite3.OperationalError:
+            logger.exception(
+                "v26 sessions row_id migration failed; sessions table "
+                "left unchanged"
+            )
+            raise
+        finally:
+            cursor.execute("PRAGMA foreign_keys=ON")
 
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``gateway_routing`` when its PRIMARY KEY predates scoping.
@@ -587,6 +700,12 @@ class SessionSchemaMixin:
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
+
+        # v26 (issue #12): named sessions.row_id. Must run before
+        # _reconcile_columns (which cannot ALTER-ADD a PK column) and before
+        # any DML begins a transaction (PRAGMA foreign_keys must toggle outside
+        # one). No-op on fresh/migrated DBs.
+        self._maybe_rebuild_sessions_row_id(cursor)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -913,6 +1032,18 @@ class SessionSchemaMixin:
                 ).fetchone() is None
                 and not self._has_fts_trash(cursor)
                 and not self._fts_external_index_empty_with_messages(cursor)
+                # v26 (issue #12): "fully optimized" means the session-title
+                # FTS is external-content AND settled. A v1 DB whose message
+                # FTS is already v23 but whose session-title FTS is still
+                # internal-content (or mid-backfill) must not be stamped at the
+                # current layout version — it has work pending for
+                # `hermes sessions optimize-storage`.
+                and not self._db_has_legacy_session_inline_fts(cursor)
+                and cursor.execute(
+                    "SELECT 1 FROM state_meta WHERE key IN "
+                    "('fts_session_rebuild_high_water', "
+                    "'fts_session_cjk_rebuild_high_water') LIMIT 1"
+                ).fetchone() is None
             ):
                 self.set_meta(
                     "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
@@ -1025,25 +1156,58 @@ class SessionSchemaMixin:
                     self._ensure_fts_cjk_schema(cursor)
 
                 # ── Sessions FTS5 (title search) ────────────────────────
-                # unicode61 table for non-CJK titles; cjk_unicode61 table
-                # for CJK titles, gated on the loadable tokenizer (LIKE
-                # fallback otherwise). Mirrors the messages FTS pattern.
-                sessions_fts_ok = self._ensure_fts_schema(
-                    cursor, "sessions_fts", SESSIONS_FTS_SQL,
-                )
-                sessions_cjk_ok = False
-                if sessions_fts_ok and self._fts_cjk_loaded:
-                    sessions_cjk_ok = self._ensure_fts_schema(
-                        cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL,
+                # v26: two layouts. A pre-v26 install keeps its
+                # internal-content sessions_fts* (inline, broad triggers)
+                # until `hermes sessions optimize-storage` converts them to
+                # the external-content layout backed by sessions.row_id.
+                # Fresh installs / migrated DBs get the external DDL. No
+                # startup backfill on either path: an existing internal index
+                # already holds its rows, and a fresh external index on a
+                # populated DB is backfilled by the resumable chunk engine
+                # through the dedicated marker pair (triggers stay gated until
+                # then).
+                if self._db_has_legacy_session_inline_fts(cursor):
+                    sessions_fts_ok = self._ensure_fts_schema(
+                        cursor, "sessions_fts", SESSIONS_FTS_LEGACY_SQL,
                     )
-                self._sessions_fts_available = sessions_fts_ok
-                self._sessions_cjk_available = sessions_cjk_ok
-                if sessions_fts_ok:
-                    # One-time backfill of pre-existing session titles.
-                    self._backfill_sessions_fts(
-                        cursor,
-                        include_cjk=sessions_cjk_ok,
+                    sessions_cjk_ok = False
+                    if sessions_fts_ok and self._fts_cjk_loaded:
+                        sessions_cjk_ok = self._ensure_fts_schema(
+                            cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_LEGACY_SQL,
+                        )
+                    elif sessions_fts_ok:
+                        # Tokenizer-less process against a DB that carries a
+                        # legacy sessions_fts_cjk with live triggers (built on
+                        # a capable host): drop them so session writes don't
+                        # die inside the cjk trigger (same self-heal as the
+                        # external path).
+                        self._self_heal_session_cjk_without_tokenizer(cursor)
+                    self._sessions_fts_available = sessions_fts_ok
+                    self._sessions_cjk_available = sessions_cjk_ok
+                else:
+                    sessions_fts_ok = self._ensure_fts_schema(
+                        cursor, "sessions_fts", SESSIONS_FTS_SQL,
                     )
+                    self._sessions_fts_available = sessions_fts_ok
+                    # CJK session-title index: external shape, self-healing.
+                    # A tokenizer-less process must not leave live cjk
+                    # triggers behind (session writes would die inside them);
+                    # a tokenizer-capable host rebuilds a stale index on the
+                    # next `optimize-storage`.
+                    if sessions_fts_ok:
+                        self._ensure_session_fts_cjk_schema(cursor)
+                    else:
+                        self._sessions_cjk_available = False
+                    # Seed the resumable rebuild markers on a populated DB so
+                    # the external index is backfilled by the shared chunk
+                    # engine and never served incomplete. Empty DBs are
+                    # complete by construction (triggers cover every future
+                    # row) and skip the markers.
+                    if sessions_fts_ok:
+                        self._seed_session_fts_markers(
+                            cursor,
+                            include_cjk=self._sessions_cjk_available,
+                        )
 
             # Replace any pre-existing broad AFTER UPDATE triggers with
             # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
@@ -1051,6 +1215,180 @@ class SessionSchemaMixin:
                 self._migrate_broad_fts_update_triggers(cursor)
 
         self._conn.commit()
+
+    def _self_heal_session_cjk_without_tokenizer(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Drop live sessions_fts_cjk triggers when the tokenizer is absent.
+
+        A process that cannot load ``cjk_unicode61`` must not leave live
+        session cjk triggers behind — every ``INSERT`` into ``sessions`` would
+        die inside the trigger. Drops them and leaves the
+        ``fts_session_cjk_stale`` breadcrumb so a capable host rebuilds the
+        index from scratch via ``optimize-storage``. Mirrors the message-side
+        self-heal. Works for both the legacy and external session CJK shapes.
+        """
+        cjk_present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'sessions_fts_cjk'"
+        ).fetchone())
+        if not cjk_present:
+            return
+        live = [
+            r[0] for r in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                f"AND name IN ({','.join('?' for _ in _SESSION_FTS_CJK_TRIGGERS)})",
+                _SESSION_FTS_CJK_TRIGGERS,
+            ).fetchall()
+        ]
+        if not live:
+            return
+        logger.warning(
+            "sessions_fts_cjk triggers present but the cjk_unicode61 "
+            "tokenizer is unavailable — dropping the session cjk triggers so "
+            "session writes keep working. CJK title search falls back to "
+            "LIKE; run `hermes sessions optimize-storage` on a host with the "
+            "extension to rebuild."
+        )
+        cursor.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+            (SESSION_FTS_CJK_STALE_KEY,),
+        )
+        for trig in live:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+
+    def _ensure_session_fts_cjk_schema(self, cursor: sqlite3.Cursor) -> None:
+        """Create / repair / self-heal the session-title CJK index surface.
+
+        Mirrors ``_ensure_fts_cjk_schema`` (the message-side CJK index):
+
+          tokenizer NOT loaded, table present with live triggers → drop the
+              session cjk triggers so sessions INSERTs don't fail at trigger
+              time, and leave the ``fts_session_cjk_stale`` breadcrumb. The
+              table stays for a later capable open to rebuild.
+          tokenizer loaded, table absent → create the external table. A
+              populated DB gets its session cjk markers from
+              ``_seed_session_fts_markers`` (called by the caller); the index
+              is not served until the backfill completes.
+          tokenizer loaded, table present, stale breadcrumb → do NOT reinstall
+              triggers (the gap's extent is unknown; an external-content
+              'delete' for an unindexed rowid corrupts the index). The next
+              `optimize-storage` rebuilds from scratch.
+          tokenizer loaded, table present, healthy → ensure triggers and serve
+              when no backfill is pending.
+
+        Never raises; every failure mode degrades to "no session cjk index"
+        (CJK title search falls back to LIKE/Unicode paths).
+        """
+        cjk_present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'sessions_fts_cjk'"
+        ).fetchone())
+
+        if not self._fts_cjk_loaded:
+            self._self_heal_session_cjk_without_tokenizer(cursor)
+            self._sessions_cjk_available = False
+            return
+
+        try:
+            # SESSIONS_FTS_CJK_SQL installs both the external virtual table
+            # and its marker-gated triggers (IF NOT EXISTS), so a healthy
+            # table gets its triggers repaired on every open.
+            cursor.executescript(SESSIONS_FTS_CJK_SQL)
+            stale = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (SESSION_FTS_CJK_STALE_KEY,),
+            ).fetchone()
+            if stale:
+                # A tokenizer-less process dropped the triggers at some
+                # unknown point — the index has a gap of unknown extent. Do
+                # NOT leave the just-recreated triggers live (the external
+                # DDL above re-added them); drop them again so writes stay
+                # safe, and leave the index unserved until `optimize-storage`
+                # rebuilds from scratch on a capable host.
+                for trig in _SESSION_FTS_CJK_TRIGGERS:
+                    cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                self._sessions_cjk_available = False
+                return
+            if not cjk_present:
+                # Freshly created. An empty DB's index is complete by
+                # construction (triggers cover every future row); a populated
+                # DB gets the dedicated marker pair so the id-gated triggers
+                # keep NEW sessions indexed while old rows await the
+                # `optimize-storage` backfill.
+                n = cursor.execute(
+                    "SELECT COUNT(*) FROM sessions"
+                ).fetchone()[0]
+                if n > 0:
+                    hw = cursor.execute(
+                        "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+                    ).fetchone()[0]
+                    for k, v in (
+                        ("fts_session_cjk_rebuild_high_water", str(hw)),
+                        ("fts_session_cjk_rebuild_progress", "0"),
+                    ):
+                        cursor.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (k, v),
+                        )
+            backfill_pending = cursor.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_session_cjk_rebuild_high_water' LIMIT 1"
+            ).fetchone()
+            self._sessions_cjk_available = not backfill_pending
+        except sqlite3.OperationalError:
+            logger.warning(
+                "sessions_fts_cjk ensure failed; CJK title search stays on "
+                "LIKE/Unicode", exc_info=True,
+            )
+            self._sessions_cjk_available = False
+
+    def _seed_session_fts_markers(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        include_cjk: bool,
+    ) -> None:
+        """Seed the session-title rebuild marker pairs on a populated DB.
+
+        External-content session-title FTS created on a DB that already has
+        sessions is not complete by construction: the empty index covers no
+        historical rows, so the trigger WHEN-gate would silently drop them.
+        Write ``fts_session_rebuild_high_water`` / ``fts_session_rebuild_progress``
+        (and the ``fts_session_cjk_*`` pair when the tokenizer is available) so
+        the shared resumable chunk engine (``fts_session_rebuild_step`` /
+        ``fts_session_cjk_rebuild_step`` in hermes_state_search) backfills the
+        historical rows before the index is served. Empty DBs skip this — the
+        index is complete by construction and the markers would only gate the
+        triggers during an unnecessary backfill.
+        """
+        n = cursor.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        if n == 0:
+            return
+        hw = cursor.execute(
+            "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+        ).fetchone()[0]
+        for k, v in (
+            ("fts_session_rebuild_high_water", str(hw)),
+            ("fts_session_rebuild_progress", "0"),
+        ):
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (k, v),
+            )
+        if include_cjk:
+            for k, v in (
+                ("fts_session_cjk_rebuild_high_water", str(hw)),
+                ("fts_session_cjk_rebuild_progress", "0"),
+            ):
+                cursor.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (k, v),
+                )
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

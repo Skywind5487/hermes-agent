@@ -24,7 +24,12 @@ from hermes_state_common import (
     FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
+    SESSION_FTS_CJK_STALE_KEY,
+    SESSIONS_FTS_CJK_SQL,
+    SESSIONS_FTS_SQL,
     _FTS_CJK_TRIGGERS,
+    _SESSION_FTS_CJK_TRIGGERS,
+    _SESSION_FTS_TRIGGERS,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -396,6 +401,249 @@ class SessionSearchMixin:
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
 
+    # ── Session-title FTS rebuild engine (v26 external-content) ──
+    #
+    # Mirrors the message deferred-rebuild engine — same chunk constants BY
+    # NAME (``_FTS_REBUILD_CHUNK_ROWS`` / ``_FTS_REBUILD_DUTY_FACTOR`` /
+    # ``_FTS_REBUILD_MIN_PAUSE``), no duplicated numeric values — but on the
+    # session marker pairs:
+    #   fts_session_rebuild_high_water / fts_session_rebuild_progress
+    #   fts_session_cjk_rebuild_high_water / fts_session_cjk_rebuild_progress
+    # Each chunk claims ``(P, min(P + chunk, H)]`` by row_id range (so gaps
+    # from deleted rows don't shrink chunks) and publishes progress in the
+    # SAME write transaction as the rows it covers (crash-atomic). New
+    # sessions (``row_id > H``) are indexed live by the triggers; title
+    # search supplements the bounded ``(P, H]`` gap (see
+    # ``_session_fts_rebuild_gap`` in hermes_state). The CJK index has its
+    # own pair because tokenizer availability is optional and can require a
+    # later, independent rebuild — matching the message-CJK lifecycle.
+
+    def fts_session_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Session-title index backfill progress, or None when none pending."""
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
+                ("fts_session_rebuild_high_water", "fts_session_rebuild_progress"),
+            ).fetchall()
+        meta = {r["key"]: r["value"] for r in row}
+        high_water = meta.get("fts_session_rebuild_high_water")
+        if high_water is None:
+            return None
+        progress = int(meta.get("fts_session_rebuild_progress") or 0)
+        total = int(high_water)
+        if total <= 0:
+            return None
+        pct = min(100, int(100 * progress / total))
+        return {"pending": True, "total": total, "indexed": progress, "percent": pct}
+
+    def fts_session_rebuild_step(self) -> bool:
+        """Backfill one chunk of the session-title index. True while work remains."""
+        if not getattr(self, "_sessions_fts_available", False):
+            return False
+        high_water_raw = self.get_meta("fts_session_rebuild_high_water")
+        if high_water_raw is None:
+            return False
+        high_water = int(high_water_raw)
+        chunk = self._FTS_REBUILD_CHUNK_ROWS
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_progress'"
+            ).fetchone()
+            if row is None:
+                return False  # finished (or cleared) by another process
+            progress = int(row[0])
+            if progress >= high_water:
+                return False
+            upper = min(progress + chunk, high_water)
+            conn.execute(
+                "INSERT INTO sessions_fts(rowid, title) "
+                "SELECT row_id, title FROM sessions "
+                "WHERE row_id > ? AND row_id <= ? AND title IS NOT NULL",
+                (progress, upper),
+            )
+            conn.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = 'fts_session_rebuild_progress'",
+                (str(upper),),
+            )
+            return upper < high_water
+
+        try:
+            more = self._execute_write(_do)
+        except sqlite3.OperationalError as exc:
+            logger.debug("Session FTS rebuild chunk failed (will retry): %s", exc)
+            return True
+        if more is False:
+            status = self.fts_session_rebuild_status()
+            if status is not None and status["indexed"] >= status["total"]:
+                self._fts_session_rebuild_finish()
+            return False
+        return bool(more)
+
+    def _fts_session_rebuild_finish(self) -> None:
+        """Boundary sweep + clear the session markers; index becomes complete."""
+        def _do(conn):
+            hw_row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water'"
+            ).fetchone()
+            if hw_row is not None:
+                hw = int(hw_row[0])
+                lo, hi = hw - 1000, hw + 1000
+                # docsize is the authoritative "is this rowid indexed" surface;
+                # its key column is always named ``id`` and holds the
+                # content_rowid value (sessions.row_id).
+                conn.execute(
+                    "INSERT INTO sessions_fts(rowid, title) "
+                    "SELECT s.row_id, s.title FROM sessions s "
+                    "WHERE s.row_id > ? AND s.row_id <= ? AND s.title IS NOT NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM sessions_fts_docsize d "
+                    "                WHERE d.id = s.row_id)",
+                    (lo, hi),
+                )
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_session_rebuild_high_water', 'fts_session_rebuild_progress')"
+            )
+        self._execute_write(_do)
+        self._sessions_fts_available = True
+        logger.info("Session-title FTS backfill complete — serving title search.")
+
+    def fts_session_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Session-title CJK index backfill progress, or None when none pending."""
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
+                ("fts_session_cjk_rebuild_high_water", "fts_session_cjk_rebuild_progress"),
+            ).fetchall()
+        meta = {r["key"]: r["value"] for r in row}
+        high_water = meta.get("fts_session_cjk_rebuild_high_water")
+        if high_water is None:
+            return None
+        progress = int(meta.get("fts_session_cjk_rebuild_progress") or 0)
+        total = int(high_water)
+        if total <= 0:
+            return None
+        pct = min(100, int(100 * progress / total))
+        return {"pending": True, "total": total, "indexed": progress, "percent": pct}
+
+    def fts_session_cjk_rebuild_step(self) -> bool:
+        """Backfill one chunk of the session-title CJK index. True while work remains."""
+        if not getattr(self, "_sessions_cjk_available", False):
+            return False
+        high_water_raw = self.get_meta("fts_session_cjk_rebuild_high_water")
+        if high_water_raw is None:
+            return False
+        high_water = int(high_water_raw)
+        chunk = self._FTS_REBUILD_CHUNK_ROWS
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_cjk_rebuild_progress'"
+            ).fetchone()
+            if row is None:
+                return False
+            progress = int(row[0])
+            if progress >= high_water:
+                return False
+            upper = min(progress + chunk, high_water)
+            conn.execute(
+                "INSERT INTO sessions_fts_cjk(rowid, title) "
+                "SELECT row_id, title FROM sessions "
+                "WHERE row_id > ? AND row_id <= ? AND title IS NOT NULL",
+                (progress, upper),
+            )
+            conn.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = 'fts_session_cjk_rebuild_progress'",
+                (str(upper),),
+            )
+            return upper < high_water
+
+        try:
+            more = self._execute_write(_do)
+        except sqlite3.OperationalError as exc:
+            logger.debug("Session CJK FTS rebuild chunk failed (will retry): %s", exc)
+            return True
+        if more is False:
+            status = self.fts_session_cjk_rebuild_status()
+            if status is not None and status["indexed"] >= status["total"]:
+                self._fts_session_cjk_rebuild_finish()
+            return False
+        return bool(more)
+
+    def _fts_session_cjk_rebuild_finish(self) -> None:
+        """Boundary sweep + clear the session CJK markers; index becomes servable."""
+        def _do(conn):
+            hw_row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_cjk_rebuild_high_water'"
+            ).fetchone()
+            if hw_row is not None:
+                hw = int(hw_row[0])
+                lo, hi = hw - 1000, hw + 1000
+                # docsize key column is always named ``id`` and holds the
+                # content_rowid value (sessions.row_id).
+                conn.execute(
+                    "INSERT INTO sessions_fts_cjk(rowid, title) "
+                    "SELECT s.row_id, s.title FROM sessions s "
+                    "WHERE s.row_id > ? AND s.row_id <= ? AND s.title IS NOT NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM sessions_fts_cjk_docsize d "
+                    "                WHERE d.id = s.row_id)",
+                    (lo, hi),
+                )
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_session_cjk_rebuild_high_water', 'fts_session_cjk_rebuild_progress')"
+            )
+        self._execute_write(_do)
+        self._sessions_cjk_available = True
+        logger.info("Session-title CJK FTS backfill complete — serving CJK title search.")
+
+    def _fts_session_cjk_reset_if_stale(self) -> None:
+        """Rebuild path for a stale session-title CJK index.
+
+        The gap's extent is unknown (a tokenizer-less process dropped the
+        triggers), so the only safe recovery is a from-scratch rebuild: drop
+        the table + triggers, clear the breadcrumb and the session cjk
+        markers, then recreate via ``_ensure_session_fts_cjk_schema`` (which
+        re-seeds the session cjk markers on a populated DB). Called from
+        ``optimize_fts_storage`` on a tokenizer-capable host; no-op when not
+        stale.
+        """
+        if not self._fts_cjk_loaded:
+            return
+
+        def _do(conn):
+            stale = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (SESSION_FTS_CJK_STALE_KEY,),
+            ).fetchone()
+            if not stale:
+                return False
+            for trig in _SESSION_FTS_CJK_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            conn.execute("DROP TABLE IF EXISTS sessions_fts_cjk")
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                f"('{SESSION_FTS_CJK_STALE_KEY}', "
+                "'fts_session_cjk_rebuild_high_water', "
+                "'fts_session_cjk_rebuild_progress')"
+            )
+            return True
+
+        was_stale = self._execute_write(_do)
+        if was_stale:
+            # Recreate outside the write transaction — the ensure uses
+            # executescript() and must not run inside _execute_write's BEGIN
+            # IMMEDIATE. Re-seeds the session cjk markers on a populated DB.
+            with self._lock:
+                self._ensure_session_fts_cjk_schema(self._conn)
+                self._conn.commit()
+
     def _fts_external_index_empty_with_messages(self, conn) -> bool:
         """True when the base FTS table exists but indexes nothing while
         ``messages`` has rows. Caller must hold ``self._lock``.
@@ -594,6 +842,19 @@ class SessionSearchMixin:
                 f"('fts_cjk_rebuild_high_water', '{FTS_CJK_STALE_KEY}') LIMIT 1"
             ).fetchone():
                 return True
+            # v26 session-title FTS work: a legacy internal-content
+            # sessions_fts to convert to the external layout, or a pending
+            # session-title backfill (Unicode and/or CJK), or a stale
+            # session CJK index awaiting a from-scratch rebuild.
+            if self._db_has_legacy_session_inline_fts(self._conn):
+                return True
+            if self._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key IN "
+                "('fts_session_rebuild_high_water', "
+                "'fts_session_cjk_rebuild_high_water', "
+                "'fts_session_cjk_stale') LIMIT 1"
+            ).fetchone():
+                return True
             if self._has_fts_trash(self._conn):
                 return True
             # Pre-fix crash window: empty external-content index with
@@ -669,6 +930,65 @@ class SessionSearchMixin:
             self._conn.commit()
         return hw
 
+    def _demote_legacy_session_fts_to_external(self) -> None:
+        """Convert the legacy internal-content session-title FTS to the v26
+        external-content layout (issue #12). Idempotent.
+
+        Session titles are short, so unlike the multi-GB message FTS the
+        legacy session vtables are simply DROPPED and recreated in the
+        external shape — the historical rows are repopulated by the resumable
+        chunked backfill (``fts_session_rebuild_step`` / ``fts_session_cjk_rebuild_step``)
+        from canonical ``sessions`` through the dedicated marker pairs. No-op
+        when the session tables are already external, and a no-op when
+        ``sessions.row_id`` is missing (the v26 migration should have added it
+        at open).
+        """
+        def _do(conn):
+            if not self._db_has_legacy_session_inline_fts(conn):
+                return False
+            cols = conn.execute('PRAGMA table_info("sessions")').fetchall()
+            has_row_id = any(
+                (r[1] if isinstance(r, (tuple, list)) else r["name"]) == "row_id"
+                for r in cols
+            )
+            if not has_row_id:
+                logger.warning(
+                    "sessions.row_id missing; cannot convert session-title FTS "
+                    "to the v26 external layout (run hermes update / re-open)"
+                )
+                return False
+            for trig in _SESSION_FTS_TRIGGERS + _SESSION_FTS_CJK_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            conn.execute("DROP TABLE IF EXISTS sessions_fts")
+            conn.execute("DROP TABLE IF EXISTS sessions_fts_cjk")
+            # Claim the backfill *before* the empty external tables exist: a
+            # crash between this commit and schema ensure still leaves the
+            # markers, so optimize-storage resumes instead of serving an empty
+            # index. Seeding is idempotent and reads canonical sessions.
+            self._seed_session_fts_markers(
+                conn,
+                include_cjk=bool(self._fts_cjk_loaded),
+            )
+            return True
+
+        self._execute_write(_do)
+
+        # Create the external schema outside the write transaction
+        # (executescript commits). CJK only when the tokenizer is loadable;
+        # otherwise title search degrades to LIKE exactly as before.
+        with self._lock:
+            self._ensure_fts_schema(self._conn, "sessions_fts", SESSIONS_FTS_SQL)
+            self._sessions_fts_available = True
+            if self._fts_cjk_loaded:
+                cjk_ok = self._ensure_fts_schema(
+                    self._conn, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL
+                )
+                self._sessions_cjk_available = bool(cjk_ok)
+            self._conn.commit()
+        logger.info(
+            "Converted session-title FTS to the v26 external-content layout."
+        )
+
     def optimize_fts_storage(
         self,
         *,
@@ -730,6 +1050,9 @@ class SessionSearchMixin:
         # can only be recovered from scratch — reset it now so the cjk
         # backfill phase below rebuilds it. No-op without the tokenizer.
         self._fts_cjk_reset_if_stale()
+        # Same for the session-title CJK index (issue #12): a tokenizer-less
+        # open may have dropped its triggers; rebuild from scratch here.
+        self._fts_session_cjk_reset_if_stale()
         # An optimized v23 DB gaining the cjk index for the first time (no
         # legacy work left, tokenizer newly installed): ensure the table +
         # markers exist so the backfill phase has work to claim.
@@ -738,12 +1061,21 @@ class SessionSearchMixin:
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
 
+        # v26 (issue #12): convert a legacy internal-content session-title
+        # FTS to the external layout backed by sessions.row_id. No-op when
+        # already external or when sessions.row_id is missing.
+        self._demote_legacy_session_fts_to_external()
+
         def _emit(phase: str) -> None:
             if progress_cb is None:
                 return
             st = self.fts_rebuild_status()
             if st is None:
                 st = self.fts_cjk_rebuild_status()
+            if st is None:
+                st = self.fts_session_rebuild_status()
+            if st is None:
+                st = self.fts_session_cjk_rebuild_status()
             progress_cb({
                 "phase": phase,
                 "percent": st["percent"] if st else 100,
@@ -785,6 +1117,23 @@ class SessionSearchMixin:
             _emit("backfill")
             _pause(time.monotonic() - _t0)
 
+        # Phase 1c: backfill the session-title indexes (v26). A no-op when
+        # the session tables are still the legacy internal-content shape (only
+        # the v26 demote above converts them) or nothing is pending. Runs the
+        # SAME shared chunk constants / pause helper as the message phases.
+        while True:
+            _t0 = time.monotonic()
+            if not self.fts_session_rebuild_step():
+                break
+            _emit("backfill")
+            _pause(time.monotonic() - _t0)
+        while True:
+            _t0 = time.monotonic()
+            if not self.fts_session_cjk_rebuild_step():
+                break
+            _emit("backfill")
+            _pause(time.monotonic() - _t0)
+
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
         _emit("teardown")
         while True:
@@ -797,23 +1146,31 @@ class SessionSearchMixin:
         # Refuse to stamp "optimized" while work remains or the base index is
         # still empty against a non-empty messages table. Pre-fix code could
         # tear down trash and settle after a no-op backfill when markers were
-        # missing — permanent search-index loss for historical rows.
+        # missing — permanent search-index loss for historical rows. The
+        # session-title markers are included so a DB is never stamped fully
+        # optimized while session FTS is still backfilling (issue #12).
         with self._lock:
             still_pending = self._conn.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
             ).fetchone() is not None
+            session_pending = self._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key IN "
+                "('fts_session_rebuild_high_water', "
+                "'fts_session_cjk_rebuild_high_water') LIMIT 1"
+            ).fetchone() is not None
             still_trash = self._has_fts_trash(self._conn)
             empty_index = self._fts_external_index_empty_with_messages(self._conn)
-        if still_pending or still_trash or empty_index:
+        if still_pending or session_pending or still_trash or empty_index:
             reason = (
-                "backfill_incomplete" if still_pending or empty_index
+                "backfill_incomplete"
+                if still_pending or session_pending or empty_index
                 else "teardown_incomplete"
             )
             logger.warning(
                 "FTS storage optimization did not settle (%s): "
-                "pending=%s trash=%s empty_index=%s",
-                reason, still_pending, still_trash, empty_index,
+                "pending=%s session_pending=%s trash=%s empty_index=%s",
+                reason, still_pending, session_pending, still_trash, empty_index,
             )
             return {"ok": False, "reason": reason, "vacuumed": None}
 
@@ -859,6 +1216,12 @@ class SessionSearchMixin:
             if conn.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+            ).fetchone() is not None:
+                return "backfill_incomplete"
+            if conn.execute(
+                "SELECT 1 FROM state_meta WHERE key IN "
+                "('fts_session_rebuild_high_water', "
+                "'fts_session_cjk_rebuild_high_water') LIMIT 1"
             ).fetchone() is not None:
                 return "backfill_incomplete"
             if self._has_fts_trash(conn):

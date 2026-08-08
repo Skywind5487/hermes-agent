@@ -1184,7 +1184,13 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # Catch the full sqlite3 exception hierarchy (not just
         # OperationalError) so the malformed-shadow-table class is reported
         # rather than letting it crash the caller.
-        for fts_table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
+        for fts_table in (
+            "messages_fts",
+            "messages_fts_trigram",
+            "messages_fts_cjk",
+            "sessions_fts",
+            "sessions_fts_cjk",
+        ):
             try:
                 # No-op queries against the actual FTS5 APIs the search
                 # tools use. The trigram table is included because it backs
@@ -2326,6 +2332,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # means a legacy shape that doesn't index tool metadata → optimize.
         return "tool_name" not in sql
 
+    @staticmethod
+    def _db_has_legacy_session_inline_fts(cursor: sqlite3.Cursor) -> bool:
+        """True when sessions_fts is the pre-v26 internal-content shape.
+
+        v26's sessions_fts is external-content over the canonical ``sessions``
+        table (``content='sessions'``, ``content_rowid='row_id'``). Every
+        pre-v26 shape lacks that content declaration and stores title inline.
+        We detect "needs optimize" as "the stored CREATE lacks the
+        external-content content clause", the precise v26 marker.
+
+        Returns False when sessions_fts doesn't exist yet (fresh DB mid-init):
+        the post-migration FTS setup block creates it in the v26 shape.
+        """
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sessions_fts'"
+        ).fetchone()
+        if row is None:
+            return False
+        sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+        return "content='sessions'" not in sql
+
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
         if getattr(self, "_trigram_unavailable_warned", False):
@@ -2353,52 +2381,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self.db_path,
             exc,
         )
-
-    @staticmethod
-    def _backfill_sessions_fts(
-        cursor,
-        *,
-        include_cjk: bool = True,
-    ) -> None:
-        """Backfill existing session titles into the sessions FTS5 tables.
-
-        ``cursor`` may be a Cursor or a Connection (both expose ``execute``).
-        The cjk table backfill runs in progressive batches with a short
-        breather so the gateway writer is not starved.
-        """
-        conn = getattr(cursor, "connection", cursor)
-
-        # Main sessions_fts backfill (unicode61 — one shot).
-        cursor.execute(
-            "INSERT OR IGNORE INTO sessions_fts(rowid, title) "
-            "SELECT _rowid_, COALESCE(title, '') FROM sessions WHERE title IS NOT NULL"
-        )
-        conn.commit()
-
-        # CJK sessions_fts_cjk backfill (cjk_unicode61) — progressive batches.
-        if include_cjk:
-            cursor.execute(
-                "SELECT _rowid_ FROM sessions WHERE title IS NOT NULL "
-                "AND _rowid_ NOT IN (SELECT rowid FROM sessions_fts_cjk)"
-            )
-            missing = [row[0] for row in cursor.fetchall()]
-            if missing:
-                batch_sizes = [500, 200, 100, 50]
-                remaining = list(missing)
-                while remaining:
-                    bs = batch_sizes.pop(0) if batch_sizes else 50
-                    batch = remaining[:bs]
-                    remaining = remaining[bs:]
-                    placeholders = ",".join("?" for _ in batch)
-                    cursor.execute(
-                        f"INSERT OR IGNORE INTO sessions_fts_cjk(rowid, title) "
-                        f"SELECT _rowid_, COALESCE(title, '') FROM sessions "
-                        f"WHERE _rowid_ IN ({placeholders})",
-                        batch,
-                    )
-                    conn.commit()
-                    if remaining:
-                        time.sleep(0.05)  # 50ms breather for gateway writer
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
@@ -5541,8 +5523,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (f"{escaped} #%",),
             ))
 
+    def _session_fts_rebuild_gap(self) -> Optional[Tuple[int, int]]:
+        """Bounded unindexed session-title gap ``(progress, high_water]``.
+
+        During a v26 session-title backfill, rows whose ``row_id`` falls in
+        ``(P, H]`` are not yet in the external-content index. Title search must
+        supplement them (LIKE over the gap) and merge with the FTS candidates
+        so no valid session is hidden while the rebuild is pending. Returns
+        ``(progress, high_water)`` or ``None`` when no session rebuild is
+        pending (normal operation).
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water'"
+            ).fetchone()
+            if row is None:
+                return None
+            high_water = int(row[0])
+            p = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_progress'"
+            ).fetchone()
+            progress = int(p[0]) if p is not None else 0
+        if progress >= high_water:
+            return None
+        return progress, high_water
+
     def _fts_numbered_variants(self, title: str) -> Optional[List[sqlite3.Row]]:
         """Find numbered continuation variants via FTS5 MATCH with CJK dispatch.
+
+        During a v26 session-title rebuild the bounded ``(P, H]`` gap is
+        supplemented with a LIKE scan and merged with the FTS candidates, so
+        title resolution never returns incomplete results mid-backfill.
 
         Returns None to signal fallback to LIKE (e.g. FTS5 runtime error or
         the target table unavailable). Returns empty list when no matches.
@@ -5556,12 +5569,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not sanitized:
             return None
 
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
         with self._lock:
             try:
                 cursor = self._conn.execute(
                     f"SELECT s.id AS id, s.title, s.started_at "
                     f"FROM {fts_table} f "
-                    f"JOIN sessions s ON s._rowid_ = f.rowid "
+                    f"JOIN sessions s ON s.row_id = f.rowid "
                     f"WHERE {fts_table} MATCH ? "
                     f"ORDER BY s.started_at DESC",
                     (sanitized,),
@@ -5575,11 +5590,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return None
 
         # Post-filter: only keep sessions whose title starts with "{title} #N"
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        return [
+        filtered = [
             c for c in candidates
             if c["title"] and c["title"].startswith(f"{escaped} #")
         ]
+
+        # Bounded-gap supplement: rows in (P, H] are not in the index yet.
+        gap = self._session_fts_rebuild_gap()
+        if gap is not None:
+            progress, high_water = gap
+            with self._read_ctx() as conn:
+                gap_rows = conn.execute(
+                    "SELECT id, title, started_at FROM sessions "
+                    "WHERE title LIKE ? ESCAPE '\\' "
+                    "AND row_id > ? AND row_id <= ? "
+                    "ORDER BY started_at DESC",
+                    (f"{escaped} #%", progress, high_water),
+                ).fetchall()
+            gap_filtered = [
+                c for c in gap_rows
+                if c["title"] and c["title"].startswith(f"{escaped} #")
+            ]
+            by_id = {c["id"]: c for c in filtered}
+            for c in gap_filtered:
+                by_id.setdefault(c["id"], c)
+            # Re-sort the merged candidates so the latest continuation is
+            # first even when the gap rows joined after the FTS hits.
+            filtered = sorted(
+                by_id.values(), key=lambda c: c["started_at"], reverse=True
+            )
+
+        return filtered
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").
@@ -5677,13 +5718,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return current
 
     # Columns excluded from compact_rows projections: only the payload-heavy
-    # blob no list consumer renders. Everything else — including gateway
-    # routing fields and desktop sidebar fields like git_branch — stays, and
-    # the projection is derived from SCHEMA_SQL so columns added later via
-    # declarative reconciliation are included automatically instead of
-    # silently dropping out of list rows.
+    # blob no list consumer renders, plus the internal integer rowid alias
+    # (row_id is a storage/FTS implementation detail — callers must keep
+    # treating sessions.id as the session identity, issue #12). Everything
+    # else — including gateway routing fields and desktop sidebar fields like
+    # git_branch — stays, and the projection is derived from SCHEMA_SQL so
+    # columns added later via declarative reconciliation are included
+    # automatically instead of silently dropping out of list rows.
     _SESSION_COMPACT_EXCLUDED = frozenset(
-        {"system_prompt", "system_prompt_hash"}
+        {"system_prompt", "system_prompt_hash", "row_id"}
     )
     _session_compact_cols_sql: Optional[str] = None
 
@@ -9116,10 +9159,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # ── Space reclamation ──
 
     # FTS5 virtual tables whose b-tree segments we merge on optimize. The
-    # trigram table is created lazily / may be disabled, and the cjk-bigram
-    # table only exists (and is only queryable) when the loadable tokenizer
-    # is present — so we probe each before touching it (see optimize_fts).
-    _FTS_TABLES = ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
+    # trigram table is created lazily / may be disabled, the cjk-bigram table
+    # only exists (and is only queryable) when the loadable tokenizer is
+    # present, and the session-title tables are optional (legacy vs v26
+    # external-content) — so we probe each before touching it (see
+    # optimize_fts). This is the ONE registry the FTS maintenance lifecycle
+    # (optimize / incremental merge / rebuild / VACUUM) consumes; adding an
+    # index here makes every maintenance path aware of it (issue #12).
+    _FTS_TABLES = (
+        "messages_fts",
+        "messages_fts_trigram",
+        "messages_fts_cjk",
+        "sessions_fts",
+        "sessions_fts_cjk",
+    )
 
     def logical_size_bytes(self) -> Optional[int]:
         """Database size in bytes as SQLite itself accounts for it.

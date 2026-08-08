@@ -2173,17 +2173,21 @@ class TestVacuum:
 
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
-        """A fresh DB has both FTS indexes; optimize merges both."""
+        """A fresh DB optimizes every present FTS index — the message indexes
+        plus the session-title indexes now that they share the one
+        ``_FTS_TABLES`` registry (issue #12)."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hello world")
         statements = []
         db._conn.set_trace_callback(statements.append)
         try:
-            assert db.optimize_fts() == 2
+            present = [t for t in db._FTS_TABLES if db._fts_table_exists(t)]
+            assert len(present) >= 3  # messages_fts + trigram + sessions_fts
+            assert db.optimize_fts() == len(present)
         finally:
             db._conn.set_trace_callback(None)
         optimize_sql = [sql for sql in statements if "'optimize'" in sql]
-        assert len(optimize_sql) == 2
+        assert len(optimize_sql) == len(present)
         assert not any("'merge'" in sql for sql in optimize_sql)
 
 

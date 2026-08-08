@@ -152,7 +152,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -163,7 +163,11 @@ SCHEMA_VERSION = 25
 # layout 0 (marker absent) with a working inline index until the user opts in.
 #   1 = v23 external-content layout (content/tool_name/tool_calls,
 #       tool-row-excluded trigram)
-FTS_STORAGE_VERSION = 1
+#   2 = v26 layout — adds the session-title indexes (sessions_fts /
+#       sessions_fts_cjk) as external-content over the canonical sessions
+#       table (via the named ``sessions.row_id``), with the same resumable
+#       high-water chunk rebuild and unified lifecycle as the message FTS.
+FTS_STORAGE_VERSION = 2
 
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
@@ -193,7 +197,8 @@ CREATE TABLE IF NOT EXISTS system_prompts (
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     source TEXT NOT NULL,
     user_id TEXT,
     session_key TEXT,
@@ -380,6 +385,79 @@ CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
 """
 
 
+# ── v26 sessions table rebuild (named rowid alias) ──────────────────────
+# SQLite cannot ALTER a PRIMARY KEY, so adding the named
+# ``row_id INTEGER PRIMARY KEY AUTOINCREMENT`` (the stable integer document
+# identity the session-title FTS needs) is a table rebuild. This is the
+# exact CREATE TABLE used by the v26 migration. Keep it in lockstep with
+# the ``sessions`` block in SCHEMA_SQL: same columns, same order, only the
+# key shape differs (named row_id PK + text ``id`` NOT NULL UNIQUE).
+# The migration copies rows in rowid order so the new AUTOINCREMENT row_id
+# values equal the old hidden rowids — keeping pre-v26 internal-content
+# session-title FTS coherent through the rebuild — and preserves every
+# logical ``id`` and every ``messages.session_id -> sessions.id`` / FK
+# relationship unchanged.
+SESSION_TABLE_REBUILD_SQL = """
+CREATE TABLE sessions_new (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    system_prompt_hash TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    compression_failure_cooldown_until REAL,
+    compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions_new(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+)
+"""
+
+
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──
 # While a background index rebuild is pending, two state_meta keys define
 # which message rows are currently IN the FTS indexes:
@@ -546,8 +624,123 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 # (which would create the external-content trigram source VIEW and leave the
 # DB in a mixed, broken state). `optimize_fts_storage()` is what migrates a
 # legacy DB to the v23 shape.
-# ── Sessions FTS5 — title search ────────────────────────────────────────
+# ── Sessions FTS5 — title search (v26 external-content) ─────────────────
+#
+# Same architecture as the v23 message FTS: title text is canonical ONLY in
+# ``sessions`` (read through the named ``row_id``), never duplicated in FTS
+# content shadow storage. A dedicated marker pair
+# (``fts_session_rebuild_high_water`` / ``fts_session_rebuild_progress``)
+# drives the resumable chunked backfill (see fts_session_rebuild_step in
+# hermes_state_search.py) and gates every trigger below on the same
+# indexed-row invariant as the message indexes: a row is safe to mutate in
+# FTS only when ``row_id <= progress`` (already backfilled) or ``row_id >
+# high_water`` (inserted after capture — AUTOINCREMENT guarantees new rows
+# are always > H). The UPDATE trigger fires only on title changes
+# (AFTER UPDATE OF title plus a value-change guard) so
+# token/accounting/heartbeat metadata writes never rewrite the title index.
 SESSIONS_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    title,
+    content='sessions',
+    content_rowid='row_id',
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.row_id, new.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title)
+    VALUES ('delete', old.row_id, old.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_update
+AFTER UPDATE OF title ON sessions
+WHEN old.title IS NOT new.title
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title)
+    VALUES ('delete', old.row_id, old.title);
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.row_id, new.title);
+END;
+"""
+
+# CJK title search — cjk_unicode61 loadable tokenizer, mirroring
+# messages_fts_cjk. Requires libfts5_cjk.so (native/fts5_cjk/build.sh);
+# callers gate table creation on the extension being loaded and fall back
+# to LIKE when it is absent. Same external-content shape as the Unicode
+# index above, on its own dedicated marker pair
+# (``fts_session_cjk_rebuild_high_water`` / ``fts_session_cjk_rebuild_progress``)
+# because CJK tokenizer availability is optional and can require a later,
+# independent rebuild — matching the message-CJK lifecycle.
+SESSIONS_FTS_CJK_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_cjk USING fts5(
+    title,
+    content='sessions',
+    content_rowid='row_id',
+    tokenize='cjk_unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(rowid, title) VALUES (new.row_id, new.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(sessions_fts_cjk, rowid, title)
+    VALUES ('delete', old.row_id, old.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_update
+AFTER UPDATE OF title ON sessions
+WHEN old.title IS NOT new.title
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(sessions_fts_cjk, rowid, title)
+    VALUES ('delete', old.row_id, old.title);
+    INSERT INTO sessions_fts_cjk(rowid, title) VALUES (new.row_id, new.title);
+END;
+"""
+
+
+# ── Legacy (v25 / inline-content) session-title FTS DDL ────────────────
+# Used ONLY to keep an existing pre-v26 install's session-title search
+# working and its triggers repairable UNTIL the user opts into
+# `hermes sessions optimize-storage` (which migrates the session-title
+# indexes to the v26 external-content layout above). Each virtual table
+# stores its own copy of ``title`` and the triggers fire on every sessions
+# UPDATE (broad shape, pre-title-only). Fresh installs never create these.
+# The v26 migration adds the named ``sessions.row_id`` first; because the
+# rebuild copies rows in rowid order, the new AUTOINCREMENT row_id values
+# equal the old hidden rowids, so these legacy internal-content indexes
+# stay coherent through the table rebuild.
+SESSIONS_FTS_LEGACY_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
     title,
     tokenize='unicode61'
@@ -567,11 +760,7 @@ CREATE TRIGGER IF NOT EXISTS sessions_fts_update AFTER UPDATE ON sessions BEGIN
 END;
 """
 
-# CJK title search — cjk_unicode61 loadable tokenizer, mirroring
-# messages_fts_cjk. Requires libfts5_cjk.so (native/fts5_cjk/build.sh);
-# callers gate table creation on the extension being loaded and fall back
-# to LIKE when it is absent.
-SESSIONS_FTS_CJK_SQL = """
+SESSIONS_FTS_CJK_LEGACY_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_cjk USING fts5(
     title,
     tokenize='cjk_unicode61'
@@ -590,6 +779,27 @@ CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_update AFTER UPDATE ON sessions BE
     INSERT INTO sessions_fts_cjk(rowid, title) VALUES (new.rowid, new.title);
 END;
 """
+
+
+_SESSION_FTS_TRIGGERS = (
+    "sessions_fts_insert",
+    "sessions_fts_delete",
+    "sessions_fts_update",
+)
+
+_SESSION_FTS_CJK_TRIGGERS = (
+    "sessions_fts_cjk_insert",
+    "sessions_fts_cjk_delete",
+    "sessions_fts_cjk_update",
+)
+
+
+# state_meta breadcrumb set when a tokenizer-less process had to drop the
+# session-title cjk triggers to keep session writes alive: rows written from
+# that moment on are missing from the session cjk index, so it must not serve
+# reads until `hermes sessions optimize-storage` rebuilds it on a capable
+# host. Mirrors the message ``fts_cjk_stale`` breadcrumb.
+SESSION_FTS_CJK_STALE_KEY = "fts_session_cjk_stale"
 
 LEGACY_FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
