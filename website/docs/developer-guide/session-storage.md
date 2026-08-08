@@ -17,6 +17,8 @@ Source file: `hermes_state.py`
 ├── messages_fts          — FTS5 virtual table (content + tool_name + tool_calls)
 ├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
 ├── messages_fts_cjk      — FTS5 virtual table with cjk_unicode61 tokenizer
+├── sessions_fts          — FTS5 virtual table over session titles (external-content)
+├── sessions_fts_cjk      — FTS5 virtual table over session titles (cjk_unicode61)
 ├── state_meta            — Key/value metadata table
 ├── gateway_routing       — Gateway routing metadata
 ├── compression_locks     — Cross-process compression locking
@@ -45,7 +47,8 @@ compression-failure fields, `profile_name`, `rewind_count`, `archived`, and
 
 ```sql
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     source TEXT NOT NULL,
     user_id TEXT,
     model TEXT,
@@ -82,6 +85,13 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
     ON sessions(title) WHERE title IS NOT NULL;
 ```
+
+`row_id` is the internal integer document identity (v26, issue #12) — the
+stable key the external-content session-title FTS uses. It is an
+implementation detail: callers keep treating `id` as the logical/public
+session identity, and every relationship (`messages.session_id`,
+`session_model_usage.session_id`, parent/child lineage) continues to key on
+the text `id`.
 
 ### Messages Table
 
@@ -138,10 +148,49 @@ and DELETE of the `messages` table. The current triggers are gated on the
 background FTS rebuild can proceed without double-indexing) and cover all three
 indexed columns — see `SCHEMA_SQL` in `hermes_state.py` for the exact SQL.
 
+### Session-title FTS (v26)
+
+Session titles are indexed the same way (fork #12): the `sessions_fts` and
+`sessions_fts_cjk` virtual tables are external-content over the canonical
+`sessions` table, keyed on the named `sessions.row_id`:
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    title,
+    content='sessions',
+    content_rowid='row_id',
+    tokenize='unicode61'
+);
+```
+
+- **External content** — title text is stored only in `sessions`; the FTS
+  index holds tokens. No duplicated title copies in shadow storage.
+- **Dedicated markers** — `fts_session_rebuild_high_water` /
+  `fts_session_rebuild_progress` (and the `fts_session_cjk_*` pair) drive a
+  resumable chunked backfill reusing the same `_FTS_REBUILD_CHUNK_ROWS` /
+  `_FTS_REBUILD_DUTY_FACTOR` / `_FTS_REBUILD_MIN_PAUSE` constants as the
+  message rebuild (no duplicated numbers).
+- **Title-only triggers** — the UPDATE trigger fires only `AFTER UPDATE OF
+  title` (plus a value-change guard), so token/accounting/heartbeat writes
+  never rewrite the title index.
+- **Bounded-gap search** — while a backfill is pending, rows in
+  `(progress, high_water]` are not yet in the index; title resolution
+  supplements them with a LIKE scan and merges the results, so no valid
+  session is hidden mid-rebuild.
+- **One lifecycle** — both session indexes are registered in `_FTS_TABLES`, so
+  `optimize`, incremental merge, explicit rebuild, VACUUM, and the health
+  probe all cover them. `hermes sessions optimize-storage` converts a legacy
+  internal-content session-title FTS to this layout and settles
+  `fts_storage_version` to 2 only when the session markers are gone.
+- **CJK self-heal** — a process that cannot load `cjk_unicode61` drops live
+  `sessions_fts_cjk` triggers and leaves the `fts_session_cjk_stale`
+  breadcrumb so session writes keep working; a capable host rebuilds the
+  index from scratch via `optimize-storage`.
+
 
 ## Schema Version and Migrations
 
-Current schema version: **23**
+Current schema version: **26**
 
 The `schema_version` table stores a single integer. Simple column additions are handled declaratively by `_reconcile_columns()` (which diffs live columns against `SCHEMA_SQL` and ADDs any missing ones). The version-gated chain is reserved for data migrations and index/FTS changes that can't be expressed declaratively:
 
@@ -163,6 +212,8 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 20 | Per-model usage attribution — seed `session_model_usage` rows from historical per-session aggregate totals |
 | 22 | Task-dimension usage attribution — rebuild `session_model_usage` so the `task` column participates in the PRIMARY KEY |
 | 23 | FTS storage redesign — external-content FTS tables replacing the v11 inline-mode copies (opt-in transition for existing DBs) |
+| 25 | De-duplicate per-session `system_prompt` snapshots into the shared content-addressed `system_prompts` table |
+| 26 | Named `sessions.row_id` + session-title FTS as external-content over `sessions` (fork #12; mirrors the v23 message-FTS architecture with its own marker pairs, chunked rebuild, and unified lifecycle) |
 
 Versions not listed above were declarative column additions handled by `_reconcile_columns()` (version bump only, no data migration).
 
