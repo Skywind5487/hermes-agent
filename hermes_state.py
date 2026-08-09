@@ -2479,7 +2479,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return "tool_name" not in sql
 
     @staticmethod
-    @staticmethod
     def _db_has_internal_content_fts(
         cursor: sqlite3.Cursor, table: str
     ) -> bool:
