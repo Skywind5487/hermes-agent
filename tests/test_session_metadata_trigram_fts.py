@@ -224,6 +224,101 @@ def _build_unknown_same_name_trigram_db(db_path):
     conn.close()
 
 
+def _rewrite_tokenizer_to_simple(conn, table):
+    """Emulate the historical same-name ``tokenize='simple'`` declaration by
+    rewriting the stored sqlite_master.sql (the #34 writable_schema repro)."""
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute(
+        "UPDATE sqlite_master "
+        "SET sql = replace(sql, \"tokenize='trigram'\", \"tokenize='simple'\") "
+        "WHERE name = ? AND type = 'table'",
+        (table,),
+    )
+    ver = conn.execute("PRAGMA schema_version").fetchone()[0]
+    conn.execute(f"PRAGMA schema_version={ver + 1}")
+    conn.execute("PRAGMA writable_schema=OFF")
+
+
+def _build_legacy_simple_wrong_shape_trigram_db(db_path):
+    """DB whose ``sessions_fts_trigram`` declares ``tokenize='simple'``
+    INTERNAL content but is NOT the historical Hermes title-only shape (it
+    carries title + display_name). A same-name simple object that is not
+    ours — must classify unknown and never be demoted/deleted."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, display_name, tokenize='trigram')"
+    )
+    _rewrite_tokenizer_to_simple(conn, "sessions_fts_trigram")
+    conn.commit()
+    conn.close()
+
+
+def _build_trigram_missing_id_db(db_path):
+    """DB whose ``sessions_fts_trigram`` declares the modern trigram +
+    ``content='sessions_fts_trigram_src'`` + ``content_rowid='row_id'`` but
+    LACKS the logical ``id`` column — a near-match modern shape (the old
+    ``'id' in sql`` check was fooled by ``content_rowid='row_id'``). Must
+    classify unknown and fail closed."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIEW sessions_fts_trigram_src AS "
+        "SELECT row_id, title, id, display_name FROM sessions"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, display_name, "
+        "content='sessions_fts_trigram_src', content_rowid='row_id', "
+        "tokenize='trigram')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_modern_root_incompatible_view_db(db_path):
+    """DB whose ``sessions_fts_trigram`` is exactly modern (title, id,
+    display_name) but whose derived source VIEW projects an incompatible
+    shape (row_id, title only) — the index would read wrong content. Must
+    classify unknown and fail closed."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIEW sessions_fts_trigram_src AS "
+        "SELECT row_id, title FROM sessions"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, id, display_name, "
+        "content='sessions_fts_trigram_src', content_rowid='row_id', "
+        "tokenize='trigram')"
+    )
+    conn.commit()
+    conn.close()
+
+
 def _seed_an94_row(db):
     """Insert the canonical #30 sample metadata row (live, > H on a fresh
     DB with no markers) so search fixtures share one shape."""
@@ -343,6 +438,67 @@ class TestSchemaClassifier:
             sql = _fts_sql(r._conn, "sessions_fts_trigram")
             assert "tokenize='unicode61'" in sql
             assert r._sessions_trigram_available is False
+        finally:
+            r.close()
+
+    def test_classifier_simple_wrong_column_shape_unknown(self, tmp_path):
+        """A same-name ``tokenize='simple'`` INTERNAL object that is NOT the
+        historical Hermes title-only shape (here title + display_name) must
+        classify unknown and be left untouched — never demoted/deleted."""
+        db_path = tmp_path / "legacy_wrong.db"
+        _build_legacy_simple_wrong_shape_trigram_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            # Not demoted: the object (and its title+display_name shape)
+            # survives untouched.
+            sql = _fts_sql(r._conn, "sessions_fts_trigram")
+            assert "tokenize='simple'" in sql
+            assert "display_name" in sql
+            # No durable trigram claim was staged for a non-ours object.
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+    def test_classifier_trigram_missing_id_column_unknown(self, tmp_path):
+        """A near-match modern root (correct trigram + content + content_rowid
+        but NO logical ``id`` column) must classify unknown — the old bare
+        ``'id' in sql`` check was fooled by ``content_rowid='row_id'``."""
+        db_path = tmp_path / "missing_id.db"
+        _build_trigram_missing_id_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            # Untouched: the object keeps its missing-id shape; no claim.
+            sql = _fts_sql(r._conn, "sessions_fts_trigram")
+            assert "tokenize='trigram'" in sql
+            assert "display_name" in sql and "title" in sql
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+    def test_classifier_modern_root_incompatible_view_unknown(self, tmp_path):
+        """A modern root whose derived source VIEW projects an incompatible
+        shape must classify unknown / fail closed — the index would read
+        wrong content."""
+        db_path = tmp_path / "bad_view.db"
+        _build_modern_root_incompatible_view_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            # Untouched: the incompatible VIEW survives as built.
+            sql = _view_sql(r._conn, "sessions_fts_trigram_src")
+            assert "row_id, title" in sql
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
         finally:
             r.close()
 

@@ -2733,24 +2733,66 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Unicode lane's P (target-specific processed completeness).
 
     @staticmethod
+    def _fts_declared_columns(cursor, name: str) -> Optional[frozenset]:
+        """Logical column set of a table / VIEW via ``PRAGMA table_info``.
+
+        PRAGMA table_info reads the column list from the parsed DDL — it does
+        NOT instantiate an FTS5 virtual table, so it works even for a table
+        whose declared tokenizer (e.g. the legacy ``simple``) is unavailable
+        on this host. Returns None when the object is absent or the probe
+        fails; callers treat None as fail-closed (not ours).
+        """
+        try:
+            rows = cursor.execute(f"PRAGMA table_info({name})").fetchall()
+        except sqlite3.OperationalError:
+            return None
+        if not rows:
+            return None
+        return frozenset(r[1] if isinstance(r, sqlite3.Row) else r[1] for r in rows)
+
+    @staticmethod
+    def _sessions_trigram_src_compatible(cursor) -> bool:
+        """True when the derived source VIEW (if present) projects exactly the
+        ``(row_id, title, id, display_name)`` shape the modern index expects.
+
+        A MISSING VIEW is treated as compatible — the crash-atomic transition
+        / reopen ensure re-creates it via ``CREATE VIEW IF NOT EXISTS``. A
+        PRESENT but mismatched VIEW is incompatible: the index would read the
+        wrong content, so the same-name object must fail closed.
+        """
+        row = cursor.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'view' AND name = 'sessions_fts_trigram_src'"
+        ).fetchone()
+        if row is None:
+            return True
+        cols = SessionDB._fts_declared_columns(cursor, "sessions_fts_trigram_src")
+        return cols == frozenset({"row_id", "title", "id", "display_name"})
+
+    @staticmethod
     def _classify_sessions_fts_trigram(cursor) -> str:
         """Classify the same-name ``sessions_fts_trigram`` object by schema
-        identity (stored ``sqlite_master.sql``), NEVER by table name alone.
+        identity (stored ``sqlite_master.sql`` + actual logical columns), NEVER
+        by table name alone.
 
         Returns one of:
 
         - ``"absent"`` — no such object (fresh install / never created).
         - ``"legacy_simple"`` — the recognized historical Hermes shape
-          (FTS5 ``tokenize='simple'``, title-only, INTERNAL content). This is
-          the fork's pre-#30 ``SESSIONS_FTS_TRIGRAM_SQL``.
+          (FTS5 ``tokenize='simple'``, INTERNAL content, and EXACTLY the
+          title-only logical column set). This is the fork's pre-#30
+          ``SESSIONS_FTS_TRIGRAM_SQL``. A same-name simple object with any
+          other column shape is NOT ours.
         - ``"modern_trigram"`` — the #30 identity: FTS5 ``tokenize='trigram'``
           + ``content='sessions_fts_trigram_src'`` +
-          ``content_rowid='row_id'`` + logical ``(title, id, display_name)``
-          shape. Runtime tokenizer capability is separate from schema
-          identity: a host without built-in trigram may still carry a modern
-          schema — unavailable there, not legacy.
-        - ``"unknown_same_name"`` — an unrecognized same-name object. Fail
-          closed / diagnostic; never blindly delete it.
+          ``content_rowid='row_id'`` + EXACTLY the logical
+          ``(title, id, display_name)`` columns + a compatible derived source
+          VIEW (when one is present). Runtime tokenizer capability is separate
+          from schema identity: a host without built-in trigram may still
+          carry a modern schema — unavailable there, not legacy.
+        - ``"unknown_same_name"`` — an unrecognized same-name object (any
+          near-match that differs in column shape or VIEW projection). Fail
+          closed / diagnostic; never blindly delete or demote it.
 
         ``cursor`` may be a Cursor or a Connection.
         """
@@ -2761,21 +2803,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if row is None:
             return "absent"
         sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
-        # Recognized historical Hermes shape: FTS5 + tokenize='simple',
-        # title-only internal content (no content=). Precise enough to not
-        # swallow an arbitrary same-name table.
+        # Recognized historical Hermes shape: FTS5 tokenize='simple' + INTERNAL
+        # content + EXACTLY the title-only logical column set. The column set
+        # is verified via PRAGMA table_info (reads the DDL column list without
+        # instantiating the vtable, so it works on a host without `simple`) —
+        # a same-name simple object with any other column shape is NOT ours
+        # and must fail closed (never demote / delete it).
         if "tokenize='simple'" in sql and "content=" not in sql:
-            return "legacy_simple"
-        # Modern #30 identity (exact, not inferred from a bare 'trigram').
+            cols = SessionDB._fts_declared_columns(cursor, "sessions_fts_trigram")
+            if cols == frozenset({"title"}):
+                return "legacy_simple"
+            return "unknown_same_name"
+        # Modern #30 identity. The content/content_rowid/tokenizer attributes
+        # come from the stored DDL; the EXACT logical column set comes from
+        # PRAGMA table_info (a bare ``"id" in sql`` check is fooled by
+        # ``content_rowid='row_id'``), and a present-but-mismatched source VIEW
+        # would feed wrong content into the index — so both must hold.
         if (
             "tokenize='trigram'" in sql
             and "content='sessions_fts_trigram_src'" in sql
             and "content_rowid='row_id'" in sql
-            and "title" in sql
-            and "display_name" in sql
-            and "id" in sql
         ):
-            return "modern_trigram"
+            cols = SessionDB._fts_declared_columns(cursor, "sessions_fts_trigram")
+            if (
+                cols == frozenset({"title", "id", "display_name"})
+                and SessionDB._sessions_trigram_src_compatible(cursor)
+            ):
+                return "modern_trigram"
+            return "unknown_same_name"
         return "unknown_same_name"
 
     def _demote_legacy_sessions_trigram_fts(self) -> None:

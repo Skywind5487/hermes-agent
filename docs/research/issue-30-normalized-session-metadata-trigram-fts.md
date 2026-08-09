@@ -162,3 +162,30 @@ path; the fresh-claim clear is now gated inside it); the shared
 and carries type hints. The seed's empty-DB guard deliberately still counts
 `FROM sessions` (a canonical-table question, not a lane projection);
 `COUNT(*)` from the trigram VIEW would add a VIEW-missing risk for no benefit.
+
+### Round-3 fix — exact schema classifier (2026-08-09)
+
+Round-3 review (P2): the classifier's column checks were substring-based and
+too loose — `"id" in sql` is fooled by `content_rowid='row_id'`, and the
+legacy check never verified the historical title-only shape. A near-match
+same-name object could be misclassified modern/legacy and then either be
+demoted (writable_schema root removal) or operated on with a missing column,
+blowing up at session write/rebuild instead of failing closed at the
+migration boundary.
+
+`_classify_sessions_fts_trigram` now verifies the EXACT logical column set
+via `PRAGMA table_info` (`_fts_declared_columns` — reads the DDL column list
+without instantiating the vtable, so it works on a host without `simple`)
+and requires a compatible derived source VIEW (`_sessions_trigram_src_compatible`):
+- `legacy_simple` = `tokenize='simple'` + internal content + exactly `{title}`;
+- `modern_trigram` = `tokenize='trigram'` + the exact content/content_rowid +
+  exactly `{title, id, display_name}` + a compatible VIEW when one is present
+  (a missing VIEW is healable, a mismatched one fails closed);
+- everything else — including simple-with-other-columns, trigram-without-`id`,
+  and modern-root-with-incompatible-VIEW — is `unknown_same_name` (fail
+  closed, never demoted/deleted).
+
+Pinned by three new regression tests
+(`test_classifier_simple_wrong_column_shape_unknown`,
+`test_classifier_trigram_missing_id_column_unknown`,
+`test_classifier_modern_root_incompatible_view_unknown`).
