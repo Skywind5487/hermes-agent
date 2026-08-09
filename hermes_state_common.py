@@ -163,7 +163,9 @@ SCHEMA_VERSION = 25
 # layout 0 (marker absent) with a working inline index until the user opts in.
 #   1 = v23 external-content layout (content/tool_name/tool_calls,
 #       tool-row-excluded trigram)
-FTS_STORAGE_VERSION = 1
+#   2 = + session Unicode metadata external-content layout over raw
+#       (title, id, display_name) keyed by named sessions.row_id (#25)
+FTS_STORAGE_VERSION = 2
 
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
@@ -641,24 +643,66 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 # (which would create the external-content trigram source VIEW and leave the
 # DB in a mixed, broken state). `optimize_fts_storage()` is what migrates a
 # legacy DB to the v23 shape.
-# ── Sessions FTS5 — title search ────────────────────────────────────────
+# ── Sessions FTS5 — raw Unicode metadata search (v2 / issue #25) ────────
+# Same architecture as the v23 message FTS: metadata text is canonical ONLY
+# in ``sessions`` (read through the named ``row_id``), never duplicated in
+# FTS content shadow storage. The document is the RAW ``(title, id,
+# display_name)`` tuple — no title normalization, no synthetic concatenation
+# (normalized arbitrary-infix belongs to #30). A dedicated marker pair
+# (``fts_session_rebuild_high_water`` / ``fts_session_rebuild_progress``)
+# drives the resumable chunked backfill and gates every trigger on the same
+# indexed-row invariant as the message indexes: a row is safe to mutate in
+# FTS only when ``row_id <= P`` (already backfilled) or ``row_id > H``
+# (inserted after capture — AUTOINCREMENT guarantees new rows are always
+# > H). Rows in ``(P, H]`` are owned by the historical worker: triggers leave
+# them alone, and search supplements the bounded gap. The UPDATE trigger
+# fires only on title/id/display_name changes (AFTER UPDATE OF plus a
+# value-change guard) so token/accounting/heartbeat metadata writes never
+# rewrite the metadata index.
 SESSIONS_FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
     title,
+    id,
+    display_name,
+    content='sessions',
+    content_rowid='row_id',
     tokenize='unicode61'
 );
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions BEGIN
-    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
+CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
 END;
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions BEGIN
-    DELETE FROM sessions_fts WHERE rowid = old.rowid;
+CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
 END;
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_update AFTER UPDATE ON sessions BEGIN
-    DELETE FROM sessions_fts WHERE rowid = old.rowid;
-    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
+CREATE TRIGGER IF NOT EXISTS sessions_fts_update
+AFTER UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+    INSERT INTO sessions_fts(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
 END;
 """
 

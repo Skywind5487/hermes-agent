@@ -32,6 +32,51 @@ from hermes_state_common import (
 logger = logging.getLogger("hermes_state")
 
 
+# Deferred-rebuild specs shared by the message and session metadata FTS
+# engines. Each spec describes one external-content index family so the
+# crash-safe claim / chunk / finish rules (accepted through #76832 for
+# messages, #25 for sessions) are implemented ONCE in
+# ``fts_rebuild_status/step`` / ``_fts_rebuild_finish`` and only the SQL,
+# table, row key, and marker names differ. ``available`` /
+# ``trigram_available`` are callables taking the SessionDB host (the mixin
+# methods cannot read ``self._fts_enabled`` at import time).
+_FTS_MESSAGE_SPEC = {
+    "name": "messages",
+    "high_water_key": "fts_rebuild_high_water",
+    "progress_key": "fts_rebuild_progress",
+    "fts_table": "messages_fts",
+    "fts_columns": ("content", "tool_name", "tool_calls"),
+    "source_table": "messages",
+    "source_columns": ("content", "tool_name", "tool_calls"),
+    "row_key": "id",
+    "trigram_fts": "messages_fts_trigram",
+    "trigram_columns": ("content", "tool_name", "tool_calls"),
+    "trigram_where": "role <> 'tool'",
+    "reset_tables": ("messages_fts", "messages_fts_trigram"),
+    "available": lambda self: self._fts_enabled,
+    "trigram_available": lambda self: self._trigram_available,
+}
+
+_FTS_SESSION_SPEC = {
+    "name": "sessions",
+    "high_water_key": "fts_session_rebuild_high_water",
+    "progress_key": "fts_session_rebuild_progress",
+    "fts_table": "sessions_fts",
+    # Raw canonical values only — no normalization / synthetic concatenation
+    # (normalized arbitrary infix belongs to #30).
+    "fts_columns": ("title", "id", "display_name"),
+    "source_table": "sessions",
+    "source_columns": ("title", "id", "display_name"),
+    "row_key": "row_id",
+    "trigram_fts": None,
+    "trigram_columns": (),
+    "trigram_where": None,
+    "reset_tables": ("sessions_fts",),
+    "available": lambda self: getattr(self, "_sessions_fts_available", False),
+    "trigram_available": lambda self: False,
+}
+
+
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
 
@@ -79,7 +124,26 @@ class SessionSearchMixin:
             # optional missing index.
             logger.warning("FTS incremental merge failed: %s", exc)
 
-    def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
+    def _fts_rebuild_pause(self, chunk_seconds: float) -> None:
+        """Inter-chunk throttle shared by every deferred FTS rebuild loop.
+
+        Extracted from ``optimize_fts_storage``'s nested closure so both the
+        message and the session metadata (issue #25) rebuilds route through
+        ONE monkeypatchable helper. The duty cycle is what keeps a live
+        gateway/CLI process sharing the DB responsive: without it, back-to-
+        back BEGIN IMMEDIATE chunks starve concurrent writers out of their
+        lock retries (the measured ~85% write-lock ownership that froze
+        concurrent sessions). No session-specific copy of ``500`` / ``4.0`` /
+        ``0.2`` or this formula is introduced.
+        """
+        time.sleep(max(
+            self._FTS_REBUILD_MIN_PAUSE,
+            chunk_seconds * self._FTS_REBUILD_DUTY_FACTOR,
+        ))
+
+    def fts_rebuild_status(
+        self, spec: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
         """Return deferred-rebuild progress, or None when no rebuild pending.
 
         Shape: {"pending": True, "total": <rows at drop time>,
@@ -87,28 +151,31 @@ class SessionSearchMixin:
         Consumed by search_messages() notes and by status surfaces
         (dashboard/desktop can poll this to render a progress indicator).
 
-        Reads state_meta directly via _read_ctx instead of calling
-        get_meta() (which takes self._lock) so search_messages doesn't
-        block on the writer lock when checking rebuild status.
+        ``spec`` selects the marker pair: the message rebuild by default, or
+        the session Unicode metadata rebuild (issue #25). Reads state_meta
+        directly via _read_ctx instead of calling get_meta() (which takes
+        self._lock) so search_messages doesn't block on the writer lock when
+        checking rebuild status.
         """
+        spec = spec or _FTS_MESSAGE_SPEC
         with self._read_ctx() as conn:
             row = conn.execute(
                 "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
-                ("fts_rebuild_high_water", "fts_rebuild_progress"),
+                (spec["high_water_key"], spec["progress_key"]),
             ).fetchall()
         meta = {r["key"]: r["value"] for r in row}
-        high_water = meta.get("fts_rebuild_high_water")
+        high_water = meta.get(spec["high_water_key"])
         if high_water is None:
             return None
-        progress = int(meta.get("fts_rebuild_progress") or 0)
+        progress = int(meta.get(spec["progress_key"]) or 0)
         total = int(high_water)
         if total <= 0:
             return None
         pct = min(100, int(100 * progress / total))
         return {"pending": True, "total": total, "indexed": progress, "percent": pct}
 
-    def _fts_rebuild_finish(self) -> None:
-        """Finalize the deferred rebuild: boundary sweep + clear markers.
+    def _fts_rebuild_finish(self, spec: Optional[Dict[str, Any]] = None) -> None:
+        """Finalize a deferred rebuild: boundary sweep + clear markers.
 
         The sweep is cheap insurance against any write that slipped through
         the migration-boundary instant (between high_water capture and
@@ -116,46 +183,64 @@ class SessionSearchMixin:
         index is missing. docsize has one row per indexed doc, so the
         anti-join is exact and runs on a narrow id range.
 
-        The trigram half of the sweep is gated on ``self._trigram_available``
-        for the same reason ``fts_rebuild_step()`` gates its backfill INSERT:
-        when the SQLite build has no trigram tokenizer (or the table was
-        never created), an unconditional INSERT raises ``no such table``
+        The trigram half of the sweep is gated on the spec's availability
+        probe for the same reason ``fts_rebuild_step()`` gates its backfill
+        INSERT: when the SQLite build has no trigram tokenizer (or the table
+        was never created), an unconditional INSERT raises ``no such table``
         and aborts the whole rebuild — taking ``optimize_fts_storage()``
         down with it.
         """
-        include_trigram = self._trigram_available
+        spec = spec or _FTS_MESSAGE_SPEC
+        include_trigram = bool(
+            spec.get("trigram_fts") and spec["trigram_available"](self)
+        )
+        fts_table = spec["fts_table"]
+        source_table = spec["source_table"]
+        row_key = spec["row_key"]
+        fts_cols = ", ".join(spec["fts_columns"])
+        src_cols = ", ".join(spec["source_columns"])
 
         def _do(conn):
             hw_row = conn.execute(
-                "SELECT value FROM state_meta WHERE key = 'fts_rebuild_high_water'"
+                "SELECT value FROM state_meta WHERE key = ?",
+                (spec["high_water_key"],),
             ).fetchone()
             if hw_row is not None:
                 hw = int(hw_row[0])
                 # Sweep a generous window around the boundary.
                 lo, hi = hw - 1000, hw + 1000
                 conn.execute(
-                    "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) "
-                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
-                    "FROM messages m "
-                    "WHERE m.id > ? AND m.id <= ? "
-                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
+                    f"INSERT INTO {fts_table}(rowid, {fts_cols}) "
+                    f"SELECT {source_table}.{row_key}, {src_cols} "
+                    f"FROM {source_table} "
+                    f"WHERE {source_table}.{row_key} > ? "
+                    f"AND {source_table}.{row_key} <= ? "
+                    f"AND NOT EXISTS (SELECT 1 FROM {fts_table}_docsize d "
+                    f"                WHERE d.id = {source_table}.{row_key})",
                     (lo, hi),
                 )
-                if include_trigram:
+                trigram = spec.get("trigram_fts")
+                if trigram and include_trigram:
+                    trigram_cols = ", ".join(spec["trigram_columns"])
                     conn.execute(
-                        "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
-                        "SELECT m.id, m.content, m.tool_name, m.tool_calls "
-                        "FROM messages m "
-                        "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
-                        "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
+                        f"INSERT INTO {trigram}(rowid, {trigram_cols}) "
+                        f"SELECT {source_table}.{row_key}, {src_cols} "
+                        f"FROM {source_table} "
+                        f"WHERE {source_table}.{row_key} > ? "
+                        f"AND {source_table}.{row_key} <= ? "
+                        f"AND {spec['trigram_where']} "
+                        f"AND NOT EXISTS (SELECT 1 FROM {trigram}_docsize d "
+                        f"                WHERE d.id = {source_table}.{row_key})",
                         (lo, hi),
                     )
             conn.execute(
-                "DELETE FROM state_meta WHERE key IN "
-                "('fts_rebuild_high_water', 'fts_rebuild_progress')"
+                "DELETE FROM state_meta WHERE key IN (?, ?)",
+                (spec["high_water_key"], spec["progress_key"]),
             )
         self._execute_write(_do)
-        logger.info("Deferred FTS rebuild complete — all messages indexed.")
+        logger.info(
+            "Deferred %s FTS rebuild complete — all rows indexed.", spec["name"]
+        )
 
     def _fts_teardown_trash_step(self) -> bool:
         """Tear down one chunk of a demoted v22 FTS shadow table.
@@ -199,29 +284,41 @@ class SessionSearchMixin:
             logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
             return True
 
-    def fts_rebuild_step(self) -> bool:
-        """Backfill one chunk of the deferred FTS rebuild.
+    def fts_rebuild_step(self, spec: Optional[Dict[str, Any]] = None) -> bool:
+        """Backfill one chunk of a deferred FTS rebuild.
 
         Returns True when more work remains, False when the rebuild is
         complete (or none is pending). Safe to call from any process at any
         time; chunks are claimed atomically inside the write transaction, so
         concurrent callers interleave instead of duplicating rows.
+
+        ``spec`` selects the rebuild: messages by default, or the session
+        Unicode metadata rebuild (issue #25) via ``fts_session_rebuild_step``.
         """
-        if not self._fts_enabled:
+        spec = spec or _FTS_MESSAGE_SPEC
+        if not spec["available"](self):
             return False
-        high_water_raw = self.get_meta("fts_rebuild_high_water")
+        high_water_raw = self.get_meta(spec["high_water_key"])
         if high_water_raw is None:
             return False
         high_water = int(high_water_raw)
-        include_trigram = self._trigram_available
         chunk = self._FTS_REBUILD_CHUNK_ROWS
+        fts_table = spec["fts_table"]
+        source_table = spec["source_table"]
+        row_key = spec["row_key"]
+        fts_cols = ", ".join(spec["fts_columns"])
+        src_cols = ", ".join(spec["source_columns"])
+        include_trigram = bool(
+            spec.get("trigram_fts") and spec["trigram_available"](self)
+        )
 
         def _do(conn):
             # Re-read progress inside the write transaction (BEGIN IMMEDIATE
             # is already held by _execute_write) — this is the claim: two
             # workers can't read the same progress value concurrently.
             row = conn.execute(
-                "SELECT value FROM state_meta WHERE key = 'fts_rebuild_progress'"
+                "SELECT value FROM state_meta WHERE key = ?",
+                (spec["progress_key"],),
             ).fetchone()
             if row is None:
                 return False  # finished (or cleared) by another process
@@ -233,39 +330,62 @@ class SessionSearchMixin:
             # deleted rows don't shrink chunks below the claimed range.
             upper = min(progress + chunk, high_water)
             conn.execute(
-                "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) "
-                "SELECT id, content, tool_name, tool_calls FROM messages "
-                "WHERE id > ? AND id <= ?",
+                f"INSERT INTO {fts_table}(rowid, {fts_cols}) "
+                f"SELECT {row_key}, {src_cols} FROM {source_table} "
+                f"WHERE {row_key} > ? AND {row_key} <= ?",
                 (progress, upper),
             )
-            if include_trigram:
+            trigram = spec.get("trigram_fts")
+            if trigram and include_trigram:
+                trigram_cols = ", ".join(spec["trigram_columns"])
                 conn.execute(
-                    "INSERT INTO messages_fts_trigram"
-                    "(rowid, content, tool_name, tool_calls) "
-                    "SELECT id, content, tool_name, tool_calls FROM messages "
-                    "WHERE id > ? AND id <= ? AND role <> 'tool'",
+                    f"INSERT INTO {trigram}(rowid, {trigram_cols}) "
+                    f"SELECT {row_key}, {src_cols} FROM {source_table} "
+                    f"WHERE {row_key} > ? AND {row_key} <= ? "
+                    f"AND {spec['trigram_where']}",
                     (progress, upper),
                 )
             # Publish progress in the same transaction as the rows it
             # covers — crash-atomic: either both land or neither does.
             conn.execute(
-                "UPDATE state_meta SET value = ? "
-                "WHERE key = 'fts_rebuild_progress'",
-                (str(upper),),
+                "UPDATE state_meta SET value = ? WHERE key = ?",
+                (str(upper), spec["progress_key"]),
             )
             return upper < high_water
 
         try:
             more = self._execute_write(_do)
         except sqlite3.OperationalError as exc:
-            logger.debug("FTS rebuild chunk failed (will retry): %s", exc)
+            logger.debug(
+                "%s FTS rebuild chunk failed (will retry): %s", spec["name"], exc
+            )
             return True  # transient (lock contention) — caller retries
         if more is False:
-            status = self.fts_rebuild_status()
+            status = self.fts_rebuild_status(spec)
             if status is not None and status["indexed"] >= status["total"]:
-                self._fts_rebuild_finish()
+                self._fts_rebuild_finish(spec)
             return False
         return bool(more)
+
+    def fts_session_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Session Unicode metadata index backfill progress, or None when none
+        is pending (issue #25)."""
+        return self.fts_rebuild_status(spec=_FTS_SESSION_SPEC)
+
+    def fts_session_rebuild_step(self) -> bool:
+        """Backfill one chunk of the session Unicode metadata index (issue #25).
+
+        True while work remains. Shares the crash-safe chunk claim / atomic
+        progress / finish rules with the message rebuild — only the source
+        table, row key, columns, and marker names differ.
+        """
+        return self.fts_rebuild_step(spec=_FTS_SESSION_SPEC)
+
+    def _fts_session_rebuild_finish(self) -> None:
+        """Boundary sweep + clear the session markers (issue #25)."""
+        self._fts_rebuild_finish(spec=_FTS_SESSION_SPEC)
+        self._sessions_fts_available = True
+        logger.info("Session metadata FTS backfill complete — serving search.")
 
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
@@ -396,20 +516,23 @@ class SessionSearchMixin:
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
 
-    def _fts_external_index_empty_with_messages(self, conn) -> bool:
-        """True when the base FTS table exists but indexes nothing while
-        ``messages`` has rows. Caller must hold ``self._lock``.
+    def _fts_external_index_empty_with_source(
+        self, conn, source_table: str, fts_table: str
+    ) -> bool:
+        """True when an external-content FTS table exists but indexes nothing
+        while its canonical source table has rows. Caller must hold
+        ``self._lock``.
 
-        This is the post-demote empty-index shape: external-content FTS with
-        zero ``messages_fts_docsize`` rows against a non-empty messages table.
-        Healthy installs (and mid-backfill installs that still hold markers)
-        never match.
+        This is the post-demote / crash-window empty-index shape: external-
+        content FTS with zero ``<fts>_docsize`` rows against a non-empty
+        source table. Healthy installs (and mid-backfill installs that still
+        hold markers) never match.
         """
         try:
-            has_msg = conn.execute(
-                "SELECT EXISTS(SELECT 1 FROM messages)"
+            has_src = conn.execute(
+                f"SELECT EXISTS(SELECT 1 FROM {source_table})"
             ).fetchone()[0]
-            if not has_msg:
+            if not has_src:
                 return False
             # docsize is the authoritative "is this rowid indexed" surface for
             # external-content FTS5; probing the virtual table itself is
@@ -418,50 +541,62 @@ class SessionSearchMixin:
             # condition, and COUNT(*) is a full b-tree scan (~100ms on a
             # 2M-row table) while EXISTS is O(1).
             has_fts = conn.execute(
-                "SELECT EXISTS(SELECT 1 FROM messages_fts_docsize)"
+                f"SELECT EXISTS(SELECT 1 FROM {fts_table}_docsize)"
             ).fetchone()[0]
             return not has_fts
         except sqlite3.OperationalError:
             # Table absent / FTS disabled mid-init — not this failure class.
             return False
 
-    def _fts_index_known_empty(self, conn) -> bool:
-        """True when the base external-content index holds no rows.
+    def _fts_external_index_empty_with_messages(self, conn) -> bool:
+        """Message-index variant of ``_fts_external_index_empty_with_source``."""
+        return self._fts_external_index_empty_with_source(
+            conn, "messages", "messages_fts"
+        )
+
+    def _fts_index_known_empty(
+        self, conn, fts_table: str = "messages_fts"
+    ) -> bool:
+        """True when an external-content index holds no rows.
 
         A missing table counts as empty: the schema ensure that follows
         creates it fresh.
         """
         try:
             n = conn.execute(
-                "SELECT COUNT(*) FROM messages_fts_docsize"
+                f"SELECT COUNT(*) FROM {fts_table}_docsize"
             ).fetchone()[0]
             return int(n) == 0
         except sqlite3.OperationalError:
             return True
 
-    def _reset_fts_index_to_empty(self, conn) -> None:
-        """Delete every indexed row from the v23 external-content tables.
+    def _reset_fts_index_to_empty(
+        self, conn, tables: Optional[Collection[str]] = None
+    ) -> None:
+        """Delete every indexed row from the given external-content tables.
 
         Uses the FTS5 ``'delete-all'`` special command — the documented O(1)
         truncate for external-content tables. A plain no-WHERE ``DELETE`` is
         O(rows) on external-content FTS5 (each row's delete tokens are
         regenerated from the content table; measured ~12µs/row, minutes on a
         large index, while holding the write lock) and corrupts the index if
-        indexed rows have diverged from ``messages`` — precisely the broken-
-        bookkeeping shape this repair path handles. The backfill chunk worker
-        replays its whole selected id range with no anti-join, so a replay
-        from zero is only safe once the index is known empty — this is how a
-        partially indexed DB gets there.
+        indexed rows have diverged from the canonical source table — precisely
+        the broken-bookkeeping shape this repair path handles. The backfill
+        chunk worker replays its whole selected id range with no anti-join, so
+        a replay from zero is only safe once the index is known empty — this
+        is how a partially indexed DB gets there.
         """
-        for tbl in ("messages_fts", "messages_fts_trigram"):
+        for tbl in tables or ("messages_fts", "messages_fts_trigram"):
             try:
                 conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('delete-all')")
             except sqlite3.OperationalError:
                 pass  # table absent — already an empty surface
 
-    def _seed_fts_rebuild_markers(self, conn, *, force: bool = False) -> int:
-        """Write ``fts_rebuild_high_water`` / ``fts_rebuild_progress`` for a
-        full backfill. Returns the high-water id.
+    def _seed_fts_rebuild_markers(
+        self, conn, spec: Optional[Dict[str, Any]] = None, *, force: bool = False
+    ) -> int:
+        """Write a rebuild's high_water / progress keys for a full backfill.
+        Returns the high-water id.
 
         When ``force`` is False and high_water is already set, only repairs a
         missing progress key (stuck no-op when high_water exists alone), and
@@ -471,33 +606,36 @@ class SessionSearchMixin:
         zero on top of surviving rows. Caller must hold the write
         transaction / lock as appropriate.
         """
+        spec = spec or _FTS_MESSAGE_SPEC
         existing_hw = conn.execute(
-            "SELECT value FROM state_meta WHERE key = 'fts_rebuild_high_water'"
+            "SELECT value FROM state_meta WHERE key = ?",
+            (spec["high_water_key"],),
         ).fetchone()
         if existing_hw is not None and not force:
             hw = int(existing_hw[0])
             progress = conn.execute(
-                "SELECT value FROM state_meta WHERE key = 'fts_rebuild_progress'"
+                "SELECT value FROM state_meta WHERE key = ?",
+                (spec["progress_key"],),
             ).fetchone()
             if progress is None:
                 # high_water without progress: fts_rebuild_step treats missing
                 # progress as "done by another process" and optimize would
                 # no-op then stamp. Re-seed progress so the chunk loop runs.
-                if not self._fts_index_known_empty(conn):
-                    self._reset_fts_index_to_empty(conn)
+                if not self._fts_index_known_empty(conn, spec["fts_table"]):
+                    self._reset_fts_index_to_empty(conn, spec["reset_tables"])
                 conn.execute(
-                    "INSERT INTO state_meta (key, value) VALUES "
-                    "('fts_rebuild_progress', '0') "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                    "INSERT INTO state_meta (key, value) VALUES (?, '0') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (spec["progress_key"],),
                 )
             return hw
 
         hw = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM messages"
+            f"SELECT COALESCE(MAX({spec['row_key']}), 0) FROM {spec['source_table']}"
         ).fetchone()[0]
         for k, v in (
-            ("fts_rebuild_high_water", str(hw)),
-            ("fts_rebuild_progress", "0"),
+            (spec["high_water_key"], str(hw)),
+            (spec["progress_key"], "0"),
         ):
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
@@ -506,44 +644,66 @@ class SessionSearchMixin:
             )
         return int(hw)
 
-    def _repair_optimize_bookkeeping(self) -> None:
+    def _seed_session_fts_rebuild_markers(
+        self, conn, *, force: bool = False
+    ) -> int:
+        """Session Unicode metadata variant of ``_seed_fts_rebuild_markers``.
+
+        An empty DB is complete by construction (the triggers cover every
+        future row) and must not carry a spurious claim that would make
+        ``fts_optimize_available`` advertise pending work forever.
+        """
+        n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        if n == 0 and not force:
+            return 0
+        return self._seed_fts_rebuild_markers(
+            conn, _FTS_SESSION_SPEC, force=force
+        )
+
+    def _repair_optimize_bookkeeping(
+        self, spec: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Heal interrupted demote/backfill bookkeeping before optimize runs.
 
         Covers two post-#65798 failure classes:
 
-        1. Empty external-content index with messages present and no rebuild
-           markers (demote crash window after empty v23 tables landed but
-           before markers, or settle that stamped without backfill). Seed a
-           full backfill.
-        2. ``fts_rebuild_high_water`` present without ``fts_rebuild_progress``
-           (partial meta) — seed progress so the chunk loop is not a no-op,
-           resetting a partially populated index to a known-empty surface
-           first so the anti-join-free chunk replay cannot duplicate rows.
+        1. Empty external-content index with the source table present and no
+           rebuild markers (demote crash window after empty v23 tables landed
+           but before markers, or settle that stamped without backfill). Seed
+           a full backfill.
+        2. high_water present without progress (partial meta) — seed progress
+           so the chunk loop is not a no-op, resetting a partially populated
+           index to a known-empty surface first so the anti-join-free chunk
+           replay cannot duplicate rows.
 
         Must not invent markers on a still-legacy inline DB: that would make
         ``optimize_fts_storage`` skip demote (``legacy and not pending``) and
         attempt v23-shaped INSERTs against the inline table forever.
         """
+        spec = spec or _FTS_MESSAGE_SPEC
+
         def _do(conn):
             existing_hw = conn.execute(
-                "SELECT value FROM state_meta "
-                "WHERE key = 'fts_rebuild_high_water'"
+                "SELECT value FROM state_meta WHERE key = ?",
+                (spec["high_water_key"],),
             ).fetchone()
 
             if existing_hw is not None:
                 # Repair orphan high_water-without-progress only. Never
                 # invent a fresh claim on a healthy complete index.
                 progress = conn.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_rebuild_progress'"
+                    "SELECT 1 FROM state_meta WHERE key = ?",
+                    (spec["progress_key"],),
                 ).fetchone()
                 if progress is None:
-                    if not self._fts_index_known_empty(conn):
-                        self._reset_fts_index_to_empty(conn)
+                    if not self._fts_index_known_empty(
+                        conn, spec["fts_table"]
+                    ):
+                        self._reset_fts_index_to_empty(conn, spec["reset_tables"])
                     conn.execute(
-                        "INSERT INTO state_meta (key, value) VALUES "
-                        "('fts_rebuild_progress', '0') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '0'"
+                        "INSERT INTO state_meta (key, value) VALUES (?, '0') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '0'",
+                        (spec["progress_key"],),
                     )
                 return
 
@@ -558,6 +718,41 @@ class SessionSearchMixin:
                     "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
                 )
                 self._seed_fts_rebuild_markers(conn, force=True)
+        self._execute_write(_do)
+
+    def _repair_session_fts_bookkeeping(self) -> None:
+        """Heal interrupted session Unicode metadata backfill bookkeeping
+        (#25). Mirrors ``_repair_optimize_bookkeeping`` on the session marker
+        pair, reusing the same crash-safe rule: never infer P=0 over a
+        maybe-partial index; either recover a proven boundary or reset the
+        derived index to a known-empty surface first.
+        """
+        def _do(conn):
+            existing_hw = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water'"
+            ).fetchone()
+            if existing_hw is not None:
+                progress = conn.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key = 'fts_session_rebuild_progress'"
+                ).fetchone()
+                if progress is None:
+                    if not self._fts_index_known_empty(conn, "sessions_fts"):
+                        self._reset_fts_index_to_empty(conn, ("sessions_fts",))
+                    conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES "
+                        "('fts_session_rebuild_progress', '0') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '0'"
+                    )
+                return
+            # No claim: a freshly-created external index over a populated DB
+            # that lost its markers, or a crash window after schema ensure
+            # without a claim. Seed a full backfill (orphan recovery).
+            if self._fts_external_index_empty_with_source(
+                conn, "sessions", "sessions_fts"
+            ):
+                self._seed_session_fts_rebuild_markers(conn, force=True)
         self._execute_write(_do)
 
     def fts_optimize_available(self) -> bool:
@@ -586,6 +781,14 @@ class SessionSearchMixin:
                 "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
             ).fetchone():
                 return True
+            # Session Unicode metadata rebuild pending (issue #25): the
+            # external index was staged at open with a durable H/P claim and
+            # the historical backfill is not complete yet.
+            if self._conn.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water' LIMIT 1"
+            ).fetchone():
+                return True
             # CJK-bigram index work — only offerable when THIS process can
             # tokenize: a pending backfill (markers set at creation on a
             # populated DB) or a stale index awaiting a from-scratch rebuild.
@@ -599,7 +802,13 @@ class SessionSearchMixin:
             # Pre-fix crash window: empty external-content index with
             # messages still present, no markers, no trash (teardown already
             # finished or never needed). Re-run seeds markers and backfills.
-            return self._fts_external_index_empty_with_messages(self._conn)
+            if self._fts_external_index_empty_with_messages(self._conn):
+                return True
+            # Session orphan: external sessions_fts empty with sessions
+            # present and no claim (crash window) — healable on re-run.
+            return self._fts_external_index_empty_with_source(
+                self._conn, "sessions", "sessions_fts"
+            )
 
     def _demote_legacy_fts_to_trash(self) -> int:
         """Demote the legacy inline FTS vtables and stage their shadow tables
@@ -695,6 +904,8 @@ class SessionSearchMixin:
         # markers when trash was already staged (or torn down) without a
         # backfill claim so the phases below actually run.
         self._repair_optimize_bookkeeping()
+        # Same healing for the session Unicode metadata rebuild (issue #25).
+        self._repair_session_fts_bookkeeping()
 
         # Only demote if we're actually still on the legacy shape. If a prior
         # run already demoted (markers/trash present), skip straight to
@@ -744,26 +955,14 @@ class SessionSearchMixin:
             st = self.fts_rebuild_status()
             if st is None:
                 st = self.fts_cjk_rebuild_status()
+            if st is None:
+                st = self.fts_session_rebuild_status()
             progress_cb({
                 "phase": phase,
                 "percent": st["percent"] if st else 100,
                 "indexed": st["indexed"] if st else 0,
                 "total": st["total"] if st else 0,
             })
-
-        def _pause(chunk_seconds: float) -> None:
-            """Inter-chunk throttle (see the chunk-engine note above).
-
-            The chunk methods themselves never sleep, so this loop is the
-            single place the duty cycle is enforced: without it, back-to-back
-            BEGIN IMMEDIATE chunks starve any live gateway/CLI process
-            sharing the DB out of its lock retries (the measured ~85%
-            write-lock ownership that froze concurrent sessions).
-            """
-            time.sleep(max(
-                self._FTS_REBUILD_MIN_PAUSE,
-                chunk_seconds * self._FTS_REBUILD_DUTY_FACTOR,
-            ))
 
         # Phase 1: backfill (foreground, throttled between chunks so a live
         # gateway sharing the DB stays responsive).
@@ -773,7 +972,7 @@ class SessionSearchMixin:
             if not self.fts_rebuild_step():
                 break
             _emit("backfill")
-            _pause(time.monotonic() - _t0)
+            self._fts_rebuild_pause(time.monotonic() - _t0)
         _emit("backfill")
 
         # Phase 1b: backfill the CJK-bigram index (its own marker pair; a
@@ -783,7 +982,19 @@ class SessionSearchMixin:
             if not self.fts_cjk_rebuild_step():
                 break
             _emit("backfill")
-            _pause(time.monotonic() - _t0)
+            self._fts_rebuild_pause(time.monotonic() - _t0)
+
+        # Phase 1c: backfill the session Unicode metadata index (issue #25)
+        # — same shared chunk engine and pacing as the message rebuild. Gated
+        # on pending markers so a DB with no session work never enters the
+        # loop (and never trips a monkeypatched message ``fts_rebuild_step``).
+        if self.fts_session_rebuild_status() is not None:
+            while True:
+                _t0 = time.monotonic()
+                if not self.fts_session_rebuild_step():
+                    break
+                _emit("backfill")
+                self._fts_rebuild_pause(time.monotonic() - _t0)
 
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
         _emit("teardown")
@@ -792,19 +1003,26 @@ class SessionSearchMixin:
             if not self._fts_teardown_trash_step():
                 break
             _emit("teardown")
-            _pause(time.monotonic() - _t0)
+            self._fts_rebuild_pause(time.monotonic() - _t0)
 
         # Refuse to stamp "optimized" while work remains or the base index is
         # still empty against a non-empty messages table. Pre-fix code could
         # tear down trash and settle after a no-op backfill when markers were
-        # missing — permanent search-index loss for historical rows.
+        # missing — permanent search-index loss for historical rows. Session
+        # markers / empty session index (issue #25) count as remaining work.
         with self._lock:
             still_pending = self._conn.execute(
                 "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+                "WHERE key IN ('fts_rebuild_high_water', "
+                "'fts_session_rebuild_high_water') LIMIT 1"
             ).fetchone() is not None
             still_trash = self._has_fts_trash(self._conn)
-            empty_index = self._fts_external_index_empty_with_messages(self._conn)
+            empty_index = (
+                self._fts_external_index_empty_with_messages(self._conn)
+                or self._fts_external_index_empty_with_source(
+                    self._conn, "sessions", "sessions_fts"
+                )
+            )
         if still_pending or still_trash or empty_index:
             reason = (
                 "backfill_incomplete" if still_pending or empty_index

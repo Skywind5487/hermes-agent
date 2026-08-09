@@ -1059,6 +1059,16 @@ class SessionSchemaMixin:
                 ).fetchone() is None
                 and not self._has_fts_trash(cursor)
                 and not self._fts_external_index_empty_with_messages(cursor)
+                # #25 (session metadata FTS): "fully optimized" also requires
+                # the session Unicode index to be external-content AND settled
+                # (no pending session H/P rebuild claim). A pre-#25 DB whose
+                # sessions_fts is still internal-content, or one mid-backfill,
+                # must not be stamped at the current layout version.
+                and not self._db_has_internal_content_sessions_fts(cursor)
+                and cursor.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key = 'fts_session_rebuild_high_water' LIMIT 1"
+                ).fetchone() is None
             ):
                 self.set_meta(
                     "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
@@ -1170,26 +1180,26 @@ class SessionSchemaMixin:
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)
 
-                # ── Sessions FTS5 (title search) ────────────────────────
-                # unicode61 table for non-CJK titles; cjk_unicode61 table
-                # for CJK titles, gated on the loadable tokenizer (LIKE
-                # fallback otherwise). Mirrors the messages FTS pattern.
-                sessions_fts_ok = self._ensure_fts_schema(
-                    cursor, "sessions_fts", SESSIONS_FTS_SQL,
-                )
+                # ── Sessions FTS5 (metadata search, issue #25) ──────────
+                # external-content Unicode over raw (title, id, display_name)
+                # keyed by named sessions.row_id, staged and crash-resumable.
+                # Startup no longer performs a blocking Unicode one-shot
+                # backfill: the external index is claimed with durable H/P
+                # markers and backfilled by the resumable chunk engine
+                # (fts_session_rebuild_step), with search supplementing the
+                # bounded gap meanwhile.
+                sessions_fts_ok = self._ensure_sessions_fts_schema(cursor)
+                self._sessions_fts_available = sessions_fts_ok
+                # CJK title table stays internal-content and one-shot
+                # backfilled (the CJK lifecycle is owned by #26).
                 sessions_cjk_ok = False
                 if sessions_fts_ok and self._fts_cjk_loaded:
                     sessions_cjk_ok = self._ensure_fts_schema(
                         cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL,
                     )
-                self._sessions_fts_available = sessions_fts_ok
                 self._sessions_cjk_available = sessions_cjk_ok
-                if sessions_fts_ok:
-                    # One-time backfill of pre-existing session titles.
-                    self._backfill_sessions_fts(
-                        cursor,
-                        include_cjk=sessions_cjk_ok,
-                    )
+                if sessions_cjk_ok:
+                    self._backfill_sessions_fts_cjk(cursor)
 
             # Replace any pre-existing broad AFTER UPDATE triggers with
             # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.

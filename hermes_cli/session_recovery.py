@@ -55,6 +55,10 @@ _GENERATED_META_KEYS = frozenset({
     "fts_cjk_stale",
     "fts_cjk_rebuild_high_water",
     "fts_cjk_rebuild_progress",
+    # Session Unicode metadata rebuild markers (issue #25) - generated from
+    # the current schema on a fresh destination, never copied.
+    "fts_session_rebuild_high_water",
+    "fts_session_rebuild_progress",
     "telegram_dm_topic_schema_version",
 })
 
@@ -1104,6 +1108,8 @@ def _verify_recovered_database(
                 "fts_cjk_stale",
                 "fts_cjk_rebuild_high_water",
                 "fts_cjk_rebuild_progress",
+                "fts_session_rebuild_high_water",
+                "fts_session_rebuild_progress",
             )
             if key in meta
         )
