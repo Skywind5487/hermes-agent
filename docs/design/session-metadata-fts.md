@@ -59,6 +59,11 @@ Reuses the accepted message-FTS seam (upstream #76832):
 
 - durable claim is committed **before** an empty external index can look
   complete;
+- an internal→external conversion over a DB with **zero sessions** stages no
+  claim at all (and clears any stale one): the index is complete by
+  construction, and an `H=0/P=0` pair would never enter the rebuild (status
+  total ≤ 0) yet would leave `optimize_fts_storage` permanently pending as
+  `backfill_incomplete`;
 - `H` present / `P` missing never replays from zero over a maybe-partial index:
   either a proven boundary is recovered or the index is reset known-empty
   (`'delete-all'`) first;
@@ -79,18 +84,23 @@ it for non-CJK titles), and `list_sessions_rich(search_query=...)` now also
 matches the raw `display_name` dimension. The existing normalized / infix
 `%LIKE%` fallback is preserved until #30 deliberately replaces it.
 
-Gap semantics approximate the index conservatively: the supplement folds both
-sides with `_fts_unicode61_fold` (NFKD decompose + drop combining marks +
-casefold) instead of SQLite's ASCII-only `LOWER()`, so `MATCH 'ecole'` finds
-`École` in the gap as it does in the index. This is deliberately a
-conservative Unicode approximation, NOT exact unicode61 parity (the real
-tokenizer folds per Unicode 6.1, strips Latin-script diacritics, and preserves
-single-codepoint multi-diacritic characters such as `ộ`), so the gap lane can
-produce a temporary false positive that disappears after backfill — accepted,
-because #25's core risk is migration MISSING a result. The merged FTS+gap
-result is sorted globally by `started_at DESC` (never lane-then-gap), which is
-what `resolve_session_by_title` relies on to resume the latest continuation.
-The helper returns `(fts_ok, candidates)`: when the `sessions_fts` MATCH lane
+Gap semantics approximate the index conservatively as a **superset of the FTS
+predicate**: the supplement folds both sides with `_fts_unicode61_fold` (NFKD
+decompose + drop combining marks + casefold) instead of SQLite's ASCII-only
+`LOWER()`, and matches on ANY positive term extracted from the query
+(`_fts_query_positive_terms` — multi-token implicit AND, `OR`, quoted phrases,
+prefix `*`), so `MATCH 'ecole'` finds `École` in the gap and `MATCH 'Alpha
+Project'` finds a gap row titled `Alpha middle Project` exactly as the indexed
+lane would. Over-matching is accepted (the backfilled index restores exact
+semantics); a MISS is not. The fold is deliberately a conservative Unicode
+approximation, NOT exact unicode61 parity (the real tokenizer folds per
+Unicode 6.1, strips Latin-script diacritics, and preserves single-codepoint
+multi-diacritic characters such as `ộ`), so the gap lane can produce a
+temporary false positive that disappears after backfill — accepted, because
+#25's core risk is migration MISSING a result. The merged FTS+gap result is
+sorted globally by `started_at DESC` (never lane-then-gap), which is what
+`resolve_session_by_title` relies on to resume the latest continuation. The
+helper returns `(fts_ok, candidates)`: when the `sessions_fts` MATCH lane
 itself fails, `fts_ok` is False so title resolution falls back to the LIKE
 lane instead of trusting a partial result.
 
@@ -102,8 +112,9 @@ lane instead of trusting a partial result.
   duplicate-title repair owns it).
 - `hermes_state.py` — `_migrate_sessions_row_id`, `_ensure_sessions_fts_schema`,
   `_db_has_internal_content_sessions_fts`, `_backfill_sessions_fts_cjk`,
-  `_session_fts_rebuild_gap`, `_fts_unicode61_fold`, `_fts_metadata_candidates`
-  (returns `(fts_ok, candidates)` sorted globally), updated
+  `_session_fts_rebuild_gap`, `_fts_unicode61_fold`, `_fts_query_positive_terms`,
+  `_fts_metadata_candidates` (returns `(fts_ok, candidates)` sorted globally;
+  the gap supplement is a term-superset of the FTS predicate), updated
   `_fts_numbered_variants`.
 - `hermes_state_schema.py` — `_init_schema` wiring: the sessions-FTS block is
   placed OUTSIDE the message legacy/`else` branch so it runs for every message
@@ -119,9 +130,10 @@ lane instead of trusting a partial result.
   pending in offline recovery.
 - `tests/test_session_metadata_fts.py` — rowid-hole migration (incl. legacy
   duplicate-title upgrade), raw Unicode external-content, H/P ownership
-  regions, crash/restart, bounded-gap search (incl. conservative Unicode-fold
-  supplement and its explicit non-parity edge, cross-lane ordering), finish,
-  delete probes that read the index directly and a `rank=1` consistency check
-  on completed indexes, two real concurrent runners (thread + barrier), shared
-  throttle, and a legacy-message × old-session-FTS cross-layout upgrade path
-  (one optimize settles both).
+  regions, crash/restart, bounded-gap search (conservative Unicode-fold
+  supplement + its explicit non-parity edge, multi-token implicit-AND and OR
+  no-hide regressions, cross-lane ordering), finish, delete probes that read
+  the index directly and a `rank=1` consistency check on completed indexes,
+  two real concurrent runners (thread + barrier), shared throttle, and a
+  legacy-message × old-session-FTS cross-layout upgrade path (one optimize
+  settles both) plus the empty-legacy-DB no-zombie-marker path.
