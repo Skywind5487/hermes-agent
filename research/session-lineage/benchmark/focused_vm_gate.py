@@ -10,7 +10,8 @@ architecture question only:
 
 Normal/performance evidence uses only current shallow topology plus the real
 historical depth-14 / size-15 compatibility envelope. Synthetic 5k/10k chains
-are emitted separately as safety/B evidence.
+are emitted separately as safety/B evidence for the two actual decision
+candidates only.
 
 This script never opens production ``state.db``.
 """
@@ -33,12 +34,15 @@ from vm_gate import machine_receipt
 
 HERE = Path(__file__).resolve().parent
 
-FOCUSED_ALGORITHMS = [
+DECISION_ALGORITHMS = [
     ("per_seed_no_memo", per_seed_point),
     ("python_dict_memo", python_dict_memo),
+]
+REFERENCE_ALGORITHMS = [
     ("pure_temp_reference", pure_temp),
     ("fixed3_reference", fixed3_shared_cross),
 ]
+FOCUSED_ALGORITHMS = DECISION_ALGORITHMS + REFERENCE_ALGORITHMS
 
 
 def focused_performance(*, repeats: int, filler: int, budget: int):
@@ -69,10 +73,16 @@ def focused_performance(*, repeats: int, filler: int, budget: int):
 
 
 def focused_budget(*, repeats: int, budgets: tuple[int, ...]):
+    """Safety/B curve for production decision candidates only.
+
+    TEMP and Fixed3 are architecture references, but running every pathological
+    B cell for them adds VM work without informing the final fuse for whichever
+    KISS candidate wins.
+    """
     rows = []
     for scenario in make_pathological_scenarios():
         for budget in budgets:
-            for name, fn in FOCUSED_ALGORITHMS:
+            for name, fn in DECISION_ALGORITHMS:
                 result = repeated(
                     scenario,
                     fn,
@@ -156,12 +166,12 @@ def main():
     meta = {
         "quick": args.quick,
         "production_db_opened": False,
-        "decision_algorithms": ["per_seed_no_memo", "python_dict_memo"],
-        "reference_algorithms": ["pure_temp_reference", "fixed3_reference"],
+        "decision_algorithms": [name for name, _ in DECISION_ALGORITHMS],
+        "reference_algorithms": [name for name, _ in REFERENCE_ALGORITHMS],
         "performance_rows": len(perf),
         "safety_rows": len(safety),
         "normal_budget": 10_000,
-        "note": "Final production B is intentionally not selected by this runner; analyze focused_budget separately from normal/historical performance.",
+        "note": "Final production B is intentionally not selected by this runner; focused_budget contains only the two production decision candidates and must be analyzed separately from normal/historical performance.",
     }
     (out / "suite_meta.json").write_text(
         json.dumps(meta, indent=2, ensure_ascii=False),
