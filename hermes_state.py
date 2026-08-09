@@ -2473,15 +2473,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "SELECT 1 FROM sqlite_master "
             "WHERE type = 'table' AND name = 'sessions_fts'"
         ).fetchone())
+
+        # Fresh-create path: stage the durable claim BEFORE the empty external
+        # table can exist (the #76832 invariant). A crash between the claim
+        # commit and the schema ensure leaves markers without a table; reopen
+        # re-ensures the schema and finds the claim already durable — never an
+        # empty index + populated sessions + no claim orphan.
+        if not existing and self.get_meta("fts_session_rebuild_high_water") is None:
+            self._seed_session_fts_rebuild_markers(cursor)
+
         ok = self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
         if not ok:
             self._sessions_fts_available = False
             return False
-        # Seed the durable claim only when the external table was just
-        # created on a populated DB with no existing claim (a staged claim
-        # from a crash before schema ensure must survive untouched).
-        if not existing and self.get_meta("fts_session_rebuild_high_water") is None:
-            self._seed_session_fts_rebuild_markers(cursor)
         return True
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
@@ -5670,8 +5674,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         sanitized = self._sanitize_fts5_query(raw_query)
         if not sanitized:
             return []
+        # The gap supplement folds columns with LOWER(...) LIKE, so the needle
+        # must be lowercased too (SQLite's LIKE is case-insensitive for ASCII
+        # only, so folding both sides is required for non-ASCII match parity
+        # with the case-insensitive unicode61 FTS lane).
         escaped = (
-            raw_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            raw_query.lower()
+            .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         )
         needle = f"%{escaped}%"
         gap = self._session_fts_rebuild_gap()
@@ -5725,12 +5734,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     })
         return list(by_row_id.values())
 
-    def _fts_numbered_variants(self, title: str) -> Optional[List[sqlite3.Row]]:
+    def _fts_numbered_variants(
+        self, title: str
+    ) -> Optional[List[Dict[str, Any]]]:
         """Find numbered continuation variants via FTS5 MATCH with CJK dispatch.
 
-        During a #25 session metadata rebuild the bounded ``(P, H]`` gap is
-        supplemented with a LIKE scan and merged with the FTS candidates, so
-        title resolution never returns incomplete results mid-backfill.
+        Non-CJK titles delegate to the shared raw Unicode metadata lane
+        (``_fts_metadata_candidates``), which already covers title / logical
+        id / display_name and supplements the bounded ``(P, H]`` rebuild gap —
+        title resolution therefore never returns incomplete results
+        mid-backfill and the gap logic lives in exactly one place. CJK titles
+        keep their dedicated ``sessions_fts_cjk`` lane + gap supplement (the
+        CJK lifecycle is owned by #26).
 
         Returns None to signal fallback to LIKE (e.g. FTS5 runtime error or
         the target table unavailable). Returns empty list when no matches.
@@ -5738,64 +5753,73 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         is_cjk = self._contains_cjk(title)
         if is_cjk and not getattr(self, "_sessions_cjk_available", False):
             return None
-        fts_table = "sessions_fts_cjk" if is_cjk else "sessions_fts"
-        sanitized = self._sanitize_fts5_query(title)
-
-        if not sanitized:
-            return None
-
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-        with self._lock:
-            try:
-                cursor = self._conn.execute(
-                    f"SELECT s.id AS id, s.title, s.started_at "
-                    f"FROM {fts_table} f "
-                    f"JOIN sessions s ON s.row_id = f.rowid "
-                    f"WHERE {fts_table} MATCH ? "
-                    f"ORDER BY s.started_at DESC",
-                    (sanitized,),
-                )
-                candidates = list(cursor)
-            except sqlite3.OperationalError:
-                logging.debug(
-                    "%s MATCH failed for %r, falling back to LIKE",
-                    fts_table, sanitized, exc_info=True,
-                )
-                return None
+        # An unsanitizable query must signal "use the LIKE fallback" (None),
+        # not "no matches" ([]), for both lanes.
+        if not self._sanitize_fts5_query(title):
+            return None
 
-        # Post-filter: only keep sessions whose title starts with "{title} #N"
-        filtered = [
+        if is_cjk:
+            fts_table = "sessions_fts_cjk"
+            sanitized = self._sanitize_fts5_query(title)
+            if not sanitized:
+                return None
+            with self._lock:
+                try:
+                    cursor = self._conn.execute(
+                        f"SELECT s.id AS id, s.title, s.started_at "
+                        f"FROM {fts_table} f "
+                        f"JOIN sessions s ON s.row_id = f.rowid "
+                        f"WHERE {fts_table} MATCH ? "
+                        f"ORDER BY s.started_at DESC",
+                        (sanitized,),
+                    )
+                    candidates = list(cursor)
+                except sqlite3.OperationalError:
+                    logging.debug(
+                        "%s MATCH failed for %r, falling back to LIKE",
+                        fts_table, sanitized, exc_info=True,
+                    )
+                    return None
+            filtered = [
+                c for c in candidates
+                if c["title"] and c["title"].startswith(f"{escaped} #")
+            ]
+            # Bounded-gap supplement (same rule as the Unicode lane, kept local
+            # for the CJK table which #26 will take over).
+            gap = self._session_fts_rebuild_gap()
+            if gap is not None:
+                progress, high_water = gap
+                with self._read_ctx() as conn:
+                    gap_rows = conn.execute(
+                        "SELECT id, title, started_at FROM sessions "
+                        "WHERE title LIKE ? ESCAPE '\\' "
+                        "AND row_id > ? AND row_id <= ? "
+                        "ORDER BY started_at DESC",
+                        (f"{escaped} #%", progress, high_water),
+                    ).fetchall()
+                gap_filtered = [
+                    c for c in gap_rows
+                    if c["title"] and c["title"].startswith(f"{escaped} #")
+                ]
+                by_id = {c["id"]: c for c in filtered}
+                for c in gap_filtered:
+                    by_id.setdefault(c["id"], c)
+                filtered = sorted(
+                    by_id.values(), key=lambda c: c["started_at"], reverse=True
+                )
+            return filtered
+
+        # Non-CJK: the shared raw Unicode lane already merges the FTS
+        # candidates with the bounded (P, H] gap and dedupes by row_id.
+        candidates = self._fts_metadata_candidates(title)
+        if not candidates:
+            return candidates
+        return [
             c for c in candidates
             if c["title"] and c["title"].startswith(f"{escaped} #")
         ]
-
-        # Bounded-gap supplement: rows in (P, H] are not in the index yet.
-        gap = self._session_fts_rebuild_gap()
-        if gap is not None:
-            progress, high_water = gap
-            with self._read_ctx() as conn:
-                gap_rows = conn.execute(
-                    "SELECT id, title, started_at FROM sessions "
-                    "WHERE title LIKE ? ESCAPE '\\' "
-                    "AND row_id > ? AND row_id <= ? "
-                    "ORDER BY started_at DESC",
-                    (f"{escaped} #%", progress, high_water),
-                ).fetchall()
-            gap_filtered = [
-                c for c in gap_rows
-                if c["title"] and c["title"].startswith(f"{escaped} #")
-            ]
-            by_id = {c["id"]: c for c in filtered}
-            for c in gap_filtered:
-                by_id.setdefault(c["id"], c)
-            # Re-sort the merged candidates so the latest continuation is
-            # first even when the gap rows joined after the FTS hits.
-            filtered = sorted(
-                by_id.values(), key=lambda c: c["started_at"], reverse=True
-            )
-
-        return filtered
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").
@@ -6083,9 +6107,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 id_params.append(_like_pattern(id_needle))
             if search_needle:
-                # Same chain-membership trick as id_query, but matching either
-                # the title or the id of any session in the chain. The compact
-                # (punctuation-stripped) variant lets `an94` match `AN-94`.
+                # Same chain-membership trick as id_query, but matching the
+                # title, logical id, or display_name of any session in the
+                # chain (issue #25 covers display_name in the raw metadata
+                # search). The compact (punctuation-stripped) variant lets
+                # `an94` match `AN-94`.
                 compact_needle = re.sub(r"[\W_]+", "", search_needle)
                 compact_sql = (
                     "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
@@ -6097,8 +6123,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     " WHERE cq.root_id = s.id"
                     " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
                     " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
+                    " OR LOWER(COALESCE(cs.display_name, '')) LIKE ? ESCAPE '\\'"
                 )
-                id_params.extend([_like_pattern(search_needle)] * 2)
+                id_params.extend([_like_pattern(search_needle)] * 3)
                 if compact_needle:
                     search_clause += (
                         f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"

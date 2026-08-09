@@ -163,9 +163,7 @@ SCHEMA_VERSION = 25
 # layout 0 (marker absent) with a working inline index until the user opts in.
 #   1 = v23 external-content layout (content/tool_name/tool_calls,
 #       tool-row-excluded trigram)
-#   2 = + session Unicode metadata external-content layout over raw
-#       (title, id, display_name) keyed by named sessions.row_id (#25)
-FTS_STORAGE_VERSION = 2
+FTS_STORAGE_VERSION = 1
 
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.

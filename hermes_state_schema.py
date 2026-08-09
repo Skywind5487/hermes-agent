@@ -1059,16 +1059,6 @@ class SessionSchemaMixin:
                 ).fetchone() is None
                 and not self._has_fts_trash(cursor)
                 and not self._fts_external_index_empty_with_messages(cursor)
-                # #25 (session metadata FTS): "fully optimized" also requires
-                # the session Unicode index to be external-content AND settled
-                # (no pending session H/P rebuild claim). A pre-#25 DB whose
-                # sessions_fts is still internal-content, or one mid-backfill,
-                # must not be stamped at the current layout version.
-                and not self._db_has_internal_content_sessions_fts(cursor)
-                and cursor.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_session_rebuild_high_water' LIMIT 1"
-                ).fetchone() is None
             ):
                 self.set_meta(
                     "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor

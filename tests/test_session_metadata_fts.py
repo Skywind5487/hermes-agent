@@ -409,6 +409,20 @@ class TestUnicodeExternalContent:
         compact = " ".join(sql.split())
         assert "AFTER UPDATE OF title, id, display_name" in compact
 
+    def test_list_sessions_rich_search_covers_display_name(self, db):
+        """The production session listing's search_query lane matches the raw
+        display_name dimension (issue #25), not only title / logical id."""
+        db.create_session("s1", source="cli")
+        db._conn.execute(
+            "UPDATE sessions SET display_name = 'Team Zebra Display' "
+            "WHERE id = 's1'"
+        )
+        db._conn.commit()
+        rows = db.list_sessions_rich(
+            search_query="zebra", order_by_last_active=True
+        )
+        assert [r["id"] for r in rows] == ["s1"]
+
 
 # =========================================================================
 # Group C — crash/restart H/P bookkeeping

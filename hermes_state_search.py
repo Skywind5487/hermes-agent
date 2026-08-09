@@ -381,12 +381,6 @@ class SessionSearchMixin:
         """
         return self.fts_rebuild_step(spec=_FTS_SESSION_SPEC)
 
-    def _fts_session_rebuild_finish(self) -> None:
-        """Boundary sweep + clear the session markers (issue #25)."""
-        self._fts_rebuild_finish(spec=_FTS_SESSION_SPEC)
-        self._sessions_fts_available = True
-        logger.info("Session metadata FTS backfill complete — serving search.")
-
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
         with self._read_ctx() as conn:
@@ -660,6 +654,23 @@ class SessionSearchMixin:
             conn, _FTS_SESSION_SPEC, force=force
         )
 
+    def _repair_missing_progress(self, conn, spec: Dict[str, Any]) -> None:
+        """Repair an orphan high_water-without-progress for one rebuild spec.
+
+        Re-seeds P=0 so the chunk loop is not a no-op, resetting a partially
+        populated index to a known-empty surface first so the anti-join-free
+        chunk replay cannot duplicate rows. This is THE crash-safe recovery
+        rule, shared by the message and session metadata rebuilds (the #76832
+        seam) — session repairs must never re-implement it.
+        """
+        if not self._fts_index_known_empty(conn, spec["fts_table"]):
+            self._reset_fts_index_to_empty(conn, spec["reset_tables"])
+        conn.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '0') "
+            "ON CONFLICT(key) DO UPDATE SET value = '0'",
+            (spec["progress_key"],),
+        )
+
     def _repair_optimize_bookkeeping(
         self, spec: Optional[Dict[str, Any]] = None
     ) -> None:
@@ -696,15 +707,7 @@ class SessionSearchMixin:
                     (spec["progress_key"],),
                 ).fetchone()
                 if progress is None:
-                    if not self._fts_index_known_empty(
-                        conn, spec["fts_table"]
-                    ):
-                        self._reset_fts_index_to_empty(conn, spec["reset_tables"])
-                    conn.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '0') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '0'",
-                        (spec["progress_key"],),
-                    )
+                    self._repair_missing_progress(conn, spec)
                 return
 
             # No markers. On a still-legacy DB demote owns marker creation.
@@ -722,10 +725,11 @@ class SessionSearchMixin:
 
     def _repair_session_fts_bookkeeping(self) -> None:
         """Heal interrupted session Unicode metadata backfill bookkeeping
-        (#25). Mirrors ``_repair_optimize_bookkeeping`` on the session marker
-        pair, reusing the same crash-safe rule: never infer P=0 over a
-        maybe-partial index; either recover a proven boundary or reset the
-        derived index to a known-empty surface first.
+        (#25). Reuses ``_repair_missing_progress`` (the shared crash-safe
+        rule) for the orphan high_water-without-progress case, and its own
+        orphan claim-seeding for a fresh external index over a populated DB
+        that lost its markers. Never re-implements the reset-before-replay
+        rule.
         """
         def _do(conn):
             existing_hw = conn.execute(
@@ -738,13 +742,7 @@ class SessionSearchMixin:
                     "WHERE key = 'fts_session_rebuild_progress'"
                 ).fetchone()
                 if progress is None:
-                    if not self._fts_index_known_empty(conn, "sessions_fts"):
-                        self._reset_fts_index_to_empty(conn, ("sessions_fts",))
-                    conn.execute(
-                        "INSERT INTO state_meta (key, value) VALUES "
-                        "('fts_session_rebuild_progress', '0') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '0'"
-                    )
+                    self._repair_missing_progress(conn, _FTS_SESSION_SPEC)
                 return
             # No claim: a freshly-created external index over a populated DB
             # that lost its markers, or a crash window after schema ensure
