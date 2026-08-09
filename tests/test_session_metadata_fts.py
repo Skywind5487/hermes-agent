@@ -236,6 +236,21 @@ def _build_legacy_message_and_session_fts_db(db_path):
     conn.close()
 
 
+def _build_legacy_empty_session_fts_db(db_path):
+    """Legacy DB with ZERO sessions: old INTERNAL title-only sessions_fts +
+    broad triggers over a legacy sessions table (no named row_id, no rows).
+    Opening it must convert sessions_fts to external WITHOUT staging an
+    H=0/P=0 claim that would leave optimize permanently pending."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    conn.execute("DROP TABLE sessions")
+    conn.executescript(_LEGACY_SESSIONS_DDL)
+    conn.executescript(_LEGACY_SESSIONS_FTS_DDL)
+    conn.commit()
+    conn.close()
+
+
 # =========================================================================
 # Group A — named row_id migration (preserve exact legacy storage identity)
 # =========================================================================
@@ -891,6 +906,46 @@ class TestBoundedGapSearch:
         finally:
             r.close()
 
+    def test_gap_supplement_multi_token_query_no_hide(self, tmp_path):
+        """A multi-token FTS query (implicit AND) must not hide a gap row:
+        'Alpha middle Project' MATCHes 'Alpha Project' once indexed (both
+        tokens present), so the gap supplement must find it too — the old
+        whole-string substring test ('alpha project' in 'alpha middle
+        project' → False) would hide it until backfill."""
+        r = _three_region_db(tmp_path)  # A(1)/B(3) indexed, C(7) in gap
+        try:
+            # A's default title is already 'Alpha Project' (indexed, <= P).
+            r.set_session_title("C", "Alpha middle Project")  # gap row
+            # Indexed lane: A matches the two-token implicit-AND query.
+            assert _raw_metadata_match_ids(r, "Alpha Project") == ["A"]
+            # Gap supplement must ALSO surface C (not hide it mid-migration).
+            hits = _metadata_search_ids(r, "Alpha Project")
+            assert "A" in hits and "C" in hits
+            # After the backfill completes, C is findable via the index.
+            while r.fts_session_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            assert "C" in _raw_metadata_match_ids(r, "Alpha Project")
+        finally:
+            r.close()
+
+    def test_gap_supplement_or_query_no_hide(self, tmp_path):
+        """A boolean OR query must not hide a gap row: the indexed lane
+        matches title='Alpha' for MATCH 'alpha OR beta', so the gap
+        supplement must surface it too. The supplement extracts positive
+        terms from the query ('alpha', 'beta') and matches ANY of them —
+        the old whole-string substring test ('alpha or beta' in 'alpha')
+        would hide the row until backfill."""
+        r = _gap_db(tmp_path)  # H=8, P=0: every row is in the gap
+        try:
+            r.set_session_title("C", "Alpha")  # row 7 in gap
+            # Nothing is indexed yet (P=0): the raw index has no hits.
+            assert _raw_metadata_match_ids(r, "alpha OR beta") == []
+            # The gap supplement surfaces C via the 'alpha' term.
+            assert "C" in _metadata_search_ids(r, "alpha OR beta")
+        finally:
+            r.close()
+
     def test_resolve_title_prefers_newer_gap_continuation(self, tmp_path):
         """resolve_session_by_title must resume the LATEST continuation even
         when the newer one is still in the (P,H] gap and the older one is
@@ -1115,3 +1170,34 @@ class TestLegacyMessageFTSUpgradePath:
             _assert_sessions_fts_integrity(r)
         finally:
             r.close()
+
+    def test_empty_legacy_db_leaves_no_zombie_hp_markers(self, tmp_path):
+        """An old INTERNAL sessions_fts on a legacy DB with ZERO sessions
+        must not leave a permanent H=0/P=0 claim after conversion to
+        external: with 0 rows the index is complete by construction, so no
+        markers should be staged, optimize must settle (not
+        backfill_incomplete), and a reopen must stay clean."""
+        db_path = tmp_path / "legacy-empty.db"
+        _build_legacy_empty_session_fts_db(db_path)
+
+        r = SessionDB(db_path=db_path)
+        try:
+            # sessions_fts converted to the #25 external Unicode shape.
+            assert "content='sessions'" in _fts_sql(r._conn, "sessions_fts")
+            # No zombie H/P pair (0 sessions = complete by construction).
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            assert r.get_meta("fts_session_rebuild_progress") is None
+            # optimize settles — not permanently pending.
+            result = r.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True, result
+            assert r.fts_optimize_available() is False
+        finally:
+            r.close()
+
+        # Reopen stays clean (markers do not reappear).
+        r2 = SessionDB(db_path=db_path)
+        try:
+            assert r2.get_meta("fts_session_rebuild_high_water") is None
+            assert r2.fts_optimize_available() is False
+        finally:
+            r2.close()

@@ -166,6 +166,33 @@ def _fts_unicode61_fold(text: Optional[str]) -> str:
     return stripped.casefold()
 
 
+def _fts_query_positive_terms(raw_query: str) -> List[str]:
+    """Conservative lexical terms for the #25 gap supplement's FTS-superset test.
+
+    The gap lane cannot parse FTS5's full query syntax (implicit AND,
+    OR/NOT, quoted phrases, prefix ``*``). Instead it extracts the words any
+    positive FTS5 match would have to contain and treats each as an
+    independent candidate trigger: ANY term in ANY metadata field → include.
+    This is deliberately a SUPERSET of the FTS predicate — over-matching is
+    accepted (the backfilled index restores exact semantics), but a MISS is
+    not: a session that MATCHes once backfilled must never be hidden while
+    it sits in the ``(P, H]`` gap.
+    """
+    # Drop FTS5 boolean operators, then split on anything that is not a
+    # letter/digit (close enough to unicode61 tokenization for a conservative
+    # superset). Trailing '*' prefix markers fold into the term itself
+    # (substring containment covers prefix matching).
+    cleaned = re.sub(
+        r"\b(?:AND|OR|NOT|NEAR)\b", " ", raw_query, flags=re.IGNORECASE
+    )
+    terms: List[str] = []
+    for token in re.split(r"[^\w]+", cleaned, flags=re.UNICODE):
+        folded = _fts_unicode61_fold(token.rstrip("*"))
+        if folded:
+            terms.append(folded)
+    return terms
+
+
 def _scrub_surrogates(value: Any) -> Any:
     """Replace lone surrogates when *value* is text; pass anything else through.
 
@@ -2459,17 +2486,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # ONE write transaction; the external schema ensure runs after
             # (it uses executescript, which issues an implicit COMMIT).
             def _stage(conn):
-                hw = conn.execute(
+                hw = int(conn.execute(
                     "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
-                ).fetchone()[0]
-                for k, v in (
-                    ("fts_session_rebuild_high_water", str(hw)),
-                    ("fts_session_rebuild_progress", "0"),
-                ):
+                ).fetchone()[0])
+                if hw > 0:
+                    # Historical rows to backfill: stage the durable H/P
+                    # claim (an empty external index is never served as
+                    # complete — the #76832 invariant).
+                    for k, v in (
+                        ("fts_session_rebuild_high_water", str(hw)),
+                        ("fts_session_rebuild_progress", "0"),
+                    ):
+                        conn.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (k, v),
+                        )
+                else:
+                    # Zero sessions: the index is complete by construction, so
+                    # no claim is needed. Also clear any stale markers left by
+                    # an earlier interrupted open — an H=0/P=0 pair would
+                    # never enter the rebuild (status total <= 0 → None) and
+                    # would leave optimize permanently pending as
+                    # ``backfill_incomplete``.
                     conn.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        (k, v),
+                        "DELETE FROM state_meta WHERE key IN "
+                        "('fts_session_rebuild_high_water', "
+                        "'fts_session_rebuild_progress')"
                     )
                 for trig in (
                     "sessions_fts_insert",
@@ -5707,17 +5750,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         The gap supplement folds values with ``_fts_unicode61_fold`` — a
         conservative Unicode approximation of the unicode61 rules (case fold
-        + diacritic removal, NOT exact parity) — so ``MATCH 'ecole'`` finds
-        ``École`` in the gap as it does in the index, while accepting the
-        loose side (a temporary extra candidate) for multi-diacritic
-        codepoints. SQLite's ``LOWER()`` only folds ASCII and would make a
-        gap row vanish/reappear across the backfill boundary.
+        + diacritic removal, NOT exact parity) — and matches on ANY positive
+        FTS term extracted from the query (see ``_fts_query_positive_terms``),
+        so both ``MATCH 'ecole'`` and a multi-token query such as
+        ``MATCH 'Alpha Project'`` (implicit AND) or ``alpha OR beta`` find
+        their gap rows exactly as the indexed lane would. The predicate is
+        deliberately a SUPERSET of the FTS semantics: it can over-match
+        (accepted — the backfilled index restores exact semantics) but never
+        misses a session the index would match, so a gap row cannot
+        vanish/reappear across the backfill boundary. SQLite's ``LOWER()``
+        only folds ASCII and would make a gap row disappear.
         """
         sanitized = self._sanitize_fts5_query(raw_query)
         if not sanitized:
             return True, []
-        needle = _fts_unicode61_fold(raw_query)
         gap = self._session_fts_rebuild_gap()
+        # Conservative FTS-superset terms for the gap supplement: the gap
+        # cannot parse FTS5's query syntax, so it matches ANY positive term
+        # in ANY field (over-match is accepted; a miss is not — a session
+        # the indexed lane matches must never hide while in (P, H]).
+        terms = _fts_query_positive_terms(raw_query)
         fts_ok = True
         by_row_id: Dict[int, Dict[str, Any]] = {}
 
@@ -5750,7 +5802,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 logging.debug(
                     "sessions_fts MATCH failed for %r", sanitized, exc_info=True,
                 )
-            if gap is not None:
+            if gap is not None and terms:
                 progress, high_water = gap
                 gap_rows = conn.execute(
                     "SELECT id, title, display_name, started_at, row_id "
@@ -5759,10 +5811,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (progress, high_water),
                 ).fetchall()
                 for c in gap_rows:
-                    if (
-                        needle in _fts_unicode61_fold(c["title"])
-                        or needle in _fts_unicode61_fold(c["id"])
-                        or needle in _fts_unicode61_fold(c["display_name"])
+                    if any(
+                        term in _fts_unicode61_fold(field)
+                        for term in terms
+                        for field in (c["title"], c["id"], c["display_name"])
                     ):
                         by_row_id.setdefault(c["row_id"], _candidate(c))
         # Global merge ordering, not lane-then-gap: resolve_session_by_title
