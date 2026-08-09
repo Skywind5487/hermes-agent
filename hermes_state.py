@@ -68,11 +68,13 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     SCHEMA_SQL,
     SCHEMA_VERSION,
     SESSIONS_FTS_SQL,
+    SESSIONS_FTS_TRIGRAM_SQL,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+    compact_session_metadata_text,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -249,6 +251,17 @@ def _split_fts_sql_statements(ddl: str) -> List[str]:
 # three gated triggers), executed individually inside the crash-atomic
 # transition's BEGIN IMMEDIATE.
 _SESSIONS_FTS_STATEMENTS = _split_fts_sql_statements(SESSIONS_FTS_SQL)
+
+# The #30 sessions_fts_trigram DDL split into its six statements (derived
+# VIEW + external trigram table + four gated triggers), executed individually
+# inside the crash-atomic transition's BEGIN IMMEDIATE.
+_SESSIONS_FTS_TRIGRAM_STATEMENTS = _split_fts_sql_statements(
+    SESSIONS_FTS_TRIGRAM_SQL
+)
+# The derived VIEW statement alone — ensured ahead of any claim seed because
+# ``_seed_fts_rebuild_markers`` reads ``MAX(row_id)`` through the spec's
+# ``source_table`` (the VIEW), which must already exist.
+_SESSIONS_FTS_TRIGRAM_SRC_STATEMENT = _SESSIONS_FTS_TRIGRAM_STATEMENTS[0]
 
 
 def _scrub_surrogates(value: Any) -> Any:
@@ -2682,7 +2695,227 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._write_count = before
         return True
 
+    # ── #30 normalized external-content session trigram ─────────────────
+    # Modern ``sessions_fts_trigram`` (FTS5 ``tokenize='trigram'``
+    # external-content over the derived ``sessions_fts_trigram_src`` VIEW:
+    # compact title, raw id, compact display_name). Its own durable H/P pair
+    # (``fts_session_trigram_rebuild_high_water`` /
+    # ``fts_session_trigram_rebuild_progress``) drives the shared resumable
+    # chunk engine via ``_FTS_SESSION_TRIGRAM_SPEC`` — never shared with the
+    # Unicode lane's P (target-specific processed completeness).
+
+    @staticmethod
+    def _classify_sessions_fts_trigram(cursor) -> str:
+        """Classify the same-name ``sessions_fts_trigram`` object by schema
+        identity (stored ``sqlite_master.sql``), NEVER by table name alone.
+
+        Returns one of:
+
+        - ``"absent"`` — no such object (fresh install / never created).
+        - ``"legacy_simple"`` — the recognized historical Hermes shape
+          (FTS5 ``tokenize='simple'``, title-only, INTERNAL content). This is
+          the fork's pre-#30 ``SESSIONS_FTS_TRIGRAM_SQL``.
+        - ``"modern_trigram"`` — the #30 identity: FTS5 ``tokenize='trigram'``
+          + ``content='sessions_fts_trigram_src'`` +
+          ``content_rowid='row_id'`` + logical ``(title, id, display_name)``
+          shape. Runtime tokenizer capability is separate from schema
+          identity: a host without built-in trigram may still carry a modern
+          schema — unavailable there, not legacy.
+        - ``"unknown_same_name"`` — an unrecognized same-name object. Fail
+          closed / diagnostic; never blindly delete it.
+
+        ``cursor`` may be a Cursor or a Connection.
+        """
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sessions_fts_trigram'"
+        ).fetchone()
+        if row is None:
+            return "absent"
+        sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+        # Recognized historical Hermes shape: FTS5 + tokenize='simple',
+        # title-only internal content (no content=). Precise enough to not
+        # swallow an arbitrary same-name table.
+        if "tokenize='simple'" in sql and "content=" not in sql:
+            return "legacy_simple"
+        # Modern #30 identity (exact, not inferred from a bare 'trigram').
+        if (
+            "tokenize='trigram'" in sql
+            and "content='sessions_fts_trigram_src'" in sql
+            and "content_rowid='row_id'" in sql
+            and "title" in sql
+            and "display_name" in sql
+            and "id" in sql
+        ):
+            return "modern_trigram"
+        return "unknown_same_name"
+
+    def _demote_legacy_sessions_trigram_fts(self) -> None:
+        """Converge a recognized legacy ``sessions_fts_trigram(simple)`` to a
+        durable modern-trigram claim WITHOUT requiring the ``simple`` tokenizer.
+
+        The historical vtable's stored declaration is ``tokenize='simple'``;
+        on a runtime without ``simple`` even ``DROP TABLE`` raises
+        ``no such tokenizer: simple`` (the #34 disposable repro). The
+        demotion therefore never SELECTs or DROPs the vtable — it drops the
+        known legacy triggers, removes ONLY the recognized root vtable
+        declaration from ``sqlite_master`` via ``writable_schema``, renames
+        the orphaned shadows (now ordinary tables) into the shared
+        ``fts_v22_trash_`` namespace, and seeds the trigram H/P claim — all
+        in ONE ``BEGIN IMMEDIATE`` so a crash anywhere before the commit
+        leaves legacy intact and re-runnable.
+
+        Uses the same demote-before-empty-schema ordering principle as the
+        message-v22 seam: the durable claim is committed BEFORE the empty
+        modern trigram index can exist, so a crash between this commit and
+        the modern schema ensure re-ensures the schema with the claim already
+        durable — never an empty index + populated source + no claim orphan.
+        """
+        def _stage(conn):
+            for trig in (
+                "sessions_fts_trigram_insert",
+                "sessions_fts_trigram_delete",
+                "sessions_fts_trigram_update",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "DELETE FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'sessions_fts_trigram' "
+                "AND sql LIKE '%tokenize=''simple''%'"
+            )
+            conn.execute("PRAGMA writable_schema=RESET")
+            shadows = [
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name LIKE 'sessions_fts_trigram\\_%' ESCAPE '\\'"
+                ).fetchall()
+            ]
+            for sh in shadows:
+                conn.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
+            self._seed_session_trigram_fts_rebuild_markers(conn, force=True)
+        self._execute_write(_stage)
+        logger.warning(
+            "Demoted legacy sessions_fts_trigram(tokenize='simple') to the "
+            "modern external-content trigram representation (issue #30); "
+            "historical backfill staged with a durable high-water claim"
+        )
+
+    def _ensure_sessions_trigram_fts_schema(self, cursor) -> bool:
+        """Migrate / self-heal the session normalized trigram FTS surface (#30).
+
+        Classifies the same-name ``sessions_fts_trigram`` by schema identity:
+        a recognized legacy ``simple`` object is converged (demoted without
+        requiring the tokenizer) BEFORE the modern same-name object is
+        created; an unknown same-name object fails closed (never deleted,
+        capability off). On a fresh modern create over a populated DB the
+        durable H/P claim is committed BEFORE the empty index can look
+        complete (#76832 invariant), then the VIEW + external table + gated
+        triggers are ensured (crash-atomic with the trigger-owned-region
+        catch-up for the fresh-create path).
+
+        Returns True when the modern trigram index is available for search.
+        """
+        classification = self._classify_sessions_fts_trigram(cursor)
+        if classification == "unknown_same_name":
+            self._sessions_trigram_available = False
+            logger.warning(
+                "sessions_fts_trigram exists but is not a recognized Hermes "
+                "shape (issue #30) — leaving it untouched; normalized trigram "
+                "search unavailable for %s", self.db_path,
+            )
+            return False
+        # The derived VIEW must exist BEFORE any claim seed reads
+        # ``MAX(row_id)`` through it (the generic ``_seed_fts_rebuild_markers``
+        # uses the spec's ``source_table``). The VIEW is a non-persistent
+        # projection — creating it cannot masquerade as a complete index, so
+        # it is safe to ensure before the durable claim (the #76832 ordering
+        # only forbids the empty *index* appearing before the claim).
+        cursor.execute(_SESSIONS_FTS_TRIGRAM_SRC_STATEMENT)
+        if classification == "legacy_simple":
+            # Converge before creating the same-name modern object. The
+            # demotion commit leaves the root absent + durable trigram H/P.
+            self._demote_legacy_sessions_trigram_fts()
+            existing = False
+        else:
+            existing = bool(cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'sessions_fts_trigram'"
+            ).fetchone())
+
+        # Fresh-create path: stage the durable claim BEFORE the empty external
+        # table can exist. A crash between the claim commit and the schema
+        # ensure leaves markers without a table; reopen re-ensures the schema
+        # and finds the claim already durable.
+        if not existing and self.get_meta(
+            "fts_session_trigram_rebuild_high_water"
+        ) is None:
+            self._seed_session_trigram_fts_rebuild_markers(cursor)
+
+        # ── Crash-atomic schema + catch-up transition (#30) ────────
+        # Mirrors #25: on a fresh create the VIEW/table/trigger install AND the
+        # trigger-owned-region catch-up land in ONE BEGIN IMMEDIATE so a row
+        # committed in the trigger-free window is caught up and a crash
+        # mid-transition rolls back schema + catch-up together. On a reopen
+        # (existing modern table) the plain IF NOT EXISTS ensure suffices.
+        if not existing:
+            ok = self._fts_session_trigram_schema_transition(cursor)
+        else:
+            ok = self._ensure_fts_schema(
+                cursor, "sessions_fts_trigram", SESSIONS_FTS_TRIGRAM_SQL
+            )
+        if not ok:
+            self._sessions_trigram_available = False
+            return False
+        self._sessions_trigram_available = True
+        return True
+
+    def _fts_session_trigram_schema_transition(self, cursor) -> bool:
+        """Crash-atomic install of the #30 derived VIEW + modern trigram
+        schema + gated triggers AND the trigger-owned-region catch-up, in one
+        ``BEGIN IMMEDIATE``.
+
+        Statement-by-statement (``executescript``'s implicit COMMIT would
+        break the transaction). The catch-up reads the projected rows through
+        the VIEW with the same ``COALESCE(H, -1)`` / ``COALESCE(P, -1)``
+        ownership predicate and an anti-join so a window row committed in the
+        trigger-free window is never missed and never duplicated.
+        """
+        def _do(conn):
+            for stmt in _SESSIONS_FTS_TRIGRAM_STATEMENTS:
+                conn.execute(stmt)
+            conn.execute(
+                "INSERT INTO sessions_fts_trigram(rowid, title, id, display_name) "
+                "SELECT src.row_id, src.title, src.id, src.display_name "
+                "FROM sessions_fts_trigram_src src "
+                "WHERE (src.row_id > COALESCE("
+                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                "     WHERE key = 'fts_session_trigram_rebuild_high_water'), -1)"
+                "   OR src.row_id <= COALESCE("
+                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                "     WHERE key = 'fts_session_trigram_rebuild_progress'), -1))"
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM sessions_fts_trigram_docsize d "
+                "    WHERE d.id = src.row_id"
+                "  )"
+            )
+        before = self._write_count
+        try:
+            self._execute_write(_do)
+        except sqlite3.OperationalError as exc:
+            if self._is_fts5_unavailable_error(exc):
+                self._warn_fts5_unavailable(exc)
+                return False
+            if self._is_trigram_unavailable_error(exc):
+                self._warn_trigram_unavailable(exc)
+                return False
+            raise
+        finally:
+            self._write_count = before
+        return True
+
     def _ensure_fts_cjk_schema(self, cursor) -> None:
+
         """Create / repair / self-heal the CJK-bigram index surface.
 
         ``cursor`` may be a Cursor or a Connection (both expose execute /
@@ -5947,6 +6180,161 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Global merge ordering, not lane-then-gap: resolve_session_by_title
         # takes candidates[0] and must resume the LATEST continuation even
         # when the newer one is still in the gap.
+        return fts_ok, sorted(
+            by_row_id.values(), key=lambda c: c["started_at"], reverse=True
+        )
+
+    def _session_trigram_rebuild_gap(self) -> Optional[Tuple[int, int]]:
+        """Bounded unindexed session-trigram gap ``(progress, high_water]``.
+
+        During a #30 normalized trigram backfill, rows whose ``row_id`` falls
+        in ``(P, H]`` are not yet in the external-content trigram index.
+        Search must supplement them (same compact-title / compact-display /
+        raw-ID policy as the indexed lane) so no valid session is hidden
+        while the rebuild is pending. Returns ``(progress, high_water)`` or
+        ``None`` when no trigram rebuild is pending (normal operation).
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_trigram_rebuild_high_water'"
+            ).fetchone()
+            if row is None:
+                return None
+            high_water = int(row[0])
+            p = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_trigram_rebuild_progress'"
+            ).fetchone()
+            progress = int(p[0]) if p is not None else 0
+        if progress >= high_water:
+            return None
+        return progress, high_water
+
+    @staticmethod
+    def _trigram_match_needle(needle: str) -> str:
+        """Quote a needle as a safe FTS5 trigram phrase.
+
+        The trigram tokenizer performs substring matching on phrases of at
+        least 3 Unicode characters, case-insensitively. Quoting keeps
+        punctuation (e.g. a raw id like ``discord:thread-123``) from being
+        parsed as FTS5 operators (``:`` is the column-filter operator).
+        Embedded double quotes are doubled per FTS5 phrase rules.
+        """
+        return '"' + needle.replace('"', '""') + '"'
+
+    def _fts_session_trigram_candidates(
+        self, raw_query: str
+    ) -> Tuple[bool, List[Dict[str, Any]]]:
+        """Low-level normalized trigram candidate lane (issue #30) for #14.
+
+        Covers ``compact(title)``, RAW ``id``, and ``compact(display_name)``
+        via the modern external-content ``sessions_fts_trigram``. While the
+        #30 backfill is pending, the bounded historical gap ``(P, H]`` is
+        supplemented from canonical rows with the SAME compact/raw policy and
+        deduplicated by ``row_id``.
+
+        Returns ``(fts_ok, candidates)`` — ``fts_ok`` is False only when the
+        trigram MATCH lane itself failed (table unavailable / corrupt), so
+        #14's router can fall back instead of trusting a partial result;
+        zero hits is a valid no-match, NOT a failure. Candidates are dicts
+        (``id``, ``title``, ``display_name``, ``started_at``, ``row_id``)
+        merged from both lanes and sorted ``started_at DESC``.
+
+        Ownership: this helper does NOT decide the Unicode/CJK/trigram/LIKE
+        routing, the 0-result LIKE fallback, or the full listing
+        lineage/scoping projection — those remain #14/#28/#29. Trigram MATCH
+        cannot match substrings shorter than 3 Unicode characters; #14's
+        direct / 0-result bounded-LIKE fallback remains necessary.
+        """
+        needle = (raw_query or "").strip()
+        compact_needle = compact_session_metadata_text(needle)
+        if not needle:
+            return True, []
+        gap = self._session_trigram_rebuild_gap()
+        fts_ok = True
+        by_row_id: Dict[int, Dict[str, Any]] = {}
+
+        def _candidate(c) -> Dict[str, Any]:
+            return {
+                "id": c["id"],
+                "title": c["title"],
+                "display_name": c["display_name"],
+                "started_at": c["started_at"],
+                "row_id": c["row_id"],
+            }
+
+        with self._read_ctx() as conn:
+            try:
+                # Field-aware trigram MATCH: compact title/display needle (if
+                # any) plus the RAW id needle. Both are quoted phrases so
+                # punctuation is preserved (trigram does substring matching).
+                match_parts = []
+                if compact_needle:
+                    match_parts.append(
+                        f"title:{self._trigram_match_needle(compact_needle)}"
+                    )
+                    match_parts.append(
+                        f"display_name:{self._trigram_match_needle(compact_needle)}"
+                    )
+                match_parts.append(f"id:{self._trigram_match_needle(needle)}")
+                match_expr = " OR ".join(match_parts)
+                cursor = conn.execute(
+                    "SELECT s.id AS id, s.title, s.display_name, "
+                    "       s.started_at, s.row_id AS row_id "
+                    "FROM sessions_fts_trigram f "
+                    "JOIN sessions s ON s.row_id = f.rowid "
+                    "WHERE sessions_fts_trigram MATCH ? ",
+                    (match_expr,),
+                )
+                for c in cursor:
+                    by_row_id[c["row_id"]] = _candidate(c)
+            except sqlite3.OperationalError:
+                # Trigram lane unavailable/corrupt: signal failure so the #14
+                # router can fall back instead of trusting a partial result;
+                # the gap supplement below still runs.
+                fts_ok = False
+                logging.debug(
+                    "sessions_fts_trigram MATCH failed for %r",
+                    match_expr,
+                    exc_info=True,
+                )
+            if gap is not None:
+                progress, high_water = gap
+                gap_rows = conn.execute(
+                    "SELECT id, title, display_name, started_at, row_id "
+                    "FROM sessions "
+                    "WHERE row_id > ? AND row_id <= ? ",
+                    (progress, high_water),
+                ).fetchall()
+                # Case-insensitive like the trigram tokenizer's default:
+                # fold both sides before the substring test (the indexed lane
+                # folds at tokenization, so a case-sensitive Python test
+                # would let a gap row hide until backfilled).
+                compact_needle_folded = compact_needle.casefold()
+                needle_folded = needle.casefold()
+                for c in gap_rows:
+                    # Same policy as the indexed lane: compact title/display
+                    # needles and the raw id needle, on the COMPACTED field
+                    # values (the index stores compacted text, so matching
+                    # raw would miss once backfilled).
+                    if (
+                        compact_needle_folded
+                        and compact_needle_folded
+                        in compact_session_metadata_text(
+                            c["title"]
+                        ).casefold()
+                    ) or (
+                        compact_needle_folded
+                        and compact_needle_folded
+                        in compact_session_metadata_text(
+                            c["display_name"]
+                        ).casefold()
+                    ) or (
+                        needle_folded
+                        and needle_folded in (c["id"] or "").casefold()
+                    ):
+                        by_row_id.setdefault(c["row_id"], _candidate(c))
         return fts_ok, sorted(
             by_row_id.values(), key=lambda c: c["started_at"], reverse=True
         )

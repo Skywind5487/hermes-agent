@@ -76,6 +76,33 @@ _FTS_SESSION_SPEC = {
     "trigram_available": lambda self: False,
 }
 
+# #30 normalized session trigram rebuild: its OWN marker pair and descriptor.
+# ``P`` means target-specific processed completeness, so the trigram lane must
+# NEVER share the Unicode lane's ``fts_session_rebuild_*`` claim — either
+# target can be created / demoted / repaired / reset independently, and a
+# shared P would let one target's completion falsely assert the other's.
+# The source is the derived ``sessions_fts_trigram_src`` VIEW (compact title,
+# raw id, compact display_name) so the chunk worker and the finish sweep read
+# the same projection the live triggers do.
+_FTS_SESSION_TRIGRAM_SPEC = {
+    "name": "sessions_trigram",
+    "high_water_key": "fts_session_trigram_rebuild_high_water",
+    "progress_key": "fts_session_trigram_rebuild_progress",
+    "fts_table": "sessions_fts_trigram",
+    "fts_columns": ("title", "id", "display_name"),
+    "source_table": "sessions_fts_trigram_src",
+    "source_columns": ("title", "id", "display_name"),
+    "row_key": "row_id",
+    "trigram_fts": None,
+    "trigram_columns": (),
+    "trigram_where": None,
+    "reset_tables": ("sessions_fts_trigram",),
+    "available": lambda self: getattr(
+        self, "_sessions_trigram_available", False
+    ),
+    "trigram_available": lambda self: False,
+}
+
 
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
@@ -381,6 +408,22 @@ class SessionSearchMixin:
         """
         return self.fts_rebuild_step(spec=_FTS_SESSION_SPEC)
 
+    def fts_session_trigram_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Session normalized trigram metadata index backfill progress, or
+        None when none is pending (issue #30)."""
+        return self.fts_rebuild_status(spec=_FTS_SESSION_TRIGRAM_SPEC)
+
+    def fts_session_trigram_rebuild_step(self) -> bool:
+        """Backfill one chunk of the session normalized trigram index (#30).
+
+        True while work remains. Shares the crash-safe chunk claim / atomic
+        progress / finish rules with the message + Unicode session rebuilds —
+        only the source VIEW, row key, columns, and its OWN marker names
+        differ. No second scheduler, pacing loop, missing-progress algorithm,
+        or finish algorithm is introduced.
+        """
+        return self.fts_rebuild_step(spec=_FTS_SESSION_TRIGRAM_SPEC)
+
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
         with self._read_ctx() as conn:
@@ -654,6 +697,19 @@ class SessionSearchMixin:
             conn, _FTS_SESSION_SPEC, force=force
         )
 
+    def _seed_session_trigram_fts_rebuild_markers(
+        self, conn, *, force: bool = False
+    ) -> int:
+        """Session normalized trigram variant of ``_seed_fts_rebuild_markers``
+        (issue #30). Same empty-DB-is-complete rule on its OWN marker pair.
+        """
+        n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        if n == 0 and not force:
+            return 0
+        return self._seed_fts_rebuild_markers(
+            conn, _FTS_SESSION_TRIGRAM_SPEC, force=force
+        )
+
     def _repair_missing_progress(self, conn, spec: Dict[str, Any]) -> None:
         """Repair an orphan high_water-without-progress for one rebuild spec.
 
@@ -753,6 +809,38 @@ class SessionSearchMixin:
                 self._seed_session_fts_rebuild_markers(conn, force=True)
         self._execute_write(_do)
 
+    def _repair_session_trigram_fts_bookkeeping(self) -> None:
+        """Heal interrupted session normalized trigram backfill bookkeeping
+        (#30). Reuses ``_repair_missing_progress`` (the shared crash-safe
+        rule) for the orphan high_water-without-progress case, and its own
+        orphan claim-seeding for a fresh external index over a populated DB
+        that lost its markers. The trigram lane is INDEPENDENT of the Unicode
+        lane's markers — an orphan here is reset on this target only. Never
+        re-implements the reset-before-replay rule.
+        """
+        def _do(conn):
+            existing_hw = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_trigram_rebuild_high_water'"
+            ).fetchone()
+            if existing_hw is not None:
+                progress = conn.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key = 'fts_session_trigram_rebuild_progress'"
+                ).fetchone()
+                if progress is None:
+                    self._repair_missing_progress(
+                        conn, _FTS_SESSION_TRIGRAM_SPEC
+                    )
+                return
+            if self._fts_external_index_empty_with_source(
+                conn, "sessions_fts_trigram_src", "sessions_fts_trigram"
+            ):
+                self._seed_session_trigram_fts_rebuild_markers(
+                    conn, force=True
+                )
+        self._execute_write(_do)
+
     def fts_optimize_available(self) -> bool:
         """True when `optimize_fts_storage()` has work to do: either this DB
         is a legacy inline-FTS install that can be optimized to the v23
@@ -787,6 +875,13 @@ class SessionSearchMixin:
                 "WHERE key = 'fts_session_rebuild_high_water' LIMIT 1"
             ).fetchone():
                 return True
+            # Session normalized trigram rebuild pending (issue #30): its own
+            # durable H/P claim, independent of the Unicode lane.
+            if self._conn.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_session_trigram_rebuild_high_water' LIMIT 1"
+            ).fetchone():
+                return True
             # CJK-bigram index work — only offerable when THIS process can
             # tokenize: a pending backfill (markers set at creation on a
             # populated DB) or a stale index awaiting a from-scratch rebuild.
@@ -804,8 +899,17 @@ class SessionSearchMixin:
                 return True
             # Session orphan: external sessions_fts empty with sessions
             # present and no claim (crash window) — healable on re-run.
-            return self._fts_external_index_empty_with_source(
+            if self._fts_external_index_empty_with_source(
                 self._conn, "sessions", "sessions_fts"
+            ):
+                return True
+            # Trigram orphan: empty sessions_fts_trigram with the derived
+            # source populated and no trigram claim (crash window / lost
+            # markers) — healable on re-run. The trigram source is a VIEW so
+            # this probe also covers the not-yet-created table (absent → the
+            # ensure that follows creates it fresh over the claim).
+            return self._fts_external_index_empty_with_source(
+                self._conn, "sessions_fts_trigram_src", "sessions_fts_trigram"
             )
 
     def _demote_legacy_fts_to_trash(self) -> int:
@@ -904,6 +1008,9 @@ class SessionSearchMixin:
         self._repair_optimize_bookkeeping()
         # Same healing for the session Unicode metadata rebuild (issue #25).
         self._repair_session_fts_bookkeeping()
+        # Same healing for the session normalized trigram rebuild (#30) — its
+        # OWN markers, independent of the Unicode lane.
+        self._repair_session_trigram_fts_bookkeeping()
 
         # Only demote if we're actually still on the legacy shape. If a prior
         # run already demoted (markers/trash present), skip straight to
@@ -955,6 +1062,8 @@ class SessionSearchMixin:
                 st = self.fts_cjk_rebuild_status()
             if st is None:
                 st = self.fts_session_rebuild_status()
+            if st is None:
+                st = self.fts_session_trigram_rebuild_status()
             progress_cb({
                 "phase": phase,
                 "percent": st["percent"] if st else 100,
@@ -994,6 +1103,16 @@ class SessionSearchMixin:
                 _emit("backfill")
                 self._fts_rebuild_pause(time.monotonic() - _t0)
 
+        # Phase 1d: backfill the session normalized trigram index (issue #30)
+        # — same shared chunk engine and pacing, its own pending markers.
+        if self.fts_session_trigram_rebuild_status() is not None:
+            while True:
+                _t0 = time.monotonic()
+                if not self.fts_session_trigram_rebuild_step():
+                    break
+                _emit("backfill")
+                self._fts_rebuild_pause(time.monotonic() - _t0)
+
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
         _emit("teardown")
         while True:
@@ -1007,18 +1126,25 @@ class SessionSearchMixin:
         # still empty against a non-empty messages table. Pre-fix code could
         # tear down trash and settle after a no-op backfill when markers were
         # missing — permanent search-index loss for historical rows. Session
-        # markers / empty session index (issue #25) count as remaining work.
+        # markers / empty session index (issue #25) count as remaining work,
+        # as do the trigram lane's own markers / empty index (issue #30).
         with self._lock:
             still_pending = self._conn.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key IN ('fts_rebuild_high_water', "
-                "'fts_session_rebuild_high_water') LIMIT 1"
+                "'fts_session_rebuild_high_water', "
+                "'fts_session_trigram_rebuild_high_water') LIMIT 1"
             ).fetchone() is not None
             still_trash = self._has_fts_trash(self._conn)
             empty_index = (
                 self._fts_external_index_empty_with_messages(self._conn)
                 or self._fts_external_index_empty_with_source(
                     self._conn, "sessions", "sessions_fts"
+                )
+                or self._fts_external_index_empty_with_source(
+                    self._conn,
+                    "sessions_fts_trigram_src",
+                    "sessions_fts_trigram",
                 )
             )
         if still_pending or still_trash or empty_index:
