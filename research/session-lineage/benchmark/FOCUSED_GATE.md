@@ -105,6 +105,13 @@ python research/session-lineage/benchmark/run.py \
   --output-dir /tmp/hermes-lineage-20260809
 ```
 
+Full mode automatically performs a **35-second CPU precondition before timing**.
+This is deliberate: the production e2-micro previously showed an approximately
+28-second shared-core burst window followed by the sustained regime. Sleeping
+would not consume burst credits, so the runner uses CPU work and records what it
+did in `precondition.json`. This avoids accidentally comparing algorithms only
+inside the unusually fast burst state.
+
 Smoke first if desired:
 
 ```bash
@@ -112,6 +119,8 @@ python research/session-lineage/benchmark/run.py \
   --quick-focused-gate \
   --output-dir /tmp/hermes-lineage-smoke
 ```
+
+Quick smoke skips the CPU precondition and is **not acceptance timing**.
 
 The focused runner never opens production `state.db`.
 
@@ -121,15 +130,18 @@ Outputs:
 focused-vm-gate/
 ├── receipt.json
 ├── tests.txt
+├── precondition.json
 ├── focused_gate.csv
 ├── focused_budget.csv
 ├── fixed3_eqp.json
 └── suite_meta.json
 ```
 
-`receipt.json` records runtime/machine/git context. `focused_gate.csv` contains
-normal + historical compatibility performance. `focused_budget.csv` is safety
-only and must be interpreted separately.
+`receipt.json` records runtime/machine/git context. `precondition.json` records
+the CPU burn used to enter the intended sustained timing regime.
+`focused_gate.csv` contains normal + historical compatibility performance.
+`focused_budget.csv` is safety only and contains **only no-memo + Python memo**;
+TEMP/Fixed3 are references and are not repeatedly stressed across every `B` cell.
 
 ## How to decide after the VM run
 
