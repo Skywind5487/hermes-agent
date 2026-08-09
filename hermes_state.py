@@ -66,6 +66,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSIONS_FTS_SQL,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
@@ -2326,6 +2327,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # means a legacy shape that doesn't index tool metadata → optimize.
         return "tool_name" not in sql
 
+    @staticmethod
+    def _db_has_internal_content_sessions_fts(cursor: sqlite3.Cursor) -> bool:
+        """True when sessions_fts is the pre-#25 internal-content shape.
+
+        #25's sessions_fts is external-content over raw (title, id,
+        display_name). The pre-#25 shape stores its own copy (title-only).
+        Detected by the absence of ``content=`` in the stored CREATE.
+        Returns False when sessions_fts doesn't exist yet (fresh DB mid-init):
+        the ensure path creates the external shape directly.
+        """
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sessions_fts'"
+        ).fetchone()
+        if row is None:
+            return False
+        sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+        return "content=" not in sql
+
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
         if getattr(self, "_trigram_unavailable_warned", False):
@@ -2355,50 +2375,114 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
     @staticmethod
-    def _backfill_sessions_fts(
-        cursor,
-        *,
-        include_cjk: bool = True,
-    ) -> None:
-        """Backfill existing session titles into the sessions FTS5 tables.
+    def _backfill_sessions_fts_cjk(cursor) -> None:
+        """Backfill existing session titles into the legacy CJK table.
 
         ``cursor`` may be a Cursor or a Connection (both expose ``execute``).
-        The cjk table backfill runs in progressive batches with a short
-        breather so the gateway writer is not starved.
+        The Unicode sessions_fts is no longer backfilled here (issue #25): it
+        is external-content and rebuilt by the resumable H/P chunk engine
+        (``fts_session_rebuild_step``), with search supplementing the bounded
+        gap meanwhile. The cjk table stays internal-content and one-shot
+        backfilled (the CJK lifecycle is owned by #26); it runs in
+        progressive batches with a short breather so the gateway writer is
+        not starved.
         """
         conn = getattr(cursor, "connection", cursor)
-
-        # Main sessions_fts backfill (unicode61 — one shot).
         cursor.execute(
-            "INSERT OR IGNORE INTO sessions_fts(rowid, title) "
-            "SELECT _rowid_, COALESCE(title, '') FROM sessions WHERE title IS NOT NULL"
+            "SELECT _rowid_ FROM sessions WHERE title IS NOT NULL "
+            "AND _rowid_ NOT IN (SELECT rowid FROM sessions_fts_cjk)"
         )
-        conn.commit()
+        missing = [row[0] for row in cursor.fetchall()]
+        if missing:
+            batch_sizes = [500, 200, 100, 50]
+            remaining = list(missing)
+            while remaining:
+                bs = batch_sizes.pop(0) if batch_sizes else 50
+                batch = remaining[:bs]
+                remaining = remaining[bs:]
+                placeholders = ",".join("?" for _ in batch)
+                cursor.execute(
+                    f"INSERT OR IGNORE INTO sessions_fts_cjk(rowid, title) "
+                    f"SELECT _rowid_, COALESCE(title, '') FROM sessions "
+                    f"WHERE _rowid_ IN ({placeholders})",
+                    batch,
+                )
+                conn.commit()
+                if remaining:
+                    time.sleep(0.05)  # 50ms breather for gateway writer
 
-        # CJK sessions_fts_cjk backfill (cjk_unicode61) — progressive batches.
-        if include_cjk:
-            cursor.execute(
-                "SELECT _rowid_ FROM sessions WHERE title IS NOT NULL "
-                "AND _rowid_ NOT IN (SELECT rowid FROM sessions_fts_cjk)"
-            )
-            missing = [row[0] for row in cursor.fetchall()]
-            if missing:
-                batch_sizes = [500, 200, 100, 50]
-                remaining = list(missing)
-                while remaining:
-                    bs = batch_sizes.pop(0) if batch_sizes else 50
-                    batch = remaining[:bs]
-                    remaining = remaining[bs:]
-                    placeholders = ",".join("?" for _ in batch)
-                    cursor.execute(
-                        f"INSERT OR IGNORE INTO sessions_fts_cjk(rowid, title) "
-                        f"SELECT _rowid_, COALESCE(title, '') FROM sessions "
-                        f"WHERE _rowid_ IN ({placeholders})",
-                        batch,
+    def _ensure_sessions_fts_schema(self, cursor: sqlite3.Cursor) -> bool:
+        """Migrate / self-heal the session Unicode metadata FTS surface (#25).
+
+        Converts a pre-#25 internal-content ``sessions_fts`` to the external-
+        content shape over raw ``(title, id, display_name)`` keyed by named
+        ``sessions.row_id``. The durable H/P claim is committed BEFORE the
+        empty external index can look complete (the #76832 invariant), then
+        the external table + gated triggers are ensured. On a fresh external
+        table over a populated DB with no existing claim, seeds H/P so the
+        resumable chunk engine backfills historical rows — an empty external
+        index is never served as complete. On a DB with an existing claim
+        (crash between claim and schema ensure), just re-ensures the schema
+        and leaves progress untouched.
+
+        Returns True when sessions_fts is available for search.
+        """
+        if self._db_has_internal_content_sessions_fts(cursor):
+            # Staged conversion: claim + teardown of the old internal table in
+            # ONE write transaction; the external schema ensure runs after
+            # (it uses executescript, which issues an implicit COMMIT).
+            def _stage(conn):
+                hw = conn.execute(
+                    "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+                ).fetchone()[0]
+                for k, v in (
+                    ("fts_session_rebuild_high_water", str(hw)),
+                    ("fts_session_rebuild_progress", "0"),
+                ):
+                    conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (k, v),
                     )
-                    conn.commit()
-                    if remaining:
-                        time.sleep(0.05)  # 50ms breather for gateway writer
+                for trig in (
+                    "sessions_fts_insert",
+                    "sessions_fts_delete",
+                    "sessions_fts_update",
+                ):
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                for tbl in (
+                    "sessions_fts", "sessions_fts_data", "sessions_fts_idx",
+                    "sessions_fts_content", "sessions_fts_docsize",
+                    "sessions_fts_config",
+                ):
+                    conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+            self._execute_write(_stage)
+            logger.warning(
+                "Migrating sessions_fts to the external-content Unicode "
+                "metadata index (issue #25); historical backfill staged "
+                "with a durable high-water claim"
+            )
+
+        # Track whether the external table is being created NOW (fresh) vs
+        # already present (reopen). A fresh external table over a populated
+        # DB needs a durable H/P claim; an existing table's rows were either
+        # live-indexed by the triggers or are already covered by durable
+        # markers — seeding again would duplicate documents on the next
+        # backfill.
+        existing = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sessions_fts'"
+        ).fetchone())
+        ok = self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
+        if not ok:
+            self._sessions_fts_available = False
+            return False
+        # Seed the durable claim only when the external table was just
+        # created on a populated DB with no existing claim (a staged claim
+        # from a crash before schema ensure must survive untouched).
+        if not existing and self.get_meta("fts_session_rebuild_high_water") is None:
+            self._seed_session_fts_rebuild_markers(cursor)
+        return True
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
@@ -5541,8 +5625,112 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (f"{escaped} #%",),
             ))
 
+    def _session_fts_rebuild_gap(self) -> Optional[Tuple[int, int]]:
+        """Bounded unindexed session-metadata gap ``(progress, high_water]``.
+
+        During a #25 session metadata backfill, rows whose ``row_id`` falls in
+        ``(P, H]`` are not yet in the external-content index. Metadata search
+        must supplement them (raw substring over the gap) and merge with the
+        FTS candidates so no valid session is hidden while the rebuild is
+        pending. Returns ``(progress, high_water)`` or ``None`` when no
+        session rebuild is pending (normal operation).
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water'"
+            ).fetchone()
+            if row is None:
+                return None
+            high_water = int(row[0])
+            p = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_progress'"
+            ).fetchone()
+            progress = int(p[0]) if p is not None else 0
+        if progress >= high_water:
+            return None
+        return progress, high_water
+
+    def _fts_metadata_candidates(self, raw_query: str) -> List[Dict[str, Any]]:
+        """Raw Unicode session-metadata candidates matching ``raw_query``.
+
+        Covers title, logical session id, and display_name (issue #25) via the
+        external-content ``sessions_fts``. While the #25 backfill is pending,
+        the bounded historical gap ``(P, H]`` is supplemented from canonical
+        rows over the same raw-substring dimensions and deduplicated by
+        ``row_id``, so migration never silently hides matching sessions:
+        rows ``<= P`` are already indexed, rows ``> H`` are live-indexed, and
+        only ``(P, H]`` is supplemented.
+
+        Returns a list of dicts (``id``, ``title``, ``display_name``,
+        ``started_at``, ``row_id``). Raw Unicode only — no normalization
+        policy (normalized arbitrary infix is owned by #30).
+        """
+        sanitized = self._sanitize_fts5_query(raw_query)
+        if not sanitized:
+            return []
+        escaped = (
+            raw_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        needle = f"%{escaped}%"
+        gap = self._session_fts_rebuild_gap()
+        by_row_id: Dict[int, Dict[str, Any]] = {}
+
+        with self._read_ctx() as conn:
+            try:
+                cursor = conn.execute(
+                    "SELECT s.id AS id, s.title, s.display_name, "
+                    "       s.started_at, s.row_id AS row_id "
+                    "FROM sessions_fts f "
+                    "JOIN sessions s ON s.row_id = f.rowid "
+                    "WHERE sessions_fts MATCH ? "
+                    "ORDER BY s.started_at DESC",
+                    (sanitized,),
+                )
+                for c in cursor:
+                    by_row_id[c["row_id"]] = {
+                        "id": c["id"],
+                        "title": c["title"],
+                        "display_name": c["display_name"],
+                        "started_at": c["started_at"],
+                        "row_id": c["row_id"],
+                    }
+            except sqlite3.OperationalError:
+                # FTS lane unavailable for this query — the gap supplement
+                # below still runs; the rest falls back to the legacy LIKE
+                # lane where the caller provides one.
+                logging.debug(
+                    "sessions_fts MATCH failed for %r", sanitized, exc_info=True,
+                )
+            if gap is not None:
+                progress, high_water = gap
+                gap_rows = conn.execute(
+                    "SELECT id, title, display_name, started_at, row_id "
+                    "FROM sessions "
+                    "WHERE row_id > ? AND row_id <= ? "
+                    "AND (LOWER(COALESCE(title, '')) LIKE ? ESCAPE '\\' "
+                    "  OR LOWER(COALESCE(id, '')) LIKE ? ESCAPE '\\' "
+                    "  OR LOWER(COALESCE(display_name, '')) LIKE ? ESCAPE '\\') "
+                    "ORDER BY started_at DESC",
+                    (progress, high_water, needle, needle, needle),
+                ).fetchall()
+                for c in gap_rows:
+                    by_row_id.setdefault(c["row_id"], {
+                        "id": c["id"],
+                        "title": c["title"],
+                        "display_name": c["display_name"],
+                        "started_at": c["started_at"],
+                        "row_id": c["row_id"],
+                    })
+        return list(by_row_id.values())
+
     def _fts_numbered_variants(self, title: str) -> Optional[List[sqlite3.Row]]:
         """Find numbered continuation variants via FTS5 MATCH with CJK dispatch.
+
+        During a #25 session metadata rebuild the bounded ``(P, H]`` gap is
+        supplemented with a LIKE scan and merged with the FTS candidates, so
+        title resolution never returns incomplete results mid-backfill.
 
         Returns None to signal fallback to LIKE (e.g. FTS5 runtime error or
         the target table unavailable). Returns empty list when no matches.
@@ -5556,12 +5744,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not sanitized:
             return None
 
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
         with self._lock:
             try:
                 cursor = self._conn.execute(
                     f"SELECT s.id AS id, s.title, s.started_at "
                     f"FROM {fts_table} f "
-                    f"JOIN sessions s ON s._rowid_ = f.rowid "
+                    f"JOIN sessions s ON s.row_id = f.rowid "
                     f"WHERE {fts_table} MATCH ? "
                     f"ORDER BY s.started_at DESC",
                     (sanitized,),
@@ -5575,11 +5765,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return None
 
         # Post-filter: only keep sessions whose title starts with "{title} #N"
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        return [
+        filtered = [
             c for c in candidates
             if c["title"] and c["title"].startswith(f"{escaped} #")
         ]
+
+        # Bounded-gap supplement: rows in (P, H] are not in the index yet.
+        gap = self._session_fts_rebuild_gap()
+        if gap is not None:
+            progress, high_water = gap
+            with self._read_ctx() as conn:
+                gap_rows = conn.execute(
+                    "SELECT id, title, started_at FROM sessions "
+                    "WHERE title LIKE ? ESCAPE '\\' "
+                    "AND row_id > ? AND row_id <= ? "
+                    "ORDER BY started_at DESC",
+                    (f"{escaped} #%", progress, high_water),
+                ).fetchall()
+            gap_filtered = [
+                c for c in gap_rows
+                if c["title"] and c["title"].startswith(f"{escaped} #")
+            ]
+            by_id = {c["id"]: c for c in filtered}
+            for c in gap_filtered:
+                by_id.setdefault(c["id"], c)
+            # Re-sort the merged candidates so the latest continuation is
+            # first even when the gap rows joined after the FTS hits.
+            filtered = sorted(
+                by_id.values(), key=lambda c: c["started_at"], reverse=True
+            )
+
+        return filtered
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").

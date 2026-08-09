@@ -336,18 +336,31 @@ def _raw_metadata_match_ids(db, query):
     return [r["id"] for r in rows]
 
 
-def _three_region_db(tmp_path):
-    """SessionDB with rows 1..4 and H=4, P=2 → ``<=P``={1,2}, ``(P,H]``={3,4},
-    and (after a fresh insert) ``>H`` rows. Pre-seeds the external index by
-    re-opening a populated DB so rebuild markers exist."""
+def _gap_db(tmp_path):
+    """Populated DB with a staged #25 rebuild: the external sessions_fts was
+    freshly created on a populated DB, so the durable H/P claim exists and
+    every historical row falls in the (0, H] gap (nothing indexed yet)."""
     db_path = tmp_path / "s.db"
-    w = SessionDB(db_path=db_path)
-    for sid in ("A", "B", "C", "D"):
-        w.create_session(sid, source="cli")
-        w.set_session_title(sid, f"Title {sid}")
-    w.close()
-    r = SessionDB(db_path=db_path)
-    _set_session_rebuild_markers(r, 4, 2)
+    _build_legacy_sessions_db(db_path)  # sessions A(1), B(3), C(7), A-child(8)
+    r = SessionDB(db_path=db_path)      # stages markers H=8, P=0; empty index
+    return r
+
+
+def _three_region_db(tmp_path):
+    """SessionDB with a #25 rebuild staged so all three ownership regions are
+    represented: rows <= P are backfilled into FTS, rows (P,H] are the
+    unindexed gap, and newly created sessions are > H (live-indexed by the
+    triggers). Uses the real migration shape (fresh external table on a
+    populated DB), not a fresh-DB-then-create flow where every row would be
+    live-indexed."""
+    r = _gap_db(tmp_path)  # H=8, P=0, empty index
+    # Backfill the <= P prefix the way the chunk engine would.
+    r._conn.execute(
+        "INSERT INTO sessions_fts(rowid, title, id, display_name) "
+        "SELECT row_id, title, id, display_name FROM sessions "
+        "WHERE row_id <= 3"
+    )
+    r.set_meta("fts_session_rebuild_progress", "3")
     return r
 
 
@@ -404,14 +417,15 @@ class TestUnicodeExternalContent:
 
 class TestRebuildMarkers:
     def test_populated_db_stages_rebuild_markers(self, tmp_path):
-        """Opening a populated DB with an external sessions_fts must stage the
-        durable H/P rebuild claim (never serve an empty index as complete)."""
+        """Opening a populated DB whose external sessions_fts is freshly
+        created must stage the durable H/P rebuild claim (never serve an
+        empty index as complete). Sessions added after a table already exists
+        are live-indexed by the triggers and need no claim."""
         db_path = tmp_path / "s.db"
-        w = SessionDB(db_path=db_path)
-        w.create_session("A", source="cli")
-        w.create_session("B", source="cli")
-        w.create_session("C", source="cli")
-        w.close()
+        # Build a populated DB WITHOUT opening a SessionDB first, so no
+        # external sessions_fts exists yet — the open creates it and must
+        # stage the claim over the historical rows.
+        _build_legacy_sessions_db(db_path)
         r = SessionDB(db_path=db_path)
         try:
             assert r.get_meta("fts_session_rebuild_high_water") is not None
@@ -527,5 +541,101 @@ class TestTriggerOwnershipRegions:
             r.create_session("E", source="cli")  # row_id 5 > H
             r.set_session_title("E", "Fresh Live Title")
             assert _raw_metadata_match_ids(r, "fresh") == ["E"]
+        finally:
+            r.close()
+
+
+# =========================================================================
+# Group E — bounded-gap search supplementation + boundary finish
+# =========================================================================
+
+
+def _metadata_search_ids(db, query):
+    """Search session metadata through the raw Unicode lane + bounded (P,H]
+    supplement (issue #25). Returns logical session ids, deduplicated."""
+    return [c["id"] for c in db._fts_metadata_candidates(query)]
+
+
+class TestBoundedGapSearch:
+    def test_gap_session_searchable_via_bounded_supplement(self, tmp_path):
+        """A session whose row_id is in the unbackfilled (P,H] gap is still
+        found by raw metadata search through bounded supplementation."""
+        r = _three_region_db(tmp_path)
+        try:
+            # C (row 7) is in (P,H] = (3,8], so its title is NOT in FTS.
+            assert _raw_metadata_match_ids(r, "gamma") == []
+            # The bounded supplement must surface it.
+            assert _metadata_search_ids(r, "gamma") == ["C"]
+        finally:
+            r.close()
+
+    def test_gap_supplement_dedupes_with_fts_candidates(self, tmp_path):
+        """A session reachable through both the FTS lane and the supplemental
+        (P,H] route (a boundary-overlap row) is returned exactly once."""
+        r = _three_region_db(tmp_path)
+        try:
+            # B (row 3) is <= P so it is in FTS. Narrow P below B so the same
+            # row also falls in the gap — the boundary overlap case.
+            _set_session_rebuild_markers(r, 8, 1)  # gap = (1, 8]
+            hits = _metadata_search_ids(r, "beta")
+            assert hits == ["B"]
+            # A (row 1) stays <= P: it must NOT be re-scanned by the gap.
+            assert _metadata_search_ids(r, "alpha") == ["A"]
+        finally:
+            r.close()
+
+    def test_supplement_is_bounded_to_gap(self, tmp_path):
+        """The supplemental query must be bounded by ``row_id > P AND row_id
+        <= H`` — never an unbounded all-sessions migration scan."""
+        r = _three_region_db(tmp_path)
+        try:
+            r.create_session("E", source="cli")  # row 9 > H, live-indexed
+            r.set_session_title("E", "Live Term E")
+            # > H rows are in FTS (live trigger) — found without the gap.
+            assert _metadata_search_ids(r, "live") == ["E"]
+            gap = r._session_fts_rebuild_gap()
+            assert gap == (3, 8)
+        finally:
+            r.close()
+
+    def test_finish_repairs_missing_boundary_doc(self, tmp_path):
+        """Finish performs a narrow boundary sweep: a document missing near H
+        is re-inserted before the rebuild markers are cleared."""
+        r = _gap_db(tmp_path)  # H=8, P=0, empty index
+        try:
+            # Backfill everything by hand, then remove C's document to
+            # simulate a write that slipped at the boundary.
+            r._conn.execute(
+                "INSERT INTO sessions_fts(rowid, title, id, display_name) "
+                "SELECT row_id, title, id, display_name FROM sessions "
+                "WHERE row_id <= 8"
+            )
+            r.set_meta("fts_session_rebuild_progress", "8")
+            r._conn.execute(
+                "INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name) "
+                "SELECT 'delete', s.row_id, s.title, s.id, s.display_name "
+                "FROM sessions s WHERE s.id = 'C'"
+            )
+            r._conn.commit()
+            assert "C" not in _raw_metadata_match_ids(r, "gamma")
+            # A single step: no chunk to claim (P >= H), but the status check
+            # runs the finish boundary sweep before clearing the markers.
+            assert r.fts_session_rebuild_step() is False
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            assert _raw_metadata_match_ids(r, "gamma") == ["C"]
+        finally:
+            r.close()
+
+    def test_deleted_gap_row_not_resurrected_by_finish(self, tmp_path):
+        """A canonical row deleted inside (P,H] is simply absent: the boundary
+        sweep must not resurrect it."""
+        r = _gap_db(tmp_path)  # H=8, P=0, empty index
+        try:
+            r.delete_session("C")  # row 7 in gap
+            while r.fts_session_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            assert _metadata_search_ids(r, "gamma") == []
+            _assert_sessions_fts_integrity(r)
         finally:
             r.close()
