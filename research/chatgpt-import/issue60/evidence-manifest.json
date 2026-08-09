@@ -1,5 +1,10 @@
 {
   "issue": 60,
+  "interpretation_correction": {
+    "hermes_runtime_start": "2026-05-29",
+    "chatgpt_import_merge_date": "2026-06-16",
+    "note": "Legacy stage-2 keys/files containing the word 'prehermes' used the old, incorrect June-16 cutoff. Preserve their raw counts as extraction artifacts, but do not interpret May-29 through June-15 Hermes runtime rows as pre-Hermes. Issue #60 and README.md are the current source of truth."
+  },
   "canonical_db": {
     "path": "/home/skywind/hermes-recovery/runs/20260807-081043/state.recovered.patched.db",
     "sha256": "23cfa3c8adb94ed403058329ae7e252e1d4c4bc01ead76e22ac7d0ff99948104",
@@ -41,10 +46,11 @@
     "message_id": 188428,
     "sha256": "f17b63778823b1d738630405fb51120c79588ed1f048f1e570a5090580bd087d"
   },
-  "stage2_results": {
+  "stage2_results_raw_legacy_naming": {
     "chatgpt_export_sessions": 5447,
     "prehermes_exact_match_rows": 0,
     "anomaly_exact_match_rows": 0,
-    "verified_nonzero_crossmatch_sessions": 0
+    "verified_nonzero_crossmatch_sessions": 0,
+    "interpretation": "The zero exact-match result is still a valid raw observation for the rows selected by stage 2, but the old label 'prehermes' is not a valid temporal classification after the May-29 correction."
   }
 }
