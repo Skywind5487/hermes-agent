@@ -91,8 +91,12 @@ decompose + drop combining marks + casefold) instead of SQLite's ASCII-only
 (`_fts_query_positive_terms` — multi-token implicit AND, `OR`, quoted phrases,
 prefix `*`), so `MATCH 'ecole'` finds `École` in the gap and `MATCH 'Alpha
 Project'` finds a gap row titled `Alpha middle Project` exactly as the indexed
-lane would. Over-matching is accepted (the backfilled index restores exact
-semantics); a MISS is not. The fold is deliberately a conservative Unicode
+lane would. Terms split on unicode61's token-character set (Unicode letters
+and digits only), so the sanitizer-quoted `[._-]` punctuation is a separator
+too: `foo_bar` / `foo-bar` / `foo.bar` all yield the terms (`foo`, `bar`)
+exactly as the index tokenizes a `foo bar` document — a term that kept `_` as
+a literal would MISS a session the FTS lane finds. Over-matching is accepted
+(the backfilled index restores exact semantics); a MISS is not. The fold is deliberately a conservative Unicode
 approximation, NOT exact unicode61 parity (the real tokenizer folds per
 Unicode 6.1, strips Latin-script diacritics, and preserves single-codepoint
 multi-diacritic characters such as `ộ`), so the gap lane can produce a
@@ -132,8 +136,9 @@ lane instead of trusting a partial result.
   duplicate-title upgrade), raw Unicode external-content, H/P ownership
   regions, crash/restart, bounded-gap search (conservative Unicode-fold
   supplement + its explicit non-parity edge, multi-token implicit-AND and OR
-  no-hide regressions, cross-lane ordering), finish, delete probes that read
-  the index directly and a `rank=1` consistency check on completed indexes,
-  two real concurrent runners (thread + barrier), shared throttle, and a
+  no-hide regressions, sanitizer-quoted `[._-]` punctuation no-hide
+  regression, cross-lane ordering), finish, delete probes that read the index
+  directly and a `rank=1` consistency check on completed indexes, two real
+  concurrent runners (thread + barrier), shared throttle, and a
   legacy-message × old-session-FTS cross-layout upgrade path (one optimize
   settles both) plus the empty-legacy-DB no-zombie-marker path.
