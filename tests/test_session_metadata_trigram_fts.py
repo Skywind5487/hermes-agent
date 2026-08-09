@@ -628,6 +628,51 @@ class TestIndependentHPRebuild:
             r.close()
 
 
+class TestTokenizerAbsent:
+    def test_trigram_tokenizer_missing_clears_fresh_claim(self, tmp_path, monkeypatch):
+        """A host without the trigram tokenizer must not leave a durable
+        trigram claim that can never be fulfilled (criterion 10 reverse
+        invariant — the #26 CJK stale precedent). The fresh-create claim is
+        cleared when the schema transition fails on an incapable host, so
+        optimize never advertises permanently-pending trigram work; a later
+        capable reopen heals by re-seeding and backfilling."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=12)
+        # Simulate the tokenizer-absent outcome: the real transition catches
+        # ``no such tokenizer: trigram`` and returns False (fts5/trigram
+        # unavailable) — a capable transition failure path is never a False.
+        with monkeypatch.context() as m:
+            m.setattr(
+                SessionDB,
+                "_fts_session_trigram_schema_transition",
+                lambda self, cursor: False,
+            )
+            r = SessionDB(db_path=db_path)
+            try:
+                assert r._sessions_trigram_available is False
+                # No stuck claim — the fresh claim seeded before the
+                # transition was rolled back because it can never be
+                # fulfilled here.
+                assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+                assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+            finally:
+                r.close()
+
+        # Patch undone → a capable reopen heals: fresh-create re-seeds a real
+        # claim, and the chunk engine backfills to a complete index.
+        r2 = SessionDB(db_path=db_path)
+        try:
+            assert r2._sessions_trigram_available is True
+            assert r2.get_meta("fts_session_trigram_rebuild_high_water") is not None
+            while r2.fts_session_trigram_rebuild_step():
+                pass
+            assert r2.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert _trigram_docsize_count(r2) == 12
+            _assert_trigram_integrity(r2)
+        finally:
+            r2.close()
+
+
 # =========================================================================
 # Group E — legacy same-name convergence
 # =========================================================================

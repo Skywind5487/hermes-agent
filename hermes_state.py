@@ -78,7 +78,11 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
-from hermes_state_search import SessionSearchMixin
+from hermes_state_search import (
+    _FTS_SESSION_SPEC,
+    _FTS_SESSION_TRIGRAM_SPEC,
+    SessionSearchMixin,
+)
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -2644,39 +2648,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return True
 
     def _fts_session_schema_transition(self, cursor) -> bool:
-        """Crash-atomic install of the #25 external sessions_fts schema AND
-        the trigger-owned-region catch-up, in one ``BEGIN IMMEDIATE``.
+        """#25 Unicode session-metadata lane of the shared crash-atomic schema
+        transition — see ``_session_fts_schema_transition``."""
+        return self._session_fts_schema_transition(
+            cursor, _FTS_SESSION_SPEC, _SESSIONS_FTS_STATEMENTS
+        )
 
-        Executes the DDL statement-by-statement (CREATE VIRTUAL TABLE + the
-        three gated triggers) and then the catch-up INSERT inside a single
-        write transaction, so the whole transition is atomic: a writer that
-        committed in the trigger-free window (after the stage transaction
-        released the lock but before the triggers existed) is caught up; a
-        writer mid-transaction is blocked; a writer after COMMIT is
-        trigger-indexed; a crash mid-transition rolls everything back, and the
-        reopen re-runs the transition. The catch-up predicate uses
-        ``COALESCE(H, -1)`` / ``COALESCE(P, -1)`` so the no-marker (empty /
-        complete) case is covered too — with no markers every ``row_id > -1``
-        is trigger-owned, which also catches an empty DB's first window row.
-        DDL runs via individual ``execute`` (not ``executescript``, whose
-        implicit COMMIT would break the transaction).
+    def _session_fts_schema_transition(
+        self, cursor, spec, statements
+    ) -> bool:
+        """Crash-atomic install of a session-metadata external-content schema
+        AND the trigger-owned-region catch-up, in one ``BEGIN IMMEDIATE``.
+
+        Shared by the Unicode (#25) and normalized trigram (#30) session
+        metadata lanes — only the statement list, FTS table, source table,
+        and marker keys differ (carried by the rebuild spec).
+
+        Executes the DDL statement-by-statement (the source VIEW when the lane
+        has one, the CREATE VIRTUAL TABLE, and the gated triggers) and then the
+        catch-up INSERT inside a single write transaction, so the whole
+        transition is atomic: a writer that committed in the trigger-free
+        window (after the stage transaction released the lock but before the
+        triggers existed) is caught up; a writer mid-transaction is blocked; a
+        writer after COMMIT is trigger-indexed; a crash mid-transition rolls
+        everything back, and the reopen re-runs the transition. The catch-up
+        predicate uses ``COALESCE(H, -1)`` / ``COALESCE(P, -1)`` so the
+        no-marker (empty / complete) case is covered too — with no markers
+        every ``row_id > -1`` is trigger-owned, which also catches an empty
+        DB's first window row. DDL runs via individual ``execute`` (not
+        ``executescript``, whose implicit COMMIT would break the transaction).
         """
+        fts_table = spec["fts_table"]
+        source_table = spec["source_table"]
+        high_water_key = spec["high_water_key"]
+        progress_key = spec["progress_key"]
+
         def _do(conn):
-            for stmt in _SESSIONS_FTS_STATEMENTS:
+            for stmt in statements:
                 conn.execute(stmt)
             conn.execute(
-                "INSERT INTO sessions_fts(rowid, title, id, display_name) "
-                "SELECT s.row_id, s.title, s.id, s.display_name "
-                "FROM sessions s "
-                "WHERE (s.row_id > COALESCE("
-                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
-                "     WHERE key = 'fts_session_rebuild_high_water'), -1)"
-                "   OR s.row_id <= COALESCE("
-                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
-                "     WHERE key = 'fts_session_rebuild_progress'), -1))"
-                "  AND NOT EXISTS ("
-                "    SELECT 1 FROM sessions_fts_docsize d WHERE d.id = s.row_id"
-                "  )"
+                f"INSERT INTO {fts_table}(rowid, title, id, display_name) "
+                f"SELECT src.row_id, src.title, src.id, src.display_name "
+                f"FROM {source_table} src "
+                f"WHERE (src.row_id > COALESCE("
+                f"    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                f"     WHERE key = '{high_water_key}'), -1)"
+                f"   OR src.row_id <= COALESCE("
+                f"    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                f"     WHERE key = '{progress_key}'), -1))"
+                f"  AND NOT EXISTS ("
+                f"    SELECT 1 FROM {fts_table}_docsize d "
+                f"    WHERE d.id = src.row_id"
+                f"  )"
             )
         # Schema-init bookkeeping must not advance the routine-write merge
         # cadence (the write-path cadence test asserts exact boundaries).
@@ -2860,6 +2883,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (existing modern table) the plain IF NOT EXISTS ensure suffices.
         if not existing:
             ok = self._fts_session_trigram_schema_transition(cursor)
+            if not ok:
+                # The trigram tokenizer / FTS5 module is unavailable on this
+                # host, so the fresh claim seeded above can never be
+                # fulfilled. Clear it — otherwise optimize would advertise
+                # permanently-unfulfillable pending trigram work forever
+                # (criterion 10's reverse invariant; the #26 CJK stale
+                # precedent). A later capable reopen re-seeds and heals.
+                self._clear_session_trigram_rebuild_claim(cursor)
+                self._sessions_trigram_available = False
+                return False
         else:
             ok = self._ensure_fts_schema(
                 cursor, "sessions_fts_trigram", SESSIONS_FTS_TRIGRAM_SQL
@@ -2870,49 +2903,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._sessions_trigram_available = True
         return True
 
-    def _fts_session_trigram_schema_transition(self, cursor) -> bool:
-        """Crash-atomic install of the #30 derived VIEW + modern trigram
-        schema + gated triggers AND the trigger-owned-region catch-up, in one
-        ``BEGIN IMMEDIATE``.
+    def _clear_session_trigram_rebuild_claim(self, cursor) -> None:
+        """Drop the durable trigram H/P claim.
 
-        Statement-by-statement (``executescript``'s implicit COMMIT would
-        break the transaction). The catch-up reads the projected rows through
-        the VIEW with the same ``COALESCE(H, -1)`` / ``COALESCE(P, -1)``
-        ownership predicate and an anti-join so a window row committed in the
-        trigger-free window is never missed and never duplicated.
+        Used when the modern index cannot be built on this host (trigram
+        tokenizer / FTS5 module unavailable), so the claim seeded for the
+        fresh-create path could never be fulfilled. ``cursor`` may be a Cursor
+        or a Connection (both expose ``execute``).
         """
-        def _do(conn):
-            for stmt in _SESSIONS_FTS_TRIGRAM_STATEMENTS:
-                conn.execute(stmt)
-            conn.execute(
-                "INSERT INTO sessions_fts_trigram(rowid, title, id, display_name) "
-                "SELECT src.row_id, src.title, src.id, src.display_name "
-                "FROM sessions_fts_trigram_src src "
-                "WHERE (src.row_id > COALESCE("
-                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
-                "     WHERE key = 'fts_session_trigram_rebuild_high_water'), -1)"
-                "   OR src.row_id <= COALESCE("
-                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
-                "     WHERE key = 'fts_session_trigram_rebuild_progress'), -1))"
-                "  AND NOT EXISTS ("
-                "    SELECT 1 FROM sessions_fts_trigram_docsize d "
-                "    WHERE d.id = src.row_id"
-                "  )"
-            )
-        before = self._write_count
-        try:
-            self._execute_write(_do)
-        except sqlite3.OperationalError as exc:
-            if self._is_fts5_unavailable_error(exc):
-                self._warn_fts5_unavailable(exc)
-                return False
-            if self._is_trigram_unavailable_error(exc):
-                self._warn_trigram_unavailable(exc)
-                return False
-            raise
-        finally:
-            self._write_count = before
-        return True
+        cursor.execute(
+            "DELETE FROM state_meta WHERE key IN "
+            "('fts_session_trigram_rebuild_high_water', "
+            "'fts_session_trigram_rebuild_progress')"
+        )
+
+    def _fts_session_trigram_schema_transition(self, cursor) -> bool:
+        """#30 normalized-trigram session-metadata lane of the shared
+        crash-atomic schema transition — see ``_session_fts_schema_transition``."""
+        return self._session_fts_schema_transition(
+            cursor, _FTS_SESSION_TRIGRAM_SPEC, _SESSIONS_FTS_TRIGRAM_STATEMENTS
+        )
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
 

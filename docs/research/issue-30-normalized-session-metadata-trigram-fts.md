@@ -120,3 +120,33 @@ reopen → no marker recreation.
   pre-existing at the pinned base `e94f2630` (verified in a clean worktree);
   not introduced by #30.
 - `ruff check` on the five touched files — clean.
+
+## Review-fix round (2026-08-09)
+
+After the two-axis code review (posted on issue #30), implemented the
+relevant findings:
+
+1. **No-trigram host no longer leaves a stuck claim (Spec).** A host whose
+   SQLite build lacks the trigram tokenizer previously seeded the durable
+   H/P claim and then failed the crash-atomic transition — leaving
+   `fts_optimize_available()` permanently True and `optimize_fts_storage()`
+   permanently `backfill_incomplete`. `_ensure_sessions_trigram_fts_schema`
+   now clears the fresh claim when the fresh-create transition fails
+   (`_clear_session_trigram_rebuild_claim`); a later capable reopen re-seeds
+   and heals. Pinned by `test_trigram_tokenizer_missing_clears_fresh_claim`
+   (criterion 10's reverse invariant + criterion 13 tokenizer-absence
+   coverage).
+2. **De-duplicated the shared seams (Standards).** The crash-atomic schema
+   transition is now one spec-parameterized `_session_fts_schema_transition`
+   shared by the Unicode (#25) and trigram (#30) lanes (the per-lane
+   `_fts_session_schema_transition` / `_fts_session_trigram_schema_transition`
+   are thin wrappers). `_repair_session_fts_bookkeeping(spec)` and
+   `_seed_session_metadata_fts_rebuild_markers(conn, spec)` are likewise
+   parameterized, with the trigram lane delegating to them.
+3. **Removed the unused `_SESSIONS_FTS_TRIGRAM_TRIGGERS` constant (Standards
+   dead code).**
+
+Deferred as not-related (per the reviewer, #14 territory): the <3-char
+needle gap-supplement vs indexed-lane divergence — trigram MATCH cannot match
+substrings under 3 Unicode characters, and #14's bounded-LIKE fallback is the
+owner.

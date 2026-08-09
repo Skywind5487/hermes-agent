@@ -844,16 +844,6 @@ END;
 """
 
 
-# Modern #30 session-trigram triggers, in the order the crash-atomic schema
-# transition installs them.
-_SESSIONS_FTS_TRIGRAM_TRIGGERS = (
-    "sessions_fts_trigram_insert",
-    "sessions_fts_trigram_delete",
-    "sessions_fts_trigram_update_before",
-    "sessions_fts_trigram_update_after",
-)
-
-
 # CJK title search — cjk_unicode61 loadable tokenizer, mirroring
 # messages_fts_cjk. Requires libfts5_cjk.so (native/fts5_cjk/build.sh);
 # callers gate table creation on the extension being loaded and fall back

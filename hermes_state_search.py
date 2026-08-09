@@ -681,19 +681,29 @@ class SessionSearchMixin:
             )
         return int(hw)
 
-    def _seed_session_fts_rebuild_markers(
-        self, conn, *, force: bool = False
+    def _seed_session_metadata_fts_rebuild_markers(
+        self, conn, spec: Dict[str, Any], *, force: bool = False
     ) -> int:
-        """Session Unicode metadata variant of ``_seed_fts_rebuild_markers``.
+        """Session-metadata variant of ``_seed_fts_rebuild_markers``.
 
         An empty DB is complete by construction (the triggers cover every
         future row) and must not carry a spurious claim that would make
-        ``fts_optimize_available`` advertise pending work forever.
+        ``fts_optimize_available`` advertise pending work forever. Shared by
+        the Unicode (#25) and normalized trigram (#30) session metadata lanes
+        so the empty-DB rule lives once — only the spec (marker keys, source
+        table, row key) differs.
         """
         n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
         if n == 0 and not force:
             return 0
-        return self._seed_fts_rebuild_markers(
+        return self._seed_fts_rebuild_markers(conn, spec, force=force)
+
+    def _seed_session_fts_rebuild_markers(
+        self, conn, *, force: bool = False
+    ) -> int:
+        """Session Unicode metadata variant of ``_seed_fts_rebuild_markers``
+        (issue #25)."""
+        return self._seed_session_metadata_fts_rebuild_markers(
             conn, _FTS_SESSION_SPEC, force=force
         )
 
@@ -701,12 +711,8 @@ class SessionSearchMixin:
         self, conn, *, force: bool = False
     ) -> int:
         """Session normalized trigram variant of ``_seed_fts_rebuild_markers``
-        (issue #30). Same empty-DB-is-complete rule on its OWN marker pair.
-        """
-        n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-        if n == 0 and not force:
-            return 0
-        return self._seed_fts_rebuild_markers(
+        (issue #30). Same empty-DB-is-complete rule on its OWN marker pair."""
+        return self._seed_session_metadata_fts_rebuild_markers(
             conn, _FTS_SESSION_TRIGRAM_SPEC, force=force
         )
 
@@ -779,67 +785,51 @@ class SessionSearchMixin:
                 self._seed_fts_rebuild_markers(conn, force=True)
         self._execute_write(_do)
 
-    def _repair_session_fts_bookkeeping(self) -> None:
-        """Heal interrupted session Unicode metadata backfill bookkeeping
-        (#25). Reuses ``_repair_missing_progress`` (the shared crash-safe
-        rule) for the orphan high_water-without-progress case, and its own
-        orphan claim-seeding for a fresh external index over a populated DB
-        that lost its markers. Never re-implements the reset-before-replay
-        rule.
+    def _repair_session_fts_bookkeeping(
+        self, spec: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Heal interrupted session-metadata backfill bookkeeping (#25 / #30).
+
+        Reuses ``_repair_missing_progress`` (the shared crash-safe rule) for
+        the orphan high_water-without-progress case, and its own orphan
+        claim-seeding for a fresh external index over a populated DB that
+        lost its markers. Never re-implements the reset-before-replay rule.
+        Parameterized by the rebuild spec so the Unicode (#25) and normalized
+        trigram (#30) session metadata lanes share one implementation — only
+        the marker keys and the source/index table names differ (the trigram
+        lane is INDEPENDENT of the Unicode lane's markers).
         """
+        spec = spec or _FTS_SESSION_SPEC
+
         def _do(conn):
             existing_hw = conn.execute(
-                "SELECT value FROM state_meta "
-                "WHERE key = 'fts_session_rebuild_high_water'"
+                "SELECT value FROM state_meta WHERE key = ?",
+                (spec["high_water_key"],),
             ).fetchone()
             if existing_hw is not None:
                 progress = conn.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_session_rebuild_progress'"
+                    "SELECT 1 FROM state_meta WHERE key = ?",
+                    (spec["progress_key"],),
                 ).fetchone()
                 if progress is None:
-                    self._repair_missing_progress(conn, _FTS_SESSION_SPEC)
+                    self._repair_missing_progress(conn, spec)
                 return
             # No claim: a freshly-created external index over a populated DB
             # that lost its markers, or a crash window after schema ensure
             # without a claim. Seed a full backfill (orphan recovery).
             if self._fts_external_index_empty_with_source(
-                conn, "sessions", "sessions_fts"
+                conn, spec["source_table"], spec["fts_table"]
             ):
-                self._seed_session_fts_rebuild_markers(conn, force=True)
+                self._seed_session_metadata_fts_rebuild_markers(
+                    conn, spec, force=True
+                )
         self._execute_write(_do)
 
     def _repair_session_trigram_fts_bookkeeping(self) -> None:
-        """Heal interrupted session normalized trigram backfill bookkeeping
-        (#30). Reuses ``_repair_missing_progress`` (the shared crash-safe
-        rule) for the orphan high_water-without-progress case, and its own
-        orphan claim-seeding for a fresh external index over a populated DB
-        that lost its markers. The trigram lane is INDEPENDENT of the Unicode
-        lane's markers — an orphan here is reset on this target only. Never
-        re-implements the reset-before-replay rule.
-        """
-        def _do(conn):
-            existing_hw = conn.execute(
-                "SELECT value FROM state_meta "
-                "WHERE key = 'fts_session_trigram_rebuild_high_water'"
-            ).fetchone()
-            if existing_hw is not None:
-                progress = conn.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_session_trigram_rebuild_progress'"
-                ).fetchone()
-                if progress is None:
-                    self._repair_missing_progress(
-                        conn, _FTS_SESSION_TRIGRAM_SPEC
-                    )
-                return
-            if self._fts_external_index_empty_with_source(
-                conn, "sessions_fts_trigram_src", "sessions_fts_trigram"
-            ):
-                self._seed_session_trigram_fts_rebuild_markers(
-                    conn, force=True
-                )
-        self._execute_write(_do)
+        """Session normalized trigram variant of
+        ``_repair_session_fts_bookkeeping`` (issue #30). Independent markers;
+        shares the crash-safe implementation."""
+        self._repair_session_fts_bookkeeping(_FTS_SESSION_TRIGRAM_SPEC)
 
     def fts_optimize_available(self) -> bool:
         """True when `optimize_fts_storage()` has work to do: either this DB
