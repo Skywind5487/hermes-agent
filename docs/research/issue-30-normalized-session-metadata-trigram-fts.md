@@ -150,3 +150,15 @@ Deferred as not-related (per the reviewer, #14 territory): the <3-char
 needle gap-supplement vs indexed-lane divergence — trigram MATCH cannot match
 substrings under 3 Unicode characters, and #14's bounded-LIKE fallback is the
 owner.
+
+### Round-2 polish (2026-08-09)
+
+Round-2 review found no hard violations. Applied the judgement-call polish:
+consolidated the duplicated `if not ok:` epilogue in
+`_ensure_sessions_trigram_fts_schema` (one `available=False` / `return False`
+path; the fresh-claim clear is now gated inside it); the shared
+`_session_fts_schema_transition` now builds its catch-up column list from
+`spec["fts_columns"]` / `spec["source_columns"]` (no hardcoded column names)
+and carries type hints. The seed's empty-DB guard deliberately still counts
+`FROM sessions` (a canonical-table question, not a lane projection);
+`COUNT(*)` from the trigram VIEW would add a VIEW-missing risk for no benefit.

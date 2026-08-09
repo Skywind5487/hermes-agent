@@ -2655,14 +2655,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
     def _session_fts_schema_transition(
-        self, cursor, spec, statements
+        self,
+        cursor,
+        spec: Dict[str, Any],
+        statements: List[str],
     ) -> bool:
         """Crash-atomic install of a session-metadata external-content schema
         AND the trigger-owned-region catch-up, in one ``BEGIN IMMEDIATE``.
 
         Shared by the Unicode (#25) and normalized trigram (#30) session
-        metadata lanes — only the statement list, FTS table, source table,
-        and marker keys differ (carried by the rebuild spec).
+        metadata lanes — the statement list, FTS table, source table, column
+        projection, and marker keys all come from the rebuild spec.
 
         Executes the DDL statement-by-statement (the source VIEW when the lane
         has one, the CREATE VIRTUAL TABLE, and the gated triggers) and then the
@@ -2682,13 +2685,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         source_table = spec["source_table"]
         high_water_key = spec["high_water_key"]
         progress_key = spec["progress_key"]
+        fts_cols = ", ".join(spec["fts_columns"])
+        src_cols = ", ".join(f"src.{c}" for c in spec["source_columns"])
 
         def _do(conn):
             for stmt in statements:
                 conn.execute(stmt)
             conn.execute(
-                f"INSERT INTO {fts_table}(rowid, title, id, display_name) "
-                f"SELECT src.row_id, src.title, src.id, src.display_name "
+                f"INSERT INTO {fts_table}(rowid, {fts_cols}) "
+                f"SELECT src.row_id, {src_cols} "
                 f"FROM {source_table} src "
                 f"WHERE (src.row_id > COALESCE("
                 f"    (SELECT CAST(value AS INTEGER) FROM state_meta "
@@ -2883,7 +2888,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (existing modern table) the plain IF NOT EXISTS ensure suffices.
         if not existing:
             ok = self._fts_session_trigram_schema_transition(cursor)
-            if not ok:
+        else:
+            ok = self._ensure_fts_schema(
+                cursor, "sessions_fts_trigram", SESSIONS_FTS_TRIGRAM_SQL
+            )
+        if not ok:
+            if not existing:
                 # The trigram tokenizer / FTS5 module is unavailable on this
                 # host, so the fresh claim seeded above can never be
                 # fulfilled. Clear it — otherwise optimize would advertise
@@ -2891,13 +2901,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # (criterion 10's reverse invariant; the #26 CJK stale
                 # precedent). A later capable reopen re-seeds and heals.
                 self._clear_session_trigram_rebuild_claim(cursor)
-                self._sessions_trigram_available = False
-                return False
-        else:
-            ok = self._ensure_fts_schema(
-                cursor, "sessions_fts_trigram", SESSIONS_FTS_TRIGRAM_SQL
-            )
-        if not ok:
             self._sessions_trigram_available = False
             return False
         self._sessions_trigram_available = True
