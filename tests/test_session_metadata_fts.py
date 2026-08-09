@@ -15,7 +15,12 @@ import time
 
 import pytest
 
-from hermes_state import SCHEMA_SQL, SessionDB
+from hermes_state import (
+    LEGACY_FTS_SQL,
+    SCHEMA_SQL,
+    SessionDB,
+    _fts_unicode61_fold,
+)
 
 
 @pytest.fixture()
@@ -107,6 +112,30 @@ CREATE TABLE sessions (
 """
 
 
+# The pre-#25 sessions_fts shape (base/dev): INTERNAL-content, title-only,
+# unicode61, maintained by three broad triggers keyed by the hidden rowid.
+# (#25 replaces this with the external-content Unicode metadata index.)
+_LEGACY_SESSIONS_FTS_DDL = """
+CREATE VIRTUAL TABLE sessions_fts USING fts5(
+    title,
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER sessions_fts_insert AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
+END;
+
+CREATE TRIGGER sessions_fts_delete AFTER DELETE ON sessions BEGIN
+    DELETE FROM sessions_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER sessions_fts_update AFTER UPDATE ON sessions BEGIN
+    DELETE FROM sessions_fts WHERE rowid = old.rowid;
+    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
+END;
+"""
+
+
 def _build_legacy_sessions_db(db_path):
     """Build a pre-#25 DB by hand: sessions WITHOUT ``row_id`` (``id TEXT
     PRIMARY KEY``), with explicit hidden rowids that contain deleted-row
@@ -150,6 +179,59 @@ def _build_legacy_sessions_db(db_path):
         (t0 + 3,),
     )
 
+    conn.commit()
+    conn.close()
+
+
+def _build_legacy_message_and_session_fts_db(db_path):
+    """Build the real pre-#25 CROSS-LAYOUT DB the #25 upgrade path must
+    handle: legacy v22 INLINE messages_fts + old INTERNAL title-only
+    sessions_fts + broad session triggers + legacy sessions (no named
+    row_id) with historical rows.
+
+    Opening the new SessionDB on this must (a) migrate sessions to named
+    row_id (DROP TABLE sessions — which SQLite uses to delete the old
+    sessions_fts triggers too), (b) STILL convert sessions_fts to the
+    external Unicode shape + recreate the gated triggers + stage the H/P
+    claim even though the legacy-message branch is taken, and (c) settle
+    BOTH message and session migration in a single optimize_fts_storage()
+    call with no reopen.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    # Demote sessions to the pre-#25 shape (no named row_id).
+    conn.execute("DROP TABLE sessions")
+    conn.executescript(_LEGACY_SESSIONS_DDL)
+    # Historical sessions with deleted-row holes in hidden rowids.
+    t0 = time.time()
+    for rowid, sid, title in (
+        (1, "A", "Alpha Project"),
+        (3, "B", "Beta Project"),
+        (7, "C", "Gamma Project"),
+    ):
+        conn.execute(
+            "INSERT INTO sessions (rowid, id, source, started_at, title) "
+            "VALUES (?, ?, 'cli', ?, ?)",
+            (rowid, sid, t0 + rowid, title),
+        )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) "
+        "VALUES ('A-child', 'cli', ?)",
+        (t0 + 8,),
+    )
+    # Legacy v22 inline messages_fts (+ triggers) over a couple of messages
+    # so the message optimize phase has real work to migrate.
+    conn.executescript(LEGACY_FTS_SQL)
+    conn.executemany(
+        "INSERT INTO messages (session_id, role, content, timestamp) "
+        "VALUES (?, 'user', ?, ?)",
+        [("A", "hello legacy world", t0), ("B", "second legacy note", t0 + 1)],
+    )
+    # Old INTERNAL title-only sessions_fts (+ broad triggers keyed by the
+    # hidden rowid) — the pre-#25 shape _ensure_sessions_fts_schema must
+    # detect and convert.
+    conn.executescript(_LEGACY_SESSIONS_FTS_DDL)
     conn.commit()
     conn.close()
 
@@ -771,11 +853,13 @@ class TestBoundedGapSearch:
             r.close()
 
     def test_gap_supplement_unicode_folding_matches_fts(self, tmp_path):
-        """The bounded-gap supplement folds with the same Unicode rules as the
-        unicode61 index (case fold + diacritic removal), so both 'ecole' and
-        'école' find a gap row titled 'École des Beaux-Arts' — a session must
-        not vanish while it sits in (P,H] just because it is not backfilled
-        yet (SQLite's ASCII-only LOWER() would hide it)."""
+        """The bounded-gap supplement folds with a conservative Unicode
+        approximation of the unicode61 rules (case fold + diacritic removal),
+        so both 'ecole' and 'école' find a gap row titled 'École des
+        Beaux-Arts' — a session must not vanish while it sits in (P,H] just
+        because it is not backfilled yet (SQLite's ASCII-only LOWER() would
+        hide it). The approximation is looser than exact tokenizer parity by
+        design (see test_gap_fold_is_conservative_not_exact_parity)."""
         r = _gap_db(tmp_path)  # H=8, P=0: every row is in the gap
         try:
             r.set_session_title("C", "École des Beaux-Arts")  # row 7 in gap
@@ -784,6 +868,26 @@ class TestBoundedGapSearch:
             # The Unicode-aware supplement finds it for both spellings.
             assert _metadata_search_ids(r, "ecole") == ["C"]
             assert _metadata_search_ids(r, "école") == ["C"]
+        finally:
+            r.close()
+
+    def test_gap_fold_is_conservative_not_exact_parity(self, tmp_path):
+        """The gap fold is a conservative approximation of unicode61, NOT a
+        parity mirror: it strips ALL combining marks across scripts and
+        casefolds, so a single-codepoint multi-diacritic character like 'ộ'
+        (U+1ED9) folds to 'o' — broader than the real tokenizer, which
+        preserves such characters under remove_diacritics=1. This temporary
+        false positive is accepted: the #25 gap lane exists to avoid MISSING
+        a migration result, not to exactly mirror the index."""
+        r = _gap_db(tmp_path)  # H=8, P=0: every row is in the gap
+        try:
+            # The helper itself is looser than the tokenizer would be.
+            assert _fts_unicode61_fold("ộ") == "o"
+            r.set_session_title("B", "Một ộ")  # row 3 in the gap
+            # The gap supplement surfaces B for 'o' — a candidate the
+            # authoritative tokenizer may not match once the row is
+            # backfilled. Over-matching is the accepted conservative side.
+            assert "B" in _metadata_search_ids(r, "o")
         finally:
             r.close()
 
@@ -936,5 +1040,78 @@ class TestConcurrencyAndThrottle:
             assert sleeps
             assert all(s >= r._FTS_REBUILD_MIN_PAUSE for s in sleeps)
             assert r.get_meta("fts_session_rebuild_high_water") is None
+        finally:
+            r.close()
+
+
+# =========================================================================
+# Group G — legacy-message-FTS × old-session-FTS cross-layout upgrade path
+# =========================================================================
+
+
+class TestLegacyMessageFTSUpgradePath:
+    def test_legacy_message_fts_does_not_block_session_fts_upgrade(
+        self, tmp_path
+    ):
+        """A legacy v22 INLINE messages_fts must NOT block the independent
+        sessions_fts upgrade (#25), and a single optimize must settle BOTH.
+
+        _migrate_sessions_row_id() rebuilds sessions via DROP TABLE, and
+        SQLite drops table triggers with the table — so the pre-#25
+        sessions_fts_* triggers are gone the moment the swap lands. The
+        sessions_fts ensure must therefore run for legacy-message DBs too
+        (not just the v23-message path), or the DB is left with the old
+        internal title-only index, no triggers, and no H/P claim.
+        """
+        db_path = tmp_path / "legacy-cross.db"
+        _build_legacy_message_and_session_fts_db(db_path)
+
+        r = SessionDB(db_path=db_path)
+        try:
+            # sessions migrated to named row_id (hidden-rowid holes kept).
+            assert _row_id_map(r._conn) == {
+                "A": 1, "B": 3, "C": 7, "A-child": 8,
+            }
+            # messages_fts is STILL the legacy inline shape — the #25 path
+            # must not have forced the message v23 migration (decoupled).
+            assert "tool_name" not in _fts_sql(r._conn, "messages_fts")
+            # sessions_fts was converted to the #25 external Unicode shape.
+            sql = _fts_sql(r._conn, "sessions_fts")
+            assert "content='sessions'" in sql
+            assert "content_rowid='row_id'" in sql
+            assert "tokenize='unicode61'" in sql
+            # Durable H/P claim staged over the historical rows.
+            assert r.get_meta("fts_session_rebuild_high_water") == "8"
+            assert r.get_meta("fts_session_rebuild_progress") == "0"
+            # All three gated session triggers exist (recreated, since the
+            # DROP TABLE swap removed the pre-#25 ones).
+            for trig in (
+                "sessions_fts_insert", "sessions_fts_delete",
+                "sessions_fts_update",
+            ):
+                assert r._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = ?", (trig,)
+                ).fetchone() is not None
+            # A session created after high-water capture is searchable
+            # immediately — live trigger maintenance works on this path.
+            r.create_session("E", source="cli")
+            r.set_session_title("E", "Fresh Post-Capture Title")
+            assert _raw_metadata_match_ids(r, "fresh") == ["E"]
+
+            # ONE optimize settles BOTH the legacy message migration AND the
+            # session backfill — no close/reopen + second optimize needed.
+            result = r.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True, result
+            assert r.fts_optimize_available() is False
+            assert r.get_meta("fts_rebuild_high_water") is None
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            # messages_fts is now v23 external (tool metadata indexed).
+            assert "tool_name" in _fts_sql(r._conn, "messages_fts")
+            # Historical sessions backfilled and searchable; index fully
+            # consistent (rank=1 cross-check).
+            assert _raw_metadata_match_ids(r, "alpha") == ["A"]
+            assert _raw_metadata_match_ids(r, "gamma") == ["C"]
+            _assert_sessions_fts_integrity(r)
         finally:
             r.close()

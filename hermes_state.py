@@ -141,18 +141,22 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
 
 
 def _fts_unicode61_fold(text: Optional[str]) -> str:
-    """Fold ``text`` the way FTS5's unicode61 tokenizer folds before indexing.
+    """Fold ``text`` for the #25 bounded-gap search supplement.
 
-    unicode61 applies Unicode case folding and, by default, removes diacritics
-    from Latin scripts, so ``École`` indexes as ``ecole`` and matches both
-    ``MATCH 'école'`` and ``MATCH 'ecole'``. The #25 bounded-gap supplement
-    must match the same queries the index does (otherwise a session searchable
-    at ``<= P`` silently vanishes while it sits in ``(P, H]``), so it folds
-    with the same rules instead of SQLite's ASCII-only ``LOWER()``.
+    The gap lane must match the same query forms the index does, otherwise a
+    session searchable at ``<= P`` silently vanishes while it sits in
+    ``(P, H]`` (SQLite's ASCII-only ``LOWER()`` would hide non-ASCII titles
+    such as ``École``).
 
-    This is a close approximation of SQLite's internal folding for Latin
-    scripts (NFKD-decompose, drop combining marks, casefold) — the gap lane is
-    a temporary migration fallback, not the authoritative index.
+    This is a CONSERVATIVE Unicode normalization APPROXIMATION of FTS5's
+    unicode61 tokenizer (NFKD-decompose, drop all combining marks, casefold),
+    deliberately more permissive than the real tokenizer — which folds per
+    Unicode 6.1, removes diacritics from Latin scripts only, and preserves
+    single-codepoint multi-diacritic characters such as ``ộ``. It is NOT a
+    parity mirror: it can produce a temporary false positive while a row sits
+    in the gap (found here, not matched after backfill). #25's core risk is
+    migration MISSING a result, so a looser gap lane is the safe direction;
+    the authoritative tokenizer governs once the row is backfilled.
     """
     text = text or ""
     decomposed = unicodedata.normalize("NFKD", text)
@@ -5701,11 +5705,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         concatenation). Raw Unicode only — no normalization policy
         (normalized arbitrary infix is owned by #30).
 
-        The gap supplement folds values with ``_fts_unicode61_fold`` — the
-        same case-fold + diacritic-removal the unicode61 tokenizer applies —
-        so ``MATCH 'ecole'`` finds ``École`` in the gap exactly as it does in
-        the index. SQLite's ``LOWER()`` only folds ASCII and would make a gap
-        row vanish/reappear across the backfill boundary.
+        The gap supplement folds values with ``_fts_unicode61_fold`` — a
+        conservative Unicode approximation of the unicode61 rules (case fold
+        + diacritic removal, NOT exact parity) — so ``MATCH 'ecole'`` finds
+        ``École`` in the gap as it does in the index, while accepting the
+        loose side (a temporary extra candidate) for multi-diacritic
+        codepoints. SQLite's ``LOWER()`` only folds ASCII and would make a
+        gap row vanish/reappear across the backfill boundary.
         """
         sanitized = self._sanitize_fts5_query(raw_query)
         if not sanitized:

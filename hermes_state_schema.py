@@ -1170,26 +1170,35 @@ class SessionSchemaMixin:
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)
 
-                # ── Sessions FTS5 (metadata search, issue #25) ──────────
-                # external-content Unicode over raw (title, id, display_name)
-                # keyed by named sessions.row_id, staged and crash-resumable.
-                # Startup no longer performs a blocking Unicode one-shot
-                # backfill: the external index is claimed with durable H/P
-                # markers and backfilled by the resumable chunk engine
-                # (fts_session_rebuild_step), with search supplementing the
-                # bounded gap meanwhile.
-                sessions_fts_ok = self._ensure_sessions_fts_schema(cursor)
-                self._sessions_fts_available = sessions_fts_ok
-                # CJK title table stays internal-content and one-shot
-                # backfilled (the CJK lifecycle is owned by #26).
-                sessions_cjk_ok = False
-                if sessions_fts_ok and self._fts_cjk_loaded:
-                    sessions_cjk_ok = self._ensure_fts_schema(
-                        cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL,
-                    )
-                self._sessions_cjk_available = sessions_cjk_ok
-                if sessions_cjk_ok:
-                    self._backfill_sessions_fts_cjk(cursor)
+            # ── Sessions FTS5 (metadata search, issue #25) ──────────
+            # external-content Unicode over raw (title, id, display_name)
+            # keyed by named sessions.row_id, staged and crash-resumable.
+            # Startup no longer performs a blocking Unicode one-shot
+            # backfill: the external index is claimed with durable H/P
+            # markers and backfilled by the resumable chunk engine
+            # (fts_session_rebuild_step), with search supplementing the
+            # bounded gap meanwhile.
+            #
+            # Deliberately runs for BOTH message-FTS layouts (legacy v22
+            # inline AND v23 external): whether messages_fts is still legacy
+            # is MESSAGE storage state and must not gate the independent
+            # sessions_fts upgrade (#25). _migrate_sessions_row_id() earlier
+            # DROP TABLE'd the old sessions (taking any pre-#25
+            # sessions_fts_* triggers with it), so the legacy-message path
+            # would otherwise strand the old internal title-only
+            # sessions_fts with no triggers and no H/P claim.
+            sessions_fts_ok = self._ensure_sessions_fts_schema(cursor)
+            self._sessions_fts_available = sessions_fts_ok
+            # CJK title table stays internal-content and one-shot
+            # backfilled (the CJK lifecycle is owned by #26).
+            sessions_cjk_ok = False
+            if sessions_fts_ok and self._fts_cjk_loaded:
+                sessions_cjk_ok = self._ensure_fts_schema(
+                    cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL,
+                )
+            self._sessions_cjk_available = sessions_cjk_ok
+            if sessions_cjk_ok:
+                self._backfill_sessions_fts_cjk(cursor)
 
             # Replace any pre-existing broad AFTER UPDATE triggers with
             # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
