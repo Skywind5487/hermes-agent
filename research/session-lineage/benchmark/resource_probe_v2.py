@@ -34,7 +34,7 @@ ALGORITHMS = [
 def read_kv_file(path):
     result = {}
     try:
-        for line in Path(path).read_text(errors="replace").splitlines():
+        for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
             parts = line.split()
             if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
                 result[parts[0].rstrip(":")] = int(parts[1])
@@ -54,7 +54,7 @@ def vmstat():
 
 def status_vmswap_kb():
     try:
-        for line in Path("/proc/self/status").read_text().splitlines():
+        for line in Path("/proc/self/status").read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("VmSwap:"):
                 return int(line.split()[1])
     except OSError:
@@ -68,7 +68,7 @@ def cgroup_cpu_stat():
 
 def proc_stat_steal_ticks():
     try:
-        line = Path("/proc/stat").read_text().splitlines()[0]
+        line = Path("/proc/stat").read_text(encoding="utf-8", errors="replace").splitlines()[0]
         parts = line.split()
         if parts and parts[0] == "cpu" and len(parts) > 8:
             return int(parts[8])
@@ -80,7 +80,7 @@ def proc_stat_steal_ticks():
 def self_schedstat():
     """Linux /proc/self/schedstat: CPU runtime ns, runqueue wait ns, timeslices."""
     try:
-        parts = Path("/proc/self/schedstat").read_text().split()
+        parts = Path("/proc/self/schedstat").read_text(encoding="utf-8", errors="replace").split()
         if len(parts) >= 3:
             return {
                 "runtime_ns": int(parts[0]),
