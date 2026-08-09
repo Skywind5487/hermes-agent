@@ -193,7 +193,8 @@ CREATE TABLE IF NOT EXISTS system_prompts (
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     source TEXT NOT NULL,
     user_id TEXT,
     session_key TEXT,
@@ -380,6 +381,106 @@ CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
 """
 
 
+# ── Sessions named row_id migration (#25) ──────────────────────────────
+# SQLite cannot ALTER a PRIMARY KEY, so giving ``sessions`` a named
+# ``row_id INTEGER PRIMARY KEY AUTOINCREMENT`` (the stable storage/document
+# identity the external-content ``sessions_fts`` needs) requires a full table
+# rebuild. The migration runs as ONE explicit BEGIN IMMEDIATE transaction:
+# create -> copy with the OLD hidden ``rowid`` copied verbatim into
+# ``row_id`` (an order-preserving copy is NOT enough — deleted-row holes must
+# be preserved exactly) -> verify count + ``{id: row_id}`` identity -> drop
+# old -> rename -> recreate indexes. Foreign keys stay OFF only outside that
+# transaction and are re-verified afterward. Do NOT use ``executescript()``
+# inside the swap — it issues an implicit COMMIT and defeats the transaction
+# boundary (see the donor-bug note in docs/research/issue-32-*.md).
+SESSION_TABLE_REBUILD_SQL = """
+CREATE TABLE sessions_new (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    system_prompt_hash TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    compression_failure_cooldown_until REAL,
+    compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+)
+"""
+
+
+# Indexes on ``sessions`` that DROP TABLE removes during the row_id swap and
+# the migration must recreate inside the same transaction (all IF NOT EXISTS
+# so the later SCHEMA_SQL / DEFERRED_INDEX_SQL passes no-op on them).
+#
+# ``idx_sessions_title_unique`` is deliberately NOT here: it is a UNIQUE index
+# and legacy DBs can carry duplicate titles (the existing post-migration
+# repair in ``_init_schema`` clears the older duplicates before creating it).
+# Rebuilding it inside the migration's transaction would raise
+# ``UNIQUE constraint failed`` and roll back the whole open for exactly the
+# legacy DBs the migration exists to upgrade — the migration must stay
+# reachable until that repair runs.
+SESSION_INDEX_SQL_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_session_key "
+    "ON sessions(session_key, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer ON sessions("
+    "source, user_id, chat_id, chat_type, thread_id, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state "
+    "ON sessions(handoff_state, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash "
+    "ON sessions(system_prompt_hash)",
+)
+
+
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──
 # While a background index rebuild is pending, two state_meta keys define
 # which message rows are currently IN the FTS indexes:
@@ -546,24 +647,66 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 # (which would create the external-content trigram source VIEW and leave the
 # DB in a mixed, broken state). `optimize_fts_storage()` is what migrates a
 # legacy DB to the v23 shape.
-# ── Sessions FTS5 — title search ────────────────────────────────────────
+# ── Sessions FTS5 — raw Unicode metadata search (v2 / issue #25) ────────
+# Same architecture as the v23 message FTS: metadata text is canonical ONLY
+# in ``sessions`` (read through the named ``row_id``), never duplicated in
+# FTS content shadow storage. The document is the RAW ``(title, id,
+# display_name)`` tuple — no title normalization, no synthetic concatenation
+# (normalized arbitrary-infix belongs to #30). A dedicated marker pair
+# (``fts_session_rebuild_high_water`` / ``fts_session_rebuild_progress``)
+# drives the resumable chunked backfill and gates every trigger on the same
+# indexed-row invariant as the message indexes: a row is safe to mutate in
+# FTS only when ``row_id <= P`` (already backfilled) or ``row_id > H``
+# (inserted after capture — AUTOINCREMENT guarantees new rows are always
+# > H). Rows in ``(P, H]`` are owned by the historical worker: triggers leave
+# them alone, and search supplements the bounded gap. The UPDATE trigger
+# fires only on title/id/display_name changes (AFTER UPDATE OF plus a
+# value-change guard) so token/accounting/heartbeat metadata writes never
+# rewrite the metadata index.
 SESSIONS_FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
     title,
+    id,
+    display_name,
+    content='sessions',
+    content_rowid='row_id',
     tokenize='unicode61'
 );
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions BEGIN
-    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
+CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
 END;
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions BEGIN
-    DELETE FROM sessions_fts WHERE rowid = old.rowid;
+CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
 END;
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_update AFTER UPDATE ON sessions BEGIN
-    DELETE FROM sessions_fts WHERE rowid = old.rowid;
-    INSERT INTO sessions_fts(rowid, title) VALUES (new.rowid, new.title);
+CREATE TRIGGER IF NOT EXISTS sessions_fts_update
+AFTER UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+    INSERT INTO sessions_fts(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
 END;
 """
 

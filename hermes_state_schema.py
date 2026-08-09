@@ -26,6 +26,8 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     SESSIONS_FTS_CJK_SQL,
     SESSIONS_FTS_SQL,
+    SESSION_INDEX_SQL_STATEMENTS,
+    SESSION_TABLE_REBUILD_SQL,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
 )
@@ -378,6 +380,142 @@ class SessionSchemaMixin:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    def _migrate_sessions_row_id(self, cursor: sqlite3.Cursor) -> None:
+        """Give ``sessions`` a named ``row_id INTEGER PRIMARY KEY`` (#25).
+
+        Session-metadata FTS is migrating to external-content backed by the
+        canonical ``sessions`` table, which needs a stable integer document
+        identity. SQLite cannot ALTER a PRIMARY KEY, so this rebuilds the
+        table with ``row_id INTEGER PRIMARY KEY AUTOINCREMENT`` while keeping
+        the text ``id`` as ``NOT NULL UNIQUE`` — the public/logical session
+        identity every SessionDB API, relationship, and
+        ``messages.session_id`` reference continues to use.
+
+        Idempotent: no-op when ``row_id`` already exists (fresh installs and
+        already-migrated DBs). Runs BEFORE ``_reconcile_columns`` (which must
+        not ALTER-ADD a PK column) and before any DML starts a transaction
+        (``PRAGMA foreign_keys`` can only toggle outside a transaction, and
+        the DROP TABLE swap requires FKs off).
+
+        The legacy hidden ``rowid`` value itself is copied into ``row_id``.
+        An order-preserving copy (``ORDER BY rowid`` + fresh AUTOINCREMENT
+        allocation) is NOT sufficient: deleted-row holes would be densified
+        (1=A, 3=B, 7=C must stay 1,3,7, not become 1,2,3). The whole
+        create/copy/verify/drop/rename/index-recreate swap is one explicit
+        BEGIN IMMEDIATE transaction, so an interrupted swap rolls back to the
+        intact legacy layout instead of stranding an empty replacement.
+        """
+        if getattr(self, "read_only", False):
+            return
+        try:
+            rows = cursor.execute('PRAGMA table_info("sessions")').fetchall()
+        except sqlite3.OperationalError:
+            return
+        names = {
+            (r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in rows
+        }
+        if "row_id" in names:
+            return
+
+        # Preflight pathological legacy rows before mutating anything: the
+        # new shape requires id NOT NULL UNIQUE, and we refuse to invent an
+        # ID for a row that never had one.
+        null_id = cursor.execute(
+            "SELECT COUNT(*) FROM sessions WHERE id IS NULL"
+        ).fetchone()
+        null_count = int(
+            null_id[0] if not isinstance(null_id, sqlite3.Row) else null_id[0]
+        )
+        if null_count > 0:
+            logger.error(
+                "Cannot migrate sessions to named row_id: %d row(s) have NULL "
+                "id; sessions table left unchanged", null_count,
+            )
+            raise sqlite3.IntegrityError(
+                "sessions.id contains NULL rows; cannot make id NOT NULL UNIQUE"
+            )
+
+        logger.warning(
+            "Migrating sessions table to named row_id (#25); one transactional "
+            "rebuild (preserves every logical id and exact numeric rowid)"
+        )
+        # Clear any transaction executescript may have left open so the
+        # PRAGMA foreign_keys toggle is legal (autocommit only).
+        try:
+            cursor.execute("COMMIT")
+        except sqlite3.OperationalError:
+            pass
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            # A donor-style interrupted attempt may have left a partial
+            # sessions_new behind; drop it inside the transaction.
+            cursor.execute("DROP TABLE IF EXISTS sessions_new")
+            cursor.execute(SESSION_TABLE_REBUILD_SQL)
+            new_cols = {
+                (r["name"] if isinstance(r, sqlite3.Row) else r[1])
+                for r in cursor.execute(
+                    'PRAGMA table_info("sessions_new")'
+                ).fetchall()
+            }
+            # Copy only columns the new table declares (guards against drift
+            # if an old table ever carries a stray extra column), copying the
+            # OLD hidden rowid explicitly into row_id.
+            shared = (names & new_cols) - {"row_id"}
+            cols_sql = ", ".join(f'"{c}"' for c in sorted(shared))
+            cursor.execute(
+                f"INSERT INTO sessions_new (row_id, {cols_sql}) "
+                f"SELECT rowid, {cols_sql} FROM sessions"
+            )
+            # Verify row count and exact {id: row_id} identity before the
+            # destructive drop — never commit a densified / lost-row swap.
+            old_count = cursor.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            new_count = cursor.execute(
+                "SELECT COUNT(*) FROM sessions_new"
+            ).fetchone()[0]
+            if old_count != new_count:
+                raise sqlite3.OperationalError(
+                    "sessions row_id migration row-count mismatch: "
+                    f"old={old_count} new={new_count}"
+                )
+            mismatch = cursor.execute(
+                "SELECT COUNT(*) FROM sessions s "
+                "LEFT JOIN sessions_new n "
+                "  ON n.id = s.id AND n.row_id = s.rowid "
+                "WHERE n.id IS NULL"
+            ).fetchone()[0]
+            if int(mismatch) > 0:
+                raise sqlite3.OperationalError(
+                    "sessions row_id migration failed {id: row_id} identity check"
+                )
+            cursor.execute("DROP TABLE sessions")
+            cursor.execute("ALTER TABLE sessions_new RENAME TO sessions")
+            # Recreate the sessions indexes DROP TABLE removed. All IF NOT
+            # EXISTS; the later SCHEMA_SQL / DEFERRED_INDEX_SQL passes no-op.
+            for stmt in SESSION_INDEX_SQL_STATEMENTS:
+                cursor.execute(stmt)
+            cursor.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                cursor.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            logger.exception(
+                "sessions row_id migration failed; sessions table left unchanged"
+            )
+            raise
+        finally:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        # FK integrity across every reference to sessions(id) after the swap.
+        fk_violations = cursor.execute("PRAGMA foreign_key_check").fetchall()
+        if fk_violations:
+            logger.error(
+                "sessions row_id migration left %d FK violation(s)",
+                len(fk_violations),
+            )
+
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``gateway_routing`` when its PRIMARY KEY predates scoping.
 
@@ -587,6 +725,14 @@ class SessionSchemaMixin:
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
+
+        # ── Named sessions.row_id migration (#25) ──────────────────────
+        # Give sessions a named INTEGER PRIMARY KEY storage identity before
+        # any reconciler runs: SQLite cannot ALTER a primary key, and
+        # _reconcile_columns must never ALTER-ADD a PK column. Detection-based
+        # and idempotent — fresh installs are already born with the new shape
+        # (SCHEMA_SQL), so this only rebuilds legacy tables.
+        self._migrate_sessions_row_id(cursor)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -1024,26 +1170,35 @@ class SessionSchemaMixin:
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)
 
-                # ── Sessions FTS5 (title search) ────────────────────────
-                # unicode61 table for non-CJK titles; cjk_unicode61 table
-                # for CJK titles, gated on the loadable tokenizer (LIKE
-                # fallback otherwise). Mirrors the messages FTS pattern.
-                sessions_fts_ok = self._ensure_fts_schema(
-                    cursor, "sessions_fts", SESSIONS_FTS_SQL,
+            # ── Sessions FTS5 (metadata search, issue #25) ──────────
+            # external-content Unicode over raw (title, id, display_name)
+            # keyed by named sessions.row_id, staged and crash-resumable.
+            # Startup no longer performs a blocking Unicode one-shot
+            # backfill: the external index is claimed with durable H/P
+            # markers and backfilled by the resumable chunk engine
+            # (fts_session_rebuild_step), with search supplementing the
+            # bounded gap meanwhile.
+            #
+            # Deliberately runs for BOTH message-FTS layouts (legacy v22
+            # inline AND v23 external): whether messages_fts is still legacy
+            # is MESSAGE storage state and must not gate the independent
+            # sessions_fts upgrade (#25). _migrate_sessions_row_id() earlier
+            # DROP TABLE'd the old sessions (taking any pre-#25
+            # sessions_fts_* triggers with it), so the legacy-message path
+            # would otherwise strand the old internal title-only
+            # sessions_fts with no triggers and no H/P claim.
+            sessions_fts_ok = self._ensure_sessions_fts_schema(cursor)
+            self._sessions_fts_available = sessions_fts_ok
+            # CJK title table stays internal-content and one-shot
+            # backfilled (the CJK lifecycle is owned by #26).
+            sessions_cjk_ok = False
+            if sessions_fts_ok and self._fts_cjk_loaded:
+                sessions_cjk_ok = self._ensure_fts_schema(
+                    cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL,
                 )
-                sessions_cjk_ok = False
-                if sessions_fts_ok and self._fts_cjk_loaded:
-                    sessions_cjk_ok = self._ensure_fts_schema(
-                        cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL,
-                    )
-                self._sessions_fts_available = sessions_fts_ok
-                self._sessions_cjk_available = sessions_cjk_ok
-                if sessions_fts_ok:
-                    # One-time backfill of pre-existing session titles.
-                    self._backfill_sessions_fts(
-                        cursor,
-                        include_cjk=sessions_cjk_ok,
-                    )
+            self._sessions_cjk_available = sessions_cjk_ok
+            if sessions_cjk_ok:
+                self._backfill_sessions_fts_cjk(cursor)
 
             # Replace any pre-existing broad AFTER UPDATE triggers with
             # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.

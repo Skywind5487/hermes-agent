@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -66,6 +67,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSIONS_FTS_SQL,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
@@ -136,6 +138,117 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     except (PermissionError, OSError, OverflowError):
         return False
     return False
+
+
+def _fts_unicode61_fold(text: Optional[str]) -> str:
+    """Fold ``text`` for the #25 bounded-gap search supplement.
+
+    The gap lane must match the same query forms the index does, otherwise a
+    session searchable at ``<= P`` silently vanishes while it sits in
+    ``(P, H]`` (SQLite's ASCII-only ``LOWER()`` would hide non-ASCII titles
+    such as ``École``).
+
+    This is a CONSERVATIVE Unicode normalization APPROXIMATION of FTS5's
+    unicode61 tokenizer (NFKD-decompose, drop all combining marks, casefold),
+    deliberately more permissive than the real tokenizer — which folds per
+    Unicode 6.1, removes diacritics from Latin scripts only, and preserves
+    single-codepoint multi-diacritic characters such as ``ộ``. It is NOT a
+    parity mirror: it can produce a temporary false positive while a row sits
+    in the gap (found here, not matched after backfill). #25's core risk is
+    migration MISSING a result, so a looser gap lane is the safe direction;
+    the authoritative tokenizer governs once the row is backfilled.
+    """
+    text = text or ""
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = "".join(
+        ch for ch in decomposed if unicodedata.category(ch) != "Mn"
+    )
+    return stripped.casefold()
+
+
+def _fts_query_positive_terms(raw_query: str) -> List[str]:
+    """Conservative lexical terms for the #25 gap supplement's FTS-superset test.
+
+    The gap lane cannot parse FTS5's full query syntax (implicit AND,
+    OR/NOT, quoted phrases, prefix ``*``). Instead it extracts the words any
+    positive FTS5 match would have to contain and treats each as an
+    independent candidate trigger: ANY term in ANY metadata field → include.
+    This is deliberately a SUPERSET of the FTS predicate — over-matching is
+    accepted (the backfilled index restores exact semantics), but a MISS is
+    not: a session that MATCHes once backfilled must never be hidden while
+    it sits in the ``(P, H]`` gap.
+
+    Tokenization deliberately does NOT mirror unicode61 exactly: SQLite's
+    unicode61 classifies characters per Unicode 6.1, while Python's
+    ``unicodedata`` reflects a different (newer) Unicode database — so
+    classifying non-ASCII by category here would risk a gap miss (e.g.
+    U+1018C is a token character in unicode61 but category ``So`` in Python).
+    The safe boundary is ASCII-only: unicode61 always treats ASCII
+    non-alphanumerics (whitespace, punctuation, and notably ``_``, which
+    Python's ``\\w`` wrongly keeps) as separators, and every non-ASCII
+    character is kept inside terms. The query sanitizer quotes ``[._-]``
+    terms as FTS phrases, but the index still tokenizes them the same way
+    (``"foo_bar"`` → phrase ``foo bar`` against a ``foo bar`` document), so
+    the gap must too: ``foo_bar`` / ``foo-bar`` / ``foo.bar`` all yield the
+    terms (``foo``, ``bar``). For a run containing non-ASCII, each ASCII
+    sub-run and each non-ASCII codepoint is additionally emitted, so a query
+    that unicode61 tokenizes more finely (a non-ASCII separator, CJK
+    per-codepoint) can never miss either. This can only over-match, never
+    miss.
+
+    Boolean operator WORDS are deliberately kept as terms. A quoted
+    ``"AND"`` is a literal FTS phrase — the sanitizer protects balanced
+    quotes — so stripping ``AND|OR|NOT|NEAR`` would empty the terms for that
+    query and hide an indexed-matched row from the gap. Because the predicate
+    is ANY-term, keeping them can only add false positives, never a false
+    negative.
+    """
+    # Safe separator boundary across Unicode versions: ASCII non-alphanumeric.
+    # Every non-ASCII character is kept — never excluded by Python's Unicode
+    # categories (SQLite's unicode61 uses Unicode 6.1, which differs).
+    cleaned = "".join(
+        " " if (ch.isascii() and not ch.isalnum()) else ch for ch in raw_query
+    )
+    terms: List[str] = []
+    seen: set = set()
+    for token in cleaned.split():
+        folded = _fts_unicode61_fold(token.rstrip("*"))
+        if folded and folded not in seen:
+            seen.add(folded)
+            terms.append(folded)
+        if any(ord(ch) >= 0x80 for ch in token):
+            # unicode61 may tokenize this run more finely (per-codepoint CJK,
+            # a non-ASCII separator, ...): emit the ASCII sub-runs and each
+            # non-ASCII codepoint so a finer tokenization can never miss.
+            for piece in re.split(r"[^\x00-\x7F]+", token):
+                f = _fts_unicode61_fold(piece)
+                if f and f not in seen:
+                    seen.add(f)
+                    terms.append(f)
+            for ch in token:
+                if ord(ch) >= 0x80:
+                    f = _fts_unicode61_fold(ch)
+                    if f and f not in seen:
+                        seen.add(f)
+                        terms.append(f)
+    return terms
+
+
+def _split_fts_sql_statements(ddl: str) -> List[str]:
+    """Split a fixed FTS DDL constant into individual statements.
+
+    Statements are separated by blank lines; trigger bodies contain
+    semicolons but no blank lines, so ``split("\n\n")`` is a safe boundary
+    for the module's fixed DDL constants (used by the crash-atomic transition,
+    which cannot use executescript's implicit COMMIT).
+    """
+    return [s.strip() for s in ddl.split("\n\n") if s.strip()]
+
+
+# The #25 sessions_fts DDL split into its four statements (external table +
+# three gated triggers), executed individually inside the crash-atomic
+# transition's BEGIN IMMEDIATE.
+_SESSIONS_FTS_STATEMENTS = _split_fts_sql_statements(SESSIONS_FTS_SQL)
 
 
 def _scrub_surrogates(value: Any) -> Any:
@@ -2326,6 +2439,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # means a legacy shape that doesn't index tool metadata → optimize.
         return "tool_name" not in sql
 
+    @staticmethod
+    def _db_has_internal_content_sessions_fts(cursor: sqlite3.Cursor) -> bool:
+        """True when sessions_fts is the pre-#25 internal-content shape.
+
+        #25's sessions_fts is external-content over raw (title, id,
+        display_name). The pre-#25 shape stores its own copy (title-only).
+        Detected by the absence of ``content=`` in the stored CREATE.
+        Returns False when sessions_fts doesn't exist yet (fresh DB mid-init):
+        the ensure path creates the external shape directly.
+        """
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sessions_fts'"
+        ).fetchone()
+        if row is None:
+            return False
+        sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+        return "content=" not in sql
+
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
         if getattr(self, "_trigram_unavailable_warned", False):
@@ -2355,50 +2487,200 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
     @staticmethod
-    def _backfill_sessions_fts(
-        cursor,
-        *,
-        include_cjk: bool = True,
-    ) -> None:
-        """Backfill existing session titles into the sessions FTS5 tables.
+    def _backfill_sessions_fts_cjk(cursor) -> None:
+        """Backfill existing session titles into the legacy CJK table.
 
         ``cursor`` may be a Cursor or a Connection (both expose ``execute``).
-        The cjk table backfill runs in progressive batches with a short
-        breather so the gateway writer is not starved.
+        The Unicode sessions_fts is no longer backfilled here (issue #25): it
+        is external-content and rebuilt by the resumable H/P chunk engine
+        (``fts_session_rebuild_step``), with search supplementing the bounded
+        gap meanwhile. The cjk table stays internal-content and one-shot
+        backfilled (the CJK lifecycle is owned by #26); it runs in
+        progressive batches with a short breather so the gateway writer is
+        not starved.
         """
         conn = getattr(cursor, "connection", cursor)
-
-        # Main sessions_fts backfill (unicode61 — one shot).
         cursor.execute(
-            "INSERT OR IGNORE INTO sessions_fts(rowid, title) "
-            "SELECT _rowid_, COALESCE(title, '') FROM sessions WHERE title IS NOT NULL"
+            "SELECT _rowid_ FROM sessions WHERE title IS NOT NULL "
+            "AND _rowid_ NOT IN (SELECT rowid FROM sessions_fts_cjk)"
         )
-        conn.commit()
+        missing = [row[0] for row in cursor.fetchall()]
+        if missing:
+            batch_sizes = [500, 200, 100, 50]
+            remaining = list(missing)
+            while remaining:
+                bs = batch_sizes.pop(0) if batch_sizes else 50
+                batch = remaining[:bs]
+                remaining = remaining[bs:]
+                placeholders = ",".join("?" for _ in batch)
+                cursor.execute(
+                    f"INSERT OR IGNORE INTO sessions_fts_cjk(rowid, title) "
+                    f"SELECT _rowid_, COALESCE(title, '') FROM sessions "
+                    f"WHERE _rowid_ IN ({placeholders})",
+                    batch,
+                )
+                conn.commit()
+                if remaining:
+                    time.sleep(0.05)  # 50ms breather for gateway writer
 
-        # CJK sessions_fts_cjk backfill (cjk_unicode61) — progressive batches.
-        if include_cjk:
-            cursor.execute(
-                "SELECT _rowid_ FROM sessions WHERE title IS NOT NULL "
-                "AND _rowid_ NOT IN (SELECT rowid FROM sessions_fts_cjk)"
-            )
-            missing = [row[0] for row in cursor.fetchall()]
-            if missing:
-                batch_sizes = [500, 200, 100, 50]
-                remaining = list(missing)
-                while remaining:
-                    bs = batch_sizes.pop(0) if batch_sizes else 50
-                    batch = remaining[:bs]
-                    remaining = remaining[bs:]
-                    placeholders = ",".join("?" for _ in batch)
-                    cursor.execute(
-                        f"INSERT OR IGNORE INTO sessions_fts_cjk(rowid, title) "
-                        f"SELECT _rowid_, COALESCE(title, '') FROM sessions "
-                        f"WHERE _rowid_ IN ({placeholders})",
-                        batch,
+    def _ensure_sessions_fts_schema(self, cursor: sqlite3.Cursor) -> bool:
+        """Migrate / self-heal the session Unicode metadata FTS surface (#25).
+
+        Converts a pre-#25 internal-content ``sessions_fts`` to the external-
+        content shape over raw ``(title, id, display_name)`` keyed by named
+        ``sessions.row_id``. The durable H/P claim is committed BEFORE the
+        empty external index can look complete (the #76832 invariant), then
+        the external table + gated triggers are ensured. On a fresh external
+        table over a populated DB with no existing claim, seeds H/P so the
+        resumable chunk engine backfills historical rows — an empty external
+        index is never served as complete. On a DB with an existing claim
+        (crash between claim and schema ensure), just re-ensures the schema
+        and leaves progress untouched.
+
+        Returns True when sessions_fts is available for search.
+        """
+        if self._db_has_internal_content_sessions_fts(cursor):
+            # Staged conversion: claim + teardown of the old internal table in
+            # ONE write transaction; the external schema ensure runs after
+            # (it uses executescript, which issues an implicit COMMIT).
+            def _stage(conn):
+                hw = int(conn.execute(
+                    "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+                ).fetchone()[0])
+                if hw > 0:
+                    # Historical rows to backfill: stage the durable H/P
+                    # claim (an empty external index is never served as
+                    # complete — the #76832 invariant).
+                    for k, v in (
+                        ("fts_session_rebuild_high_water", str(hw)),
+                        ("fts_session_rebuild_progress", "0"),
+                    ):
+                        conn.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (k, v),
+                        )
+                else:
+                    # Zero sessions: the index is complete by construction, so
+                    # no claim is needed. Also clear any stale markers left by
+                    # an earlier interrupted open — an H=0/P=0 pair would
+                    # never enter the rebuild (status total <= 0 → None) and
+                    # would leave optimize permanently pending as
+                    # ``backfill_incomplete``.
+                    conn.execute(
+                        "DELETE FROM state_meta WHERE key IN "
+                        "('fts_session_rebuild_high_water', "
+                        "'fts_session_rebuild_progress')"
                     )
-                    conn.commit()
-                    if remaining:
-                        time.sleep(0.05)  # 50ms breather for gateway writer
+                for trig in (
+                    "sessions_fts_insert",
+                    "sessions_fts_delete",
+                    "sessions_fts_update",
+                ):
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                for tbl in (
+                    "sessions_fts", "sessions_fts_data", "sessions_fts_idx",
+                    "sessions_fts_content", "sessions_fts_docsize",
+                    "sessions_fts_config",
+                ):
+                    conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+            self._execute_write(_stage)
+            logger.warning(
+                "Migrating sessions_fts to the external-content Unicode "
+                "metadata index (issue #25); historical backfill staged "
+                "with a durable high-water claim"
+            )
+
+        # Track whether the external table is being created NOW (fresh) vs
+        # already present (reopen). A fresh external table over a populated
+        # DB needs a durable H/P claim; an existing table's rows were either
+        # live-indexed by the triggers or are already covered by durable
+        # markers — seeding again would duplicate documents on the next
+        # backfill.
+        existing = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sessions_fts'"
+        ).fetchone())
+
+        # Fresh-create path: stage the durable claim BEFORE the empty external
+        # table can exist (the #76832 invariant). A crash between the claim
+        # commit and the schema ensure leaves markers without a table; reopen
+        # re-ensures the schema and finds the claim already durable — never an
+        # empty index + populated sessions + no claim orphan.
+        if not existing and self.get_meta("fts_session_rebuild_high_water") is None:
+            self._seed_session_fts_rebuild_markers(cursor)
+
+        # ── Crash-atomic schema + catch-up transition (#25) ────────
+        # The durable H capture + old-table teardown committed in the stage
+        # transaction above, so a concurrent writer can commit a session in
+        # the trigger-free window that follows. When the external table is
+        # being created NOW (internal→external conversion or fresh-create over
+        # a populated DB), schema install AND the trigger-owned-region catch-up
+        # must land in ONE BEGIN IMMEDIATE: a window row is caught up, a crash
+        # mid-transition rolls back schema + catch-up together (reopen re-runs
+        # it), and rows committing after the commit are trigger-indexed. When
+        # the table already exists (reopen), the plain IF NOT EXISTS ensure
+        # suffices — triggers are already durable, so no window.
+        if not existing:
+            ok = self._fts_session_schema_transition(cursor)
+        else:
+            ok = self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
+        if not ok:
+            self._sessions_fts_available = False
+            return False
+        return True
+
+    def _fts_session_schema_transition(self, cursor) -> bool:
+        """Crash-atomic install of the #25 external sessions_fts schema AND
+        the trigger-owned-region catch-up, in one ``BEGIN IMMEDIATE``.
+
+        Executes the DDL statement-by-statement (CREATE VIRTUAL TABLE + the
+        three gated triggers) and then the catch-up INSERT inside a single
+        write transaction, so the whole transition is atomic: a writer that
+        committed in the trigger-free window (after the stage transaction
+        released the lock but before the triggers existed) is caught up; a
+        writer mid-transaction is blocked; a writer after COMMIT is
+        trigger-indexed; a crash mid-transition rolls everything back, and the
+        reopen re-runs the transition. The catch-up predicate uses
+        ``COALESCE(H, -1)`` / ``COALESCE(P, -1)`` so the no-marker (empty /
+        complete) case is covered too — with no markers every ``row_id > -1``
+        is trigger-owned, which also catches an empty DB's first window row.
+        DDL runs via individual ``execute`` (not ``executescript``, whose
+        implicit COMMIT would break the transaction).
+        """
+        def _do(conn):
+            for stmt in _SESSIONS_FTS_STATEMENTS:
+                conn.execute(stmt)
+            conn.execute(
+                "INSERT INTO sessions_fts(rowid, title, id, display_name) "
+                "SELECT s.row_id, s.title, s.id, s.display_name "
+                "FROM sessions s "
+                "WHERE (s.row_id > COALESCE("
+                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                "     WHERE key = 'fts_session_rebuild_high_water'), -1)"
+                "   OR s.row_id <= COALESCE("
+                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                "     WHERE key = 'fts_session_rebuild_progress'), -1))"
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM sessions_fts_docsize d WHERE d.id = s.row_id"
+                "  )"
+            )
+        # Schema-init bookkeeping must not advance the routine-write merge
+        # cadence (the write-path cadence test asserts exact boundaries).
+        before = self._write_count
+        try:
+            self._execute_write(_do)
+        except sqlite3.OperationalError as exc:
+            if self._is_fts5_unavailable_error(exc):
+                self._warn_fts5_unavailable(exc)
+                return False
+            if self._is_trigram_unavailable_error(exc):
+                self._warn_trigram_unavailable(exc)
+                return False
+            raise
+        finally:
+            self._write_count = before
+        return True
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
@@ -5541,8 +5823,146 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (f"{escaped} #%",),
             ))
 
-    def _fts_numbered_variants(self, title: str) -> Optional[List[sqlite3.Row]]:
+    def _session_fts_rebuild_gap(self) -> Optional[Tuple[int, int]]:
+        """Bounded unindexed session-metadata gap ``(progress, high_water]``.
+
+        During a #25 session metadata backfill, rows whose ``row_id`` falls in
+        ``(P, H]`` are not yet in the external-content index. Metadata search
+        must supplement them (raw substring over the gap) and merge with the
+        FTS candidates so no valid session is hidden while the rebuild is
+        pending. Returns ``(progress, high_water)`` or ``None`` when no
+        session rebuild is pending (normal operation).
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water'"
+            ).fetchone()
+            if row is None:
+                return None
+            high_water = int(row[0])
+            p = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_progress'"
+            ).fetchone()
+            progress = int(p[0]) if p is not None else 0
+        if progress >= high_water:
+            return None
+        return progress, high_water
+
+    def _fts_metadata_candidates(
+        self, raw_query: str
+    ) -> Tuple[bool, List[Dict[str, Any]]]:
+        """Raw Unicode session-metadata candidates matching ``raw_query``.
+
+        Covers title, logical session id, and display_name (issue #25) via the
+        external-content ``sessions_fts``. While the #25 backfill is pending,
+        the bounded historical gap ``(P, H]`` is supplemented from canonical
+        rows and deduplicated by ``row_id``, so migration never silently hides
+        matching sessions: rows ``<= P`` are already indexed, rows ``> H`` are
+        live-indexed, and only ``(P, H]`` is supplemented.
+
+        Returns ``(fts_ok, candidates)`` — ``fts_ok`` is False when the
+        ``sessions_fts`` MATCH lane itself failed (table unavailable /
+        corrupt), so callers can fall back to the LIKE lane instead of
+        trusting a partial result; candidates is a list of dicts (``id``,
+        ``title``, ``display_name``, ``started_at``, ``row_id``) merged from
+        both lanes and sorted ``started_at DESC`` (the resume-ordering that
+        ``resolve_session_by_title`` relies on — never a lane-then-gap
+        concatenation). Raw Unicode only — no normalization policy
+        (normalized arbitrary infix is owned by #30).
+
+        The gap supplement folds values with ``_fts_unicode61_fold`` — a
+        conservative Unicode approximation of the unicode61 rules (case fold
+        + diacritic removal, NOT exact parity) — and matches on ANY positive
+        FTS term extracted from the query (see ``_fts_query_positive_terms``),
+        so both ``MATCH 'ecole'`` and a multi-token query such as
+        ``MATCH 'Alpha Project'`` (implicit AND) or ``alpha OR beta`` find
+        their gap rows exactly as the indexed lane would. The predicate is
+        deliberately a SUPERSET of the FTS semantics: it can over-match
+        (accepted — the backfilled index restores exact semantics) but never
+        misses a session the index would match, so a gap row cannot
+        vanish/reappear across the backfill boundary. SQLite's ``LOWER()``
+        only folds ASCII and would make a gap row disappear.
+        """
+        sanitized = self._sanitize_fts5_query(raw_query)
+        if not sanitized:
+            return True, []
+        gap = self._session_fts_rebuild_gap()
+        # Conservative FTS-superset terms for the gap supplement: the gap
+        # cannot parse FTS5's query syntax, so it matches ANY positive term
+        # in ANY field (over-match is accepted; a miss is not — a session
+        # the indexed lane matches must never hide while in (P, H]). Terms
+        # derive from the SANITIZED query (capped at MAX_FTS5_QUERY_CHARS, the
+        # same string the FTS lane MATCHes) so both lanes process the same
+        # bounded input and a huge query cannot blow up gap-row × terms.
+        terms = _fts_query_positive_terms(sanitized)
+        fts_ok = True
+        by_row_id: Dict[int, Dict[str, Any]] = {}
+
+        def _candidate(c) -> Dict[str, Any]:
+            return {
+                "id": c["id"],
+                "title": c["title"],
+                "display_name": c["display_name"],
+                "started_at": c["started_at"],
+                "row_id": c["row_id"],
+            }
+
+        with self._read_ctx() as conn:
+            try:
+                cursor = conn.execute(
+                    "SELECT s.id AS id, s.title, s.display_name, "
+                    "       s.started_at, s.row_id AS row_id "
+                    "FROM sessions_fts f "
+                    "JOIN sessions s ON s.row_id = f.rowid "
+                    "WHERE sessions_fts MATCH ? ",
+                    (sanitized,),
+                )
+                for c in cursor:
+                    by_row_id[c["row_id"]] = _candidate(c)
+            except sqlite3.OperationalError:
+                # FTS lane unavailable/corrupt: signal failure so callers can
+                # fall back to the LIKE lane instead of trusting a partial
+                # result; the gap supplement below still runs.
+                fts_ok = False
+                logging.debug(
+                    "sessions_fts MATCH failed for %r", sanitized, exc_info=True,
+                )
+            if gap is not None and terms:
+                progress, high_water = gap
+                gap_rows = conn.execute(
+                    "SELECT id, title, display_name, started_at, row_id "
+                    "FROM sessions "
+                    "WHERE row_id > ? AND row_id <= ? ",
+                    (progress, high_water),
+                ).fetchall()
+                for c in gap_rows:
+                    if any(
+                        term in _fts_unicode61_fold(field)
+                        for term in terms
+                        for field in (c["title"], c["id"], c["display_name"])
+                    ):
+                        by_row_id.setdefault(c["row_id"], _candidate(c))
+        # Global merge ordering, not lane-then-gap: resolve_session_by_title
+        # takes candidates[0] and must resume the LATEST continuation even
+        # when the newer one is still in the gap.
+        return fts_ok, sorted(
+            by_row_id.values(), key=lambda c: c["started_at"], reverse=True
+        )
+
+    def _fts_numbered_variants(
+        self, title: str
+    ) -> Optional[List[Dict[str, Any]]]:
         """Find numbered continuation variants via FTS5 MATCH with CJK dispatch.
+
+        Non-CJK titles delegate to the shared raw Unicode metadata lane
+        (``_fts_metadata_candidates``), which already covers title / logical
+        id / display_name and supplements the bounded ``(P, H]`` rebuild gap —
+        title resolution therefore never returns incomplete results
+        mid-backfill and the gap logic lives in exactly one place. CJK titles
+        keep their dedicated ``sessions_fts_cjk`` lane + gap supplement (the
+        CJK lifecycle is owned by #26).
 
         Returns None to signal fallback to LIKE (e.g. FTS5 runtime error or
         the target table unavailable). Returns empty list when no matches.
@@ -5550,32 +5970,74 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         is_cjk = self._contains_cjk(title)
         if is_cjk and not getattr(self, "_sessions_cjk_available", False):
             return None
-        fts_table = "sessions_fts_cjk" if is_cjk else "sessions_fts"
-        sanitized = self._sanitize_fts5_query(title)
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-        if not sanitized:
+        # An unsanitizable query must signal "use the LIKE fallback" (None),
+        # not "no matches" ([]), for both lanes.
+        if not self._sanitize_fts5_query(title):
             return None
 
-        with self._lock:
-            try:
-                cursor = self._conn.execute(
-                    f"SELECT s.id AS id, s.title, s.started_at "
-                    f"FROM {fts_table} f "
-                    f"JOIN sessions s ON s._rowid_ = f.rowid "
-                    f"WHERE {fts_table} MATCH ? "
-                    f"ORDER BY s.started_at DESC",
-                    (sanitized,),
-                )
-                candidates = list(cursor)
-            except sqlite3.OperationalError:
-                logging.debug(
-                    "%s MATCH failed for %r, falling back to LIKE",
-                    fts_table, sanitized, exc_info=True,
-                )
+        if is_cjk:
+            fts_table = "sessions_fts_cjk"
+            sanitized = self._sanitize_fts5_query(title)
+            if not sanitized:
                 return None
+            with self._lock:
+                try:
+                    cursor = self._conn.execute(
+                        f"SELECT s.id AS id, s.title, s.started_at "
+                        f"FROM {fts_table} f "
+                        f"JOIN sessions s ON s.row_id = f.rowid "
+                        f"WHERE {fts_table} MATCH ? "
+                        f"ORDER BY s.started_at DESC",
+                        (sanitized,),
+                    )
+                    candidates = list(cursor)
+                except sqlite3.OperationalError:
+                    logging.debug(
+                        "%s MATCH failed for %r, falling back to LIKE",
+                        fts_table, sanitized, exc_info=True,
+                    )
+                    return None
+            filtered = [
+                c for c in candidates
+                if c["title"] and c["title"].startswith(f"{escaped} #")
+            ]
+            # Bounded-gap supplement (same rule as the Unicode lane, kept local
+            # for the CJK table which #26 will take over).
+            gap = self._session_fts_rebuild_gap()
+            if gap is not None:
+                progress, high_water = gap
+                with self._read_ctx() as conn:
+                    gap_rows = conn.execute(
+                        "SELECT id, title, started_at FROM sessions "
+                        "WHERE title LIKE ? ESCAPE '\\' "
+                        "AND row_id > ? AND row_id <= ? "
+                        "ORDER BY started_at DESC",
+                        (f"{escaped} #%", progress, high_water),
+                    ).fetchall()
+                gap_filtered = [
+                    c for c in gap_rows
+                    if c["title"] and c["title"].startswith(f"{escaped} #")
+                ]
+                by_id = {c["id"]: c for c in filtered}
+                for c in gap_filtered:
+                    by_id.setdefault(c["id"], c)
+                filtered = sorted(
+                    by_id.values(), key=lambda c: c["started_at"], reverse=True
+                )
+            return filtered
 
-        # Post-filter: only keep sessions whose title starts with "{title} #N"
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        # Non-CJK: the shared raw Unicode lane already merges the FTS
+        # candidates with the bounded (P, H] gap, dedupes by row_id, and sorts
+        # globally by started_at DESC. When the sessions_fts lane itself
+        # failed, signal fallback to LIKE (None) rather than trusting a
+        # partial result.
+        fts_ok, candidates = self._fts_metadata_candidates(title)
+        if not fts_ok:
+            return None
+        if not candidates:
+            return candidates
         return [
             c for c in candidates
             if c["title"] and c["title"].startswith(f"{escaped} #")
@@ -5867,9 +6329,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 id_params.append(_like_pattern(id_needle))
             if search_needle:
-                # Same chain-membership trick as id_query, but matching either
-                # the title or the id of any session in the chain. The compact
-                # (punctuation-stripped) variant lets `an94` match `AN-94`.
+                # Same chain-membership trick as id_query, but matching the
+                # title, logical id, or display_name of any session in the
+                # chain (issue #25 covers display_name in the raw metadata
+                # search). The compact (punctuation-stripped) variant lets
+                # `an94` match `AN-94`.
                 compact_needle = re.sub(r"[\W_]+", "", search_needle)
                 compact_sql = (
                     "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
@@ -5881,8 +6345,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     " WHERE cq.root_id = s.id"
                     " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
                     " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
+                    " OR LOWER(COALESCE(cs.display_name, '')) LIKE ? ESCAPE '\\'"
                 )
-                id_params.extend([_like_pattern(search_needle)] * 2)
+                id_params.extend([_like_pattern(search_needle)] * 3)
                 if compact_needle:
                     search_clause += (
                         f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"
