@@ -6246,6 +6246,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         The servable-vs-zero distinction is what lets #14 route ordinary CJK
         picker queries without owning lifecycle state.
+
+        The durable guard checks and the MATCH run inside ONE explicit read
+        transaction, so ``(servable=True, ...)`` always reflects a single
+        consistent SQLite snapshot — never a torn read of a partially-mutated
+        index that a concurrent writer landed between a standalone guard
+        statement and the MATCH.
         """
         # A lone single CJK character cannot match inside longer runs in the
         # bigram index — classify as fallback-only before touching the index.
@@ -6258,43 +6264,70 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Process-local hint: this process knows the index is not servable.
             return False, None
         with self._read_ctx() as conn:
-            # Durable source of truth, read in the SAME snapshot as the MATCH:
-            # a stale breadcrumb or pending H/P written by ANY process (e.g. a
-            # tokenizer-less sibling sharing this state.db) must make the CJK
-            # lane unservable even when this process's cached
-            # ``_sessions_cjk_available`` is stale. The process-local flag is
-            # only a hint, never the source of truth.
-            if conn.execute(
+            # ONE SQLite snapshot for the durable guard reads AND the MATCH.
+            # ``_read_ctx()`` connections are autocommit (isolation_level
+            # = None), so each SELECT would otherwise open a FRESH read
+            # transaction — a concurrent writer could land stale/drop/mutate
+            # between the guard and the MATCH, and the lane would serve a
+            # partial index. An explicit deferred read transaction fixes the
+            # guard+MATCH to a single snapshot: under WAL it is snapshot-only
+            # (never blocks the writer) and costs nothing on the hot path.
+            began = False
+            if not conn.in_transaction:
+                try:
+                    conn.execute("BEGIN")
+                    began = True
+                except sqlite3.OperationalError:
+                    # Already inside a transaction (or cannot begin here):
+                    # the reads still share whatever snapshot already exists.
+                    began = False
+            try:
+                if self._cjk_lane_durable_guarded(conn):
+                    return False, None
+                try:
+                    cursor = conn.execute(
+                        "SELECT s.id AS id, s.title, s.display_name, "
+                        "       s.started_at, s.row_id AS row_id "
+                        "FROM sessions_fts_cjk f "
+                        "JOIN sessions s ON s.row_id = f.rowid "
+                        "WHERE sessions_fts_cjk MATCH ? "
+                        "ORDER BY s.started_at DESC",
+                        (sanitized,),
+                    )
+                    candidates = [dict(row) for row in cursor]
+                except sqlite3.OperationalError:
+                    # CJK lane unavailable/corrupt on this connection (e.g.
+                    # the tokenizer did not load on this read connection):
+                    # signal fallback, never trust a partial result.
+                    logging.debug(
+                        "sessions_fts_cjk MATCH failed for %r, falling back",
+                        raw_query, exc_info=True,
+                    )
+                    return False, None
+            finally:
+                if began:
+                    conn.execute("COMMIT")
+        return True, candidates
+
+    def _cjk_lane_durable_guarded(self, conn) -> bool:
+        """True when a durable CJK guard is present on ``conn``'s snapshot.
+
+        Either the stale breadcrumb (a tokenizer-less sibling dropped the CJK
+        triggers over an index gap of unknown extent) or a pending high-water
+        claim (a rebuild in flight) makes the CJK lane unservable — a partial
+        index is never served. Must be evaluated on the SAME connection /
+        snapshot that runs the MATCH (see ``_fts_cjk_metadata_candidates``).
+        """
+        return (
+            conn.execute(
                 "SELECT 1 FROM state_meta WHERE key = ?",
                 (FTS_SESSION_CJK_STALE_KEY,),
-            ).fetchone() is not None:
-                return False, None
-            if conn.execute(
+            ).fetchone() is not None
+            or conn.execute(
                 "SELECT 1 FROM state_meta WHERE key = ?",
                 ("fts_session_cjk_rebuild_high_water",),
-            ).fetchone() is not None:
-                return False, None
-            try:
-                cursor = conn.execute(
-                    "SELECT s.id AS id, s.title, s.display_name, "
-                    "       s.started_at, s.row_id AS row_id "
-                    "FROM sessions_fts_cjk f "
-                    "JOIN sessions s ON s.row_id = f.rowid "
-                    "WHERE sessions_fts_cjk MATCH ? "
-                    "ORDER BY s.started_at DESC",
-                    (sanitized,),
-                )
-                candidates = [dict(row) for row in cursor]
-            except sqlite3.OperationalError:
-                # CJK lane unavailable/corrupt on this connection (e.g. the
-                # tokenizer did not load on this read connection): signal
-                # fallback, never trust a partial result.
-                logging.debug(
-                    "sessions_fts_cjk MATCH failed for %r, falling back",
-                    raw_query, exc_info=True,
-                )
-                return False, None
-        return True, candidates
+            ).fetchone() is not None
+        )
 
     def _fts_numbered_variants(
         self, title: str

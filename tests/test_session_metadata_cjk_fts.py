@@ -14,6 +14,7 @@ is present. The degraded/unavailable-host tests that need no tokenizer always
 run.
 """
 
+import contextlib
 import os
 import sqlite3
 import shutil
@@ -181,6 +182,20 @@ def _open_incapable(db_path, tmp_path, monkeypatch):
     """Open SessionDB with the tokenizer unavailable (absent .so)."""
     monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "absent.so"))
     return SessionDB(db_path=db_path)
+
+
+def _pre_enable_wal(db_path):
+    """Pre-set journal_mode=WAL on disk so SessionDB's vulnerable-runtime
+    fallback leaves it in WAL (``_apply_delete_for_wal_reset_bug`` only
+    downgrades DBs that are not already WAL). The P1 interleaving test needs
+    WAL: a concurrent committed writer must be able to land between a reader's
+    guard and MATCH (snapshot isolation), which DELETE-mode locking forbids.
+    Harmless for a throwaway temp DB."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    finally:
+        conn.close()
 
 
 def _cjk_fts_rowids(db, query):
@@ -824,6 +839,119 @@ class TestCjkSearchSeam:
             servable, candidates = d._fts_cjk_metadata_candidates("東京")
             assert servable is False
             assert candidates is None
+        finally:
+            d.close()
+
+    def test_stale_write_between_guard_and_match_stays_consistent(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """P1 (PR #65): the durable guard and the MATCH must share ONE SQLite
+        snapshot. This manufactures the exact interleaving the above test
+        cannot: it wraps the connection ``_read_ctx`` yields in a proxy that
+        commits a concurrent sibling's write (mark stale + drop the CJK
+        triggers + add AND directly index a new canonical session) on a
+        SEPARATE connection right AFTER the guard's first read completes but
+        BEFORE the MATCH runs.
+
+        Pre-fix (autocommit: a fresh snapshot per SELECT) the MATCH opens a
+        new snapshot that already contains the sibling's new index row → the
+        lane reports ``(servable=True, ...)`` over a stale-guarded, partially
+        rebuilt index. Post-fix the MATCH stays on the guard's snapshot → it
+        returns the consistent pre-write rows and never serves a row that
+        belongs to a later, stale-guarded snapshot.
+        """
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=20)
+        _pre_enable_wal(db_path)  # WAL: concurrent committed writer required
+        d = _open_capable(db_path, cjk_so, monkeypatch)
+        try:
+            while d.fts_session_cjk_rebuild_step():
+                pass
+            d.create_session("日本語ID", source="cli")
+            d.set_session_title("日本語ID", "東京タワー計画")
+            assert d._sessions_cjk_available is True
+
+            def commit_sibling():
+                # The sibling's mid-flight write, committed on a SEPARATE
+                # connection while our read transaction stays open: mark
+                # stale, drop the CJK triggers, add a new canonical session
+                # AND index it directly — so the CJK index now differs from
+                # the guard's snapshot.
+                b = sqlite3.connect(str(db_path), isolation_level=None)
+                b.enable_load_extension(True)
+                b.load_extension(str(cjk_so))
+                try:
+                    b.execute("BEGIN IMMEDIATE")
+                    b.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (CJK_STALE, "1"),
+                    )
+                    b.execute("DROP TRIGGER IF EXISTS sessions_fts_cjk_insert")
+                    b.execute("DROP TRIGGER IF EXISTS sessions_fts_cjk_delete")
+                    b.execute("DROP TRIGGER IF EXISTS sessions_fts_cjk_update")
+                    b.execute(
+                        "INSERT INTO sessions (row_id, id, source, "
+                        "started_at, title) VALUES (?, ?, 'cli', ?, ?)",
+                        (1000, "sibling_new", 1.0, "東京ライバル"),
+                    )
+                    b.execute(
+                        "INSERT INTO sessions_fts_cjk "
+                        "(rowid, title, id, display_name) "
+                        "VALUES (?, ?, ?, NULL)",
+                        (1000, "東京ライバル", "sibling_new"),
+                    )
+                    b.execute("COMMIT")
+                finally:
+                    b.close()
+
+            real_read_ctx = SessionDB._read_ctx
+
+            class _RacyReadConn:
+                """Delegates to the real read connection, but after the FIRST
+                durable guard SELECT completes it commits the sibling's
+                concurrent write — manufacturing the P1 interleaving between
+                the guard and the MATCH that a plain sequential test cannot.
+                (``sqlite3.Connection.execute`` is a C-level slot and cannot
+                be monkeypatched directly.)"""
+
+                def __init__(self, conn, on_guard_read):
+                    self._conn = conn
+                    self._on_guard_read = on_guard_read
+                    self._fired = False
+
+                @property
+                def in_transaction(self):
+                    return self._conn.in_transaction
+
+                def execute(self, sql, *args, **kwargs):
+                    cur = self._conn.execute(sql, *args, **kwargs)
+                    if (
+                        not self._fired
+                        and isinstance(sql, str)
+                        and "state_meta" in sql
+                        and sql.lstrip().upper().startswith("SELECT")
+                    ):
+                        # First guard read done — its snapshot (no stale) is
+                        # established. Now let the sibling's write land.
+                        self._fired = True
+                        self._on_guard_read()
+                    return cur
+
+            @contextlib.contextmanager
+            def racy_read_ctx(self):
+                with real_read_ctx(self) as conn:
+                    yield _RacyReadConn(conn, commit_sibling)
+
+            monkeypatch.setattr(SessionDB, "_read_ctx", racy_read_ctx)
+            servable, candidates = d._fts_cjk_metadata_candidates("東京")
+            # Post-fix: consistent pre-write snapshot — the pre-existing row
+            # is found and the sibling's post-snapshot row is NOT served as
+            # if current (it lives on a later, stale-guarded snapshot the
+            # guard never saw).
+            assert servable is True
+            assert any(c["id"] == "日本語ID" for c in candidates)
+            assert all(c["id"] != "sibling_new" for c in candidates)
         finally:
             d.close()
 
