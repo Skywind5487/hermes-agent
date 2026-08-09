@@ -59,6 +59,12 @@ _GENERATED_META_KEYS = frozenset({
     # the current schema on a fresh destination, never copied.
     "fts_session_rebuild_high_water",
     "fts_session_rebuild_progress",
+    # Session CJK metadata rebuild markers + stale breadcrumb (issue #26) -
+    # optional-CJK derived state, regenerated from the current schema on a
+    # fresh destination, never copied.
+    "fts_session_cjk_rebuild_high_water",
+    "fts_session_cjk_rebuild_progress",
+    "fts_session_cjk_stale",
     "telegram_dm_topic_schema_version",
 })
 
@@ -1110,6 +1116,9 @@ def _verify_recovered_database(
                 "fts_cjk_rebuild_progress",
                 "fts_session_rebuild_high_water",
                 "fts_session_rebuild_progress",
+                "fts_session_cjk_rebuild_high_water",
+                "fts_session_cjk_rebuild_progress",
+                "fts_session_cjk_stale",
             )
             if key in meta
         )
