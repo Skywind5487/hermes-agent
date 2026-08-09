@@ -81,6 +81,14 @@ class ProductionProfileSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path=Path(td)/"state.db"; self.make_db(path); before=path.read_bytes(); expected=hashlib.sha256(before).hexdigest(); report=profile_database(path,expected,enforce_authoritative_counts=False); after=path.read_bytes(); self.assertEqual(before,after); self.assertEqual(report["source"]["sha256"],expected); self.assertFalse(report["source"]["mutations_performed"]); self.assertEqual(report["canonical_counts"]["sessions"],3); self.assertEqual(report["topology"]["positive_compression_edges"],1); self.assertEqual(report["topology"]["child_markers"].get("branch_marker"),1); self.assertFalse(report["query_distribution"]["measured"])
 
+    def test_profiler_handles_tail_into_positive_cycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/"state.db"; self.make_db(path); conn=sqlite3.connect(path)
+            try:
+                conn.executemany("INSERT INTO sessions VALUES(?,?,?,?,?,?,?)",[("cyc1","cyc2","compression","{}","discord","4","5"),("cyc2","cyc1","compression","{}","discord","4","5"),("tail","cyc1",None,"{}","discord","6",None)]); conn.commit()
+            finally:conn.close()
+            expected=hashlib.sha256(path.read_bytes()).hexdigest(); report=profile_database(path,expected,enforce_authoritative_counts=False); self.assertEqual(report["topology"]["positive_lineage_cycles"],2)
+
     def test_profiler_rejects_wrong_hash(self):
         with tempfile.TemporaryDirectory() as td:
             path=Path(td)/"state.db"; self.make_db(path)
