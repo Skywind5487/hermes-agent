@@ -210,9 +210,214 @@ def _assert_sessions_fts_cjk_integrity(db):
     )
 
 
+def _assert_sessions_fts_cjk_internal_integrity(db):
+    """Ordinary FTS5 internal integrity-check (shadow-table structure only).
+    Unlike the rank=1 form, safe mid-migration when the (P, H] gap rows are
+    legitimately unindexed."""
+    db._conn.execute(
+        "INSERT INTO sessions_fts_cjk(sessions_fts_cjk) "
+        "VALUES('integrity-check')"
+    )
+
+
+def _cjk_three_region_db(cjk_so, tmp_path, monkeypatch):
+    """SessionDB with a CJK rebuild staged so all three ownership regions are
+    represented: rows <= P are backfilled into the CJK index, rows (P,H] are
+    the unindexed worker-owned gap, and newly created sessions are > H
+    (live-indexed by the triggers)."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=8)  # row 1..8
+    d = _open_capable(db_path, cjk_so, monkeypatch)  # CJK H=8, P=0
+    d._conn.execute(
+        "INSERT INTO sessions_fts_cjk(rowid, title, id, display_name) "
+        "SELECT row_id, title, id, display_name FROM sessions "
+        "WHERE row_id <= 3"
+    )
+    d.set_meta(CJK_PROG, "3")
+    return d
+
+
 # =========================================================================
 # Group A — external-content raw shape (replaces legacy title-only)
 # =========================================================================
+
+
+# =========================================================================
+# Group B2 — trigger ownership regions behavioral matrix (<=P, (P,H], >H)
+# =========================================================================
+
+
+class TestCjkTriggerOwnershipRegions:
+    """Behavioral matrix for the CJK trigger ownership regions during a
+    pending backfill — acceptance criterion: trigger behavior follows the
+    same indexed-region invariant as Unicode (row <= P or > H live; (P,H]
+    worker-owned and left alone)."""
+
+    def test_insert_above_high_water_is_live_indexed(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """A session created above the captured H is indexed immediately by
+        the insert trigger."""
+        d = _cjk_three_region_db(cjk_so, tmp_path, monkeypatch)
+        try:
+            d.create_session("s9", source="cli")   # row 9 > H
+            d.set_session_title("s9", "Live Insert")
+            assert _cjk_fts_rowids(d, "live") == [9]
+        finally:
+            d.close()
+
+    def test_delete_indexed_prefix_row_removes_doc(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """Deleting a <=P row (already indexed) removes its CJK document."""
+        d = _cjk_three_region_db(cjk_so, tmp_path, monkeypatch)
+        try:
+            d.set_session_title("s1", "Alpha One")   # row 1 <= P
+            assert _cjk_fts_rowids(d, "alpha") == [1]
+            d.delete_session("s1")
+            assert _cjk_fts_rowids(d, "alpha") == []
+            _assert_sessions_fts_cjk_internal_integrity(d)
+        finally:
+            d.close()
+
+    def test_delete_gap_row_issues_no_fts_delete(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """Deleting a (P,H] row (never indexed) issues no external-content
+        delete; the index stays free of stale postings."""
+        d = _cjk_three_region_db(cjk_so, tmp_path, monkeypatch)
+        try:
+            d.set_session_title("s7", "Gamma Gap")   # row 7 in (P,H]
+            assert _cjk_fts_rowids(d, "gamma") == []
+            d.delete_session("s7")
+            assert _cjk_fts_rowids(d, "gamma") == []
+            assert d.get_session("s7") is None
+            _assert_sessions_fts_cjk_internal_integrity(d)
+        finally:
+            d.close()
+
+    def test_delete_live_row_removes_doc(self, cjk_so, tmp_path, monkeypatch):
+        """Deleting a >H live row removes its live-indexed document."""
+        d = _cjk_three_region_db(cjk_so, tmp_path, monkeypatch)
+        try:
+            d.create_session("s9", source="cli")
+            d.set_session_title("s9", "Live Echo")
+            assert _cjk_fts_rowids(d, "echo") == [9]
+            d.delete_session("s9")
+            assert _cjk_fts_rowids(d, "echo") == []
+            _assert_sessions_fts_cjk_internal_integrity(d)
+        finally:
+            d.close()
+
+    def test_update_indexed_prefix_row_rewrites_doc(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """Updating a <=P row rewrites its already-indexed CJK document."""
+        d = _cjk_three_region_db(cjk_so, tmp_path, monkeypatch)
+        try:
+            d.set_session_title("s1", "Alpha One")
+            assert _cjk_fts_rowids(d, "alpha") == [1]
+            d.set_session_title("s1", "Alpha Updated")
+            assert _cjk_fts_rowids(d, "alpha") == [1]
+            assert _cjk_fts_rowids(d, "updated") == [1]
+        finally:
+            d.close()
+
+    def test_update_gap_row_does_not_rewrite_index(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """Updating a (P,H] row must not rewrite a document that was never
+        indexed; the index stays healthy."""
+        d = _cjk_three_region_db(cjk_so, tmp_path, monkeypatch)
+        try:
+            d.set_session_title("s7", "Gamma Gap")
+            d.set_session_title("s7", "Gamma Changed")
+            assert _cjk_fts_rowids(d, "gamma") == []
+            assert _cjk_fts_rowids(d, "changed") == []
+            _assert_sessions_fts_cjk_internal_integrity(d)
+        finally:
+            d.close()
+
+    def test_update_live_row_rewrites_doc(self, cjk_so, tmp_path, monkeypatch):
+        """Updating a >H live row rewrites its live-indexed document."""
+        d = _cjk_three_region_db(cjk_so, tmp_path, monkeypatch)
+        try:
+            d.create_session("s9", source="cli")
+            d.set_session_title("s9", "Live Delta")
+            assert _cjk_fts_rowids(d, "delta") == [9]
+            d.set_session_title("s9", "Live Changed")
+            assert _cjk_fts_rowids(d, "delta") == []
+            assert _cjk_fts_rowids(d, "changed") == [9]
+        finally:
+            d.close()
+
+    def test_unrelated_column_update_does_not_rewrite_index(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """A narrow UPDATE OF title,id,display_name trigger: an unrelated
+        metadata column write must not rewrite the CJK index."""
+        d = _cjk_three_region_db(cjk_so, tmp_path, monkeypatch)
+        try:
+            d.set_session_title("s1", "Alpha One")
+            assert _cjk_fts_rowids(d, "alpha") == [1]
+            d._conn.execute(
+                "UPDATE sessions SET message_count = 5 WHERE row_id = 1"
+            )
+            d._conn.commit()
+            assert _cjk_fts_rowids(d, "alpha") == [1]
+        finally:
+            d.close()
+
+
+# =========================================================================
+# Group C2 — read-only connection capability seam
+# =========================================================================
+
+
+class TestCjkReadOnly:
+    def test_read_only_completed_cjk_index_matches(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """A dedicated SessionDB(read_only=True) with the tokenizer loaded on
+        its connection must MATCH the completed CJK index — tokenizer
+        capability is connection-local, and the read seam derives serving
+        from the durable state in the same snapshot."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=20)
+        w = _open_capable(db_path, cjk_so, monkeypatch)
+        while w.fts_session_cjk_rebuild_step():
+            pass
+        w.create_session("日本語ID", source="cli")
+        w.set_session_title("日本語ID", "東京タワー計画")
+        w.close()
+        monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(cjk_so))
+        ro = SessionDB(db_path=db_path, read_only=True)
+        try:
+            servable, candidates = ro._fts_cjk_metadata_candidates("東京")
+            assert servable is True
+            assert any(c["id"] == "日本語ID" for c in candidates)
+        finally:
+            ro.close()
+
+    def test_read_only_without_tokenizer_falls_back(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """A tokenizer-less read-only consumer cannot MATCH the CJK index: it
+        reports unservable (canonical fallback), never a partial result."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=20)
+        w = _open_capable(db_path, cjk_so, monkeypatch)
+        while w.fts_session_cjk_rebuild_step():
+            pass
+        w.close()
+        monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "absent.so"))
+        ro = SessionDB(db_path=db_path, read_only=True)
+        try:
+            servable, candidates = ro._fts_cjk_metadata_candidates("東京")
+            assert servable is False
+            assert candidates is None
+        finally:
+            ro.close()
 
 
 class TestCjkExternalContentShape:
@@ -339,6 +544,30 @@ class TestCjkRebuildMarkers:
             assert d.get_meta(CJK_PROG) is None
             assert d.get_meta(CJK_STALE) == "1"
             assert d._sessions_cjk_available is False
+        finally:
+            d.close()
+
+    def test_schema_soft_fail_keeps_worker_operable_false(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """A soft-failed CJK schema transition must not leave worker-operable
+        True — otherwise optimize's phase 1d would retry the missing/unusable
+        table forever (fts_rebuild_step treats OperationalError as transient).
+        worker-operable means 'can operate the target NOW', not just '.so
+        loaded once'."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=20)
+        monkeypatch.setattr(
+            SessionDB,
+            "_fts_session_cjk_schema_transition",
+            lambda self, cursor: False,
+        )
+        d = _open_capable(db_path, cjk_so, monkeypatch)
+        try:
+            assert d._sessions_cjk_worker_operable is False
+            assert d._sessions_cjk_available is False
+            # The worker refuses to advance (no infinite retry loop).
+            assert d.fts_session_cjk_rebuild_step() is False
         finally:
             d.close()
 
@@ -567,6 +796,34 @@ class TestCjkSearchSeam:
             assert _cjk_match_ids(d, "東京") == ["日本語ID"]      # title
             assert _cjk_match_ids(d, "日本語") == ["日本語ID"]    # logical id
             assert _cjk_match_ids(d, "カタカナ") == ["日本語ID"]  # display_name
+        finally:
+            d.close()
+
+    def test_cross_process_stale_keeps_serving_off(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """A long-lived capable process whose cache says the CJK index is
+        servable must still stop serving when a tokenizer-less sibling
+        persists the durable stale breadcrumb. The durable state — read in
+        the same snapshot as the MATCH — is the source of truth, never the
+        process-local flag."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=20)
+        d = _open_capable(db_path, cjk_so, monkeypatch)
+        try:
+            while d.fts_session_cjk_rebuild_step():
+                pass
+            d.create_session("日本語ID", source="cli")
+            d.set_session_title("日本語ID", "東京タワー計画")
+            # In-memory cache says serving...
+            assert d._sessions_cjk_available is True
+            servable, candidates = d._fts_cjk_metadata_candidates("東京")
+            assert servable is True
+            # ...but a sibling process persisted the durable stale breadcrumb.
+            d.set_meta(CJK_STALE, "1")
+            servable, candidates = d._fts_cjk_metadata_candidates("東京")
+            assert servable is False
+            assert candidates is None
         finally:
             d.close()
 

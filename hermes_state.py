@@ -2168,26 +2168,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                             is True
                         )
-                    # Session CJK metadata (issue #26): a read-only consumer
-                    # needs the tokenizer loaded on THIS connection to MATCH —
-                    # a writer-level _fts_cjk_loaded is not proof every read
-                    # connection can. Probe the table, then load best-effort;
-                    # a failed connection-local load degrades to fallback, not
-                    # a crash or a false "CJK available" claim. (The table
-                    # probe is a LIMIT 0 scan and does not tokenize.)
-                    if self._fts_table_probe(cursor, "sessions_fts_cjk") is True:
-                        self._sessions_cjk_worker_operable = (
-                            load_fts5_cjk_extension(self._conn)
-                        )
+                    # Session CJK metadata (issue #26): load the cjk_unicode61
+                    # tokenizer on THIS connection FIRST — custom FTS5
+                    # tokenizers are connection-local, and a vtable using one
+                    # cannot be instantiated before the tokenizer is
+                    # registered on that connection. Then check existence via
+                    # sqlite_master (no vtable instantiation) and the durable
+                    # pending/stale state. A failed connection-local load
+                    # degrades to fallback, never a crash or a false "CJK
+                    # available" claim.
+                    self._sessions_cjk_worker_operable = (
+                        load_fts5_cjk_extension(self._conn)
+                    )
+                    self._sessions_cjk_available = False
+                    if self._sessions_cjk_worker_operable and cursor.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'sessions_fts_cjk'"
+                    ).fetchone() is not None:
                         pending = cursor.execute(
                             "SELECT 1 FROM state_meta WHERE key IN "
                             "('fts_session_cjk_rebuild_high_water', "
                             f"'{FTS_SESSION_CJK_STALE_KEY}') LIMIT 1"
                         ).fetchone()
-                        self._sessions_cjk_available = (
-                            self._sessions_cjk_worker_operable
-                            and pending is None
-                        )
+                        self._sessions_cjk_available = pending is None
                 except BaseException:
                     conn, self._conn = self._conn, None
                     try:
@@ -2616,8 +2619,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._sessions_cjk_available = False
             return
 
-        # Capable host.
-        self._sessions_cjk_worker_operable = True
+        # Capable host — ``_sessions_cjk_worker_operable`` is derived AFTER the
+        # schema is actually ensured below, so a soft-failed transition never
+        # leaves a worker flag that cannot really operate the target (that
+        # would make ``optimize_fts_storage``'s phase-1d loop retry forever).
 
         # Detect / replace the pre-#26 internal title-only shape on a capable
         # host. Staged in a write transaction: seed the durable CJK-session
@@ -2697,19 +2702,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ok = False
 
         if not ok:
+            self._sessions_cjk_worker_operable = False
             self._sessions_cjk_available = False
             return
 
         # Stale breadcrumb: a tokenizer-less process dropped the triggers at
         # an unknown point — the index has a gap of unknown extent. Do NOT
         # reinstall triggers (an external-content 'delete' for an unindexed
-        # rowid corrupts the index); the next `optimize-storage` run on a
-        # capable host resets and rebuilds from scratch.
+        # rowid corrupts the index), and the plain chunk worker must NOT
+        # operate a stale index either (its gap extends beyond any (P, H]).
+        # The next `optimize-storage` run on a capable host resets and
+        # rebuilds from scratch; the recreate re-derives worker operability.
         stale = cursor.execute(
             "SELECT 1 FROM state_meta WHERE key = ?",
             (FTS_SESSION_CJK_STALE_KEY,),
         ).fetchone()
         if stale:
+            self._sessions_cjk_worker_operable = False
             self._sessions_cjk_available = False
             return
 
@@ -2720,9 +2729,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "sessions_fts_cjk trigger ensure failed; CJK session search "
                 "stays on the Unicode/LIKE lane", exc_info=True,
             )
+            self._sessions_cjk_worker_operable = False
             self._sessions_cjk_available = False
             return
 
+        # Schema + triggers are in place — this worker can genuinely operate
+        # the target now.
+        self._sessions_cjk_worker_operable = True
         backfill_pending = cursor.execute(
             "SELECT 1 FROM state_meta "
             "WHERE key = 'fts_session_cjk_rebuild_high_water' LIMIT 1"
@@ -6242,9 +6255,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not sanitized:
             return False, None
         if not getattr(self, "_sessions_cjk_available", False):
-            # Pending / stale / tokenizer-unavailable: not servable.
+            # Process-local hint: this process knows the index is not servable.
             return False, None
         with self._read_ctx() as conn:
+            # Durable source of truth, read in the SAME snapshot as the MATCH:
+            # a stale breadcrumb or pending H/P written by ANY process (e.g. a
+            # tokenizer-less sibling sharing this state.db) must make the CJK
+            # lane unservable even when this process's cached
+            # ``_sessions_cjk_available`` is stale. The process-local flag is
+            # only a hint, never the source of truth.
+            if conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (FTS_SESSION_CJK_STALE_KEY,),
+            ).fetchone() is not None:
+                return False, None
+            if conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                ("fts_session_cjk_rebuild_high_water",),
+            ).fetchone() is not None:
+                return False, None
             try:
                 cursor = conn.execute(
                     "SELECT s.id AS id, s.title, s.display_name, "
@@ -6257,7 +6286,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 candidates = [dict(row) for row in cursor]
             except sqlite3.OperationalError:
-                # CJK lane unavailable/corrupt on this connection: signal
+                # CJK lane unavailable/corrupt on this connection (e.g. the
+                # tokenizer did not load on this read connection): signal
                 # fallback, never trust a partial result.
                 logging.debug(
                     "sessions_fts_cjk MATCH failed for %r, falling back",
