@@ -483,6 +483,44 @@ class TestSchemaClassifier:
         finally:
             r.close()
 
+    def test_classifier_legacy_simple_without_simple_tokenizer(self, tmp_path):
+        """The legacy identity must classify on a RAW connection with NO
+        ``simple`` tokenizer loaded — and the open path must still demote it to
+        modern. #34's contract: legacy-simple → modern must never require
+        ``simple`` (PRAGMA table_info would connect the vtable and raise
+        ``no such tokenizer: simple`` on a host without it)."""
+        db_path = tmp_path / "legacy.db"
+        _build_legacy_simple_sessions_trigram_db(db_path)
+        raw = sqlite3.connect(str(db_path))  # no simple loaded
+        try:
+            assert SessionDB._classify_sessions_fts_trigram(raw) == "legacy_simple"
+        finally:
+            raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            assert "tokenize='trigram'" in _fts_sql(r._conn, "sessions_fts_trigram")
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is not None
+        finally:
+            r.close()
+
+    def test_classifier_legacy_does_not_probe_vtable(self, tmp_path, monkeypatch):
+        """Legacy identity is decided from the stored DDL alone — it must NOT
+        call ``_fts_declared_columns`` (PRAGMA table_info), which connects the
+        FTS5 vtable and raises on a host without ``simple``."""
+        db_path = tmp_path / "legacy.db"
+        _build_legacy_simple_sessions_trigram_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        try:
+            # Simulate a SQLite build where probing the vtable cannot connect
+            # (the legacy table requires the missing `simple` tokenizer).
+            monkeypatch.setattr(
+                SessionDB, "_fts_declared_columns", lambda cursor, name: None
+            )
+            assert SessionDB._classify_sessions_fts_trigram(raw) == "legacy_simple"
+        finally:
+            raw.close()
+
     def test_classifier_unknown_same_name(self, tmp_path):
         """An unrecognized same-name object fails closed — classified unknown,
         never mistaken for legacy or modern, and never deleted."""

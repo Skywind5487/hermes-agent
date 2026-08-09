@@ -844,6 +844,21 @@ END;
 """
 
 
+# The exact historical (pre-#30) ``sessions_fts_trigram`` ROOT declaration from
+# the fork (commit 37811327cd): FTS5, title-only, INTERNAL content,
+# ``tokenize='simple'``. The classifier matches this by normalized DDL — it
+# deliberately does NOT use PRAGMA table_info, which must CONNECT the FTS5
+# virtual table and therefore raises ``no such tokenizer: simple`` on a host
+# without the legacy tokenizer. #30's whole point is that legacy simple must
+# not be required to retire it.
+LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_trigram USING fts5(
+    title,
+    tokenize='simple'
+);
+"""
+
+
 # CJK title search — cjk_unicode61 loadable tokenizer, mirroring
 # messages_fts_cjk. Requires libfts5_cjk.so (native/fts5_cjk/build.sh);
 # callers gate table creation on the extension being loaded and fall back

@@ -211,3 +211,27 @@ the root to be a `CREATE VIRTUAL TABLE ... USING fts5` declaration.
 Pinned by two new regression tests
 (`test_classifier_modern_root_miswired_view_unknown`,
 `test_classifier_modern_root_same_name_table_src_unknown`).
+
+### Round-5 fix — legacy identity without connecting the vtable (P1, 2026-08-10)
+
+Round-5 review (P1): `PRAGMA table_info()` must CONNECT an FTS5 virtual table,
+so on a host without the legacy `simple` tokenizer it raises
+`no such tokenizer: simple`. The round-3 classifier used `_fts_declared_columns`
+(PRAGMA) to verify the legacy shape — on such a host that returned None →
+`unknown_same_name` → the #30 demotion never ran, silently re-introducing the
+exact #34 contract violation ("legacy-simple → modern must not require
+`simple`").
+
+`_sessions_trigram_legacy_definition_matches` now verifies the legacy identity
+by a normalized DDL comparison of the stored root declaration against the
+canonical historical `LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION` (FTS5,
+title-only, INTERNAL content, `tokenize='simple'`) — it reads the declared
+columns directly from the stored SQL and never connects the vtable, so it
+works on a host without `simple`. The MODERN branch keeps PRAGMA table_info
+(built-in trigram; a no-trigram host failing closed to unknown is safe — the
+table is never deleted). Pinned by
+`test_classifier_legacy_simple_without_simple_tokenizer` (raw connection, no
+`simple` → classifies legacy → open path demotes to modern) and
+`test_classifier_legacy_does_not_probe_vtable` (monkeypatched
+`_fts_declared_columns` → None; legacy still classifies, proving no PRAGMA
+dependency).

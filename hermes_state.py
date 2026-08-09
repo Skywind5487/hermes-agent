@@ -64,6 +64,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
+    LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
@@ -2751,6 +2752,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return frozenset(r[1] if isinstance(r, sqlite3.Row) else r[1] for r in rows)
 
     @staticmethod
+    def _sessions_trigram_legacy_definition_matches(stored_sql: str) -> bool:
+        """True when the stored root declaration is the canonical historical
+        legacy ``sessions_fts_trigram`` (FTS5, title-only, INTERNAL content,
+        ``tokenize='simple'``) — compared as normalized DDL.
+
+        This is deliberately NOT a PRAGMA table_info check: PRAGMA must
+        CONNECT the FTS5 virtual table, which resolves the declared tokenizer
+        and raises ``no such tokenizer: simple`` on a host without the legacy
+        ``simple`` tokenizer — the exact host the #30 demotion exists to
+        support. The historical shape is unique, so a normalized DDL
+        comparison (stripping ``IF NOT EXISTS`` / trailing ``;`` / all
+        whitespace) is exact and reads the declared columns directly from the
+        stored declaration — it cannot be fooled by unrelated ``id`` /
+        ``display_name`` substrings elsewhere in the SQL.
+        """
+        canonical = LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION
+
+        def _norm(s: str) -> str:
+            t = s.replace("IF NOT EXISTS", "").strip()
+            if t.endswith(";"):
+                t = t[:-1]
+            return "".join(t.split())
+
+        return _norm(stored_sql) == _norm(canonical)
+
+    @staticmethod
     def _sessions_trigram_src_compatible(cursor) -> bool:
         """True when the derived source object (if present) is the exact #30
         projection: an actual VIEW — never a same-name table, which
@@ -2843,17 +2870,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # a ``CREATE VIRTUAL TABLE ... USING fts5`` declaration.
         if "CREATE VIRTUAL TABLE" not in sql or "USING fts5" not in sql:
             return "unknown_same_name"
-        # Recognized historical Hermes shape: FTS5 tokenize='simple' + INTERNAL
-        # content + EXACTLY the title-only logical column set. The column set
-        # is verified via PRAGMA table_info (reads the DDL column list without
-        # instantiating the vtable, so it works on a host without `simple`) —
-        # a same-name simple object with any other column shape is NOT ours
-        # and must fail closed (never demote / delete it).
-        if "tokenize='simple'" in sql and "content=" not in sql:
-            cols = SessionDB._fts_declared_columns(cursor, "sessions_fts_trigram")
-            if cols == frozenset({"title"}):
-                return "legacy_simple"
-            return "unknown_same_name"
+        # Recognized historical Hermes shape (FTS5 title-only INTERNAL content
+        # ``tokenize='simple'``) — verified by a normalized DDL comparison of
+        # the stored declaration. Deliberately NOT PRAGMA table_info: PRAGMA
+        # must CONNECT the vtable and raises ``no such tokenizer: simple`` on
+        # a host without the legacy tokenizer — the exact host #30's demotion
+        # exists to support. A same-name simple object with any other column
+        # shape is NOT ours and must fail closed (never demote / delete it).
+        if SessionDB._sessions_trigram_legacy_definition_matches(sql):
+            return "legacy_simple"
         # Modern #30 identity. The content/content_rowid/tokenizer attributes
         # come from the stored DDL; the EXACT logical column set comes from
         # PRAGMA table_info (a bare ``"id" in sql`` check is fooled by
