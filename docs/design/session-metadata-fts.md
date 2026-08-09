@@ -1,0 +1,93 @@
+# Session metadata FTS (#25) — stable `row_id` + resumable Unicode external-content index
+
+Status: **implemented on `fts/session-row-id-unicode-migration`** (fork #25).
+
+This documents the architecture shipped by #25 and the invariants later tickets
+(#26 CJK, #27 unified lifecycle/storage settlement, #30 normalized trigram) build on.
+Research context: [`docs/research/issue-32-stable-row-id-unicode-session-fts.md`](../research/issue-32-stable-row-id-unicode-session-fts.md).
+
+## What changed
+
+1. `sessions` gained a named `row_id INTEGER PRIMARY KEY AUTOINCREMENT` while
+   `id TEXT NOT NULL UNIQUE` stays the logical/public identity. Legacy hidden
+   `rowid` values are copied verbatim into `row_id` (deleted-row holes
+   preserved), in one `BEGIN IMMEDIATE` transaction.
+2. `sessions_fts` is now **external-content** over the raw canonical
+   `(title, id, display_name)` tuple, keyed by `content_rowid='row_id'`,
+   `tokenize='unicode61'`. No normalization or synthetic concatenation
+   (that is #30's scope).
+3. Startup no longer runs a blocking one-shot Unicode backfill. It stages a
+   durable H/P claim (`fts_session_rebuild_high_water` / `..._progress`) and
+   the historical rows are backfilled by the resumable chunk engine, sharing
+   the message rebuild's crash-safe claim/repair/finish rules and its single
+   monkeypatchable pause helper.
+
+## Ownership model
+
+A session's `row_id` determines who may touch its FTS document while a rebuild
+is pending:
+
+```mermaid
+flowchart LR
+    subgraph regions["row_id regions during rebuild (H = high water, P = progress)"]
+        L["row_id <= P<br/>already backfilled<br/>triggers maintain FTS"]
+        G["(P, H]<br/>historical worker owns it<br/>triggers leave it alone<br/>search supplements it"]
+        R["row_id > H<br/>live row<br/>inserted after capture<br/>trigger indexes immediately"]
+    end
+```
+
+The live triggers gate on `row_id > H OR row_id <= P`; when no rebuild is
+pending both markers are absent and `COALESCE(..., -1)` makes the gate a
+tautology (normal operation). This makes every existing canonical
+session-delete path correct without a second manual FTS delete path:
+
+- deleting `<= P` removes the already-indexed document;
+- deleting `(P, H]` issues no external-content delete (the document was never
+  indexed) and the later range backfill simply finds no canonical row;
+- deleting `> H` removes the live-indexed document.
+
+## Crash-safe H/P rebuild
+
+Reuses the accepted message-FTS seam (upstream #76832):
+
+- durable claim is committed **before** an empty external index can look
+  complete;
+- `H` present / `P` missing never replays from zero over a maybe-partial index:
+  either a proven boundary is recovered or the index is reset known-empty
+  (`'delete-all'`) first;
+- each chunk claims `(P, min(P + _FTS_REBUILD_CHUNK_ROWS, H)]` and publishes
+  progress in the same `BEGIN IMMEDIATE` transaction (crash-atomic, and two
+  concurrent runners interleave disjoint chunks);
+- finish runs a narrow docsize anti-join boundary sweep before clearing the
+  markers.
+
+## Search during migration
+
+`_fts_metadata_candidates(raw_query)` is the raw Unicode lane over
+`(title, id, display_name)`. While the backfill is pending it supplements only
+the bounded gap `(P, H]` from canonical rows and deduplicates by `row_id`, so
+migration never silently hides a matching session. The existing normalized /
+infix `%LIKE%` fallback in `list_sessions_rich(search_query=...)` is preserved
+unchanged until #30 deliberately replaces it.
+
+## Files
+
+- `hermes_state_common.py` — `SESSIONS_FTS_SQL` (external DDL + gated narrow
+  triggers), `SESSION_TABLE_REBUILD_SQL` / `SESSION_INDEX_SQL_STATEMENTS`,
+  `FTS_STORAGE_VERSION = 2`.
+- `hermes_state.py` — `_migrate_sessions_row_id`, `_ensure_sessions_fts_schema`,
+  `_db_has_internal_content_sessions_fts`, `_backfill_sessions_fts_cjk`,
+  `_session_fts_rebuild_gap`, `_fts_metadata_candidates`, updated
+  `_fts_numbered_variants`.
+- `hermes_state_schema.py` — `_init_schema` wiring, `fts_storage_version`
+  stamp requires session-settled.
+- `hermes_state_search.py` — shared `_FTS_MESSAGE_SPEC` / `_FTS_SESSION_SPEC`,
+  parameterized `fts_rebuild_status/step`, `_fts_rebuild_finish`,
+  `_seed_fts_rebuild_markers`, `_repair_optimize_bookkeeping`,
+  `_fts_rebuild_pause`, session wrappers + `_repair_session_fts_bookkeeping`,
+  `fts_optimize_available` / `optimize_fts_storage` session phase.
+- `hermes_cli/session_recovery.py` — session markers treated as generated /
+  pending in offline recovery.
+- `tests/test_session_metadata_fts.py` — rowid-hole migration, raw Unicode
+  external-content, H/P ownership regions, crash/restart, bounded-gap search +
+  finish, concurrency + shared throttle.
