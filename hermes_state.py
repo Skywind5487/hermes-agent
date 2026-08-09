@@ -76,7 +76,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
-from hermes_state_search import SessionSearchMixin
+from hermes_state_lineage import SessionSearchMixin
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
