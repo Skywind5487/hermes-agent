@@ -107,7 +107,7 @@ _FTS_SESSION_CJK_SPEC = {
     "reset_tables": ("sessions_fts_cjk",),
     "available": lambda self: getattr(self, "_sessions_cjk_worker_operable", False),
     "trigram_available": lambda self: False,
-    "finish_hook": lambda self: setattr(self, "_sessions_cjk_available", True),
+    "finish_hook": lambda self: self._fts_session_cjk_finish_set_serving(),
 }
 
 
@@ -442,6 +442,24 @@ class SessionSearchMixin:
         """
         return self.fts_rebuild_step(spec=_FTS_SESSION_CJK_SPEC)
 
+    def _fts_session_cjk_finish_set_serving(self) -> None:
+        """Flip session-CJK search-serving on after finish, unless the index
+        is stale (issue #26).
+
+        #77629/#26 invariant: only a successful boundary-sweep finish that
+        also finds no stale breadcrumb makes the index search-serving. An
+        incapable host may have persisted ``fts_session_cjk_stale`` and
+        dropped the CJK triggers mid-rebuild, leaving a gap of unknown
+        extent — that index is never served until a capable host resets and
+        rebuilds.
+        """
+        with self._read_ctx() as conn:
+            stale = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (FTS_SESSION_CJK_STALE_KEY,),
+            ).fetchone()
+        self._sessions_cjk_available = stale is None
+
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
         with self._read_ctx() as conn:
@@ -532,37 +550,56 @@ class SessionSearchMixin:
         self._fts_cjk_available = True
         logger.info("CJK FTS index backfill complete — serving CJK search.")
 
-    def _fts_cjk_reset_if_stale(self) -> None:
-        """Rebuild path for a stale cjk index (triggers were dropped).
+    def _fts_reset_stale_cjk_surface(
+        self,
+        *,
+        stale_key: str,
+        trigger_tuple: Collection[str],
+        drop_tables: Collection[str],
+        drop_views: Collection[str] = (),
+        meta_keys: Collection[str],
+        recreate: Callable[[], None],
+    ) -> None:
+        """Drop-and-recreate a stale optional CJK index from scratch, shared
+        by the message (``_fts_cjk_reset_if_stale``) and session
+        (``_fts_session_cjk_reset_if_stale``) CJK surfaces.
 
-        The gap's extent is unknown, so the only safe recovery is a from-
-        scratch rebuild: drop the table + triggers, clear the breadcrumb,
-        recreate via ``_ensure_fts_cjk_schema`` (which sets fresh backfill
-        markers on a populated DB). Called from ``optimize_fts_storage`` on
-        a tokenizer-capable host; no-op when not stale.
+        A stale index (its triggers were dropped by a tokenizer-less host) has
+        a gap of unknown extent, so the only safe recovery is a from-scratch
+        rebuild: drop the table + triggers, clear the stale breadcrumb and any
+        H/P, then let ``recreate`` re-ensure the surface (which sets fresh
+        backfill markers on a populated DB). No-op when not stale or not
+        tokenizer-capable.
         """
         if not self._fts_cjk_loaded:
             return
 
         def _do(conn):
             stale = conn.execute(
-                "SELECT 1 FROM state_meta WHERE key = ?",
-                (FTS_CJK_STALE_KEY,),
+                "SELECT 1 FROM state_meta WHERE key = ?", (stale_key,),
             ).fetchone()
             if not stale:
                 return False
-            for trig in _FTS_CJK_TRIGGERS:
+            for trig in trigger_tuple:
                 conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
-            conn.execute("DROP TABLE IF EXISTS messages_fts_cjk")
-            conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+            for tbl in drop_tables:
+                conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+            for view in drop_views:
+                conn.execute(f"DROP VIEW IF EXISTS {view}")
+            ph = ", ".join("?" for _ in meta_keys)
             conn.execute(
-                "DELETE FROM state_meta WHERE key IN "
-                f"('{FTS_CJK_STALE_KEY}', 'fts_cjk_rebuild_high_water', "
-                "'fts_cjk_rebuild_progress')"
+                f"DELETE FROM state_meta WHERE key IN ({ph})", tuple(meta_keys),
             )
             return True
+
         was_stale = self._execute_write(_do)
         if was_stale:
+            recreate()
+
+    def _fts_cjk_reset_if_stale(self) -> None:
+        """Rebuild path for a stale message CJK index (triggers were dropped).
+        See ``_fts_reset_stale_cjk_surface``."""
+        def _recreate():
             # Recreate outside the write transaction — _ensure_fts_cjk_schema
             # uses executescript(), which implicitly commits any pending
             # transaction and must not run inside _execute_write's BEGIN
@@ -571,52 +608,47 @@ class SessionSearchMixin:
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
 
+        self._fts_reset_stale_cjk_surface(
+            stale_key=FTS_CJK_STALE_KEY,
+            trigger_tuple=_FTS_CJK_TRIGGERS,
+            drop_tables=("messages_fts_cjk",),
+            drop_views=("messages_fts_cjk_src",),
+            meta_keys=(
+                FTS_CJK_STALE_KEY,
+                "fts_cjk_rebuild_high_water",
+                "fts_cjk_rebuild_progress",
+            ),
+            recreate=_recreate,
+        )
+
     def _fts_session_cjk_reset_if_stale(self) -> None:
         """Rebuild path for a stale session-CJK index (triggers were dropped
-        by a tokenizer-less host, issue #26).
-
-        The gap's extent is unknown, so the only safe recovery is a from-
-        scratch rebuild: drop the table + triggers, clear the breadcrumb and
-        any CJK H/P, then recreate via ``_ensure_sessions_fts_cjk_schema``
-        (which sets fresh CJK-session markers on a populated DB). Called from
-        ``optimize_fts_storage`` on a tokenizer-capable host; no-op when not
-        stale.
-        """
-        if not self._fts_cjk_loaded:
-            return
-
-        def _do(conn):
-            stale = conn.execute(
-                "SELECT 1 FROM state_meta WHERE key = ?",
-                (FTS_SESSION_CJK_STALE_KEY,),
-            ).fetchone()
-            if not stale:
-                return False
-            for trig in _FTS_SESSION_CJK_TRIGGERS:
-                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
-            conn.execute("DROP TABLE IF EXISTS sessions_fts_cjk")
-            for tbl in (
-                "sessions_fts_cjk_data", "sessions_fts_cjk_idx",
-                "sessions_fts_cjk_content", "sessions_fts_cjk_docsize",
-                "sessions_fts_cjk_config",
-            ):
-                conn.execute(f"DROP TABLE IF EXISTS {tbl}")
-            conn.execute(
-                "DELETE FROM state_meta WHERE key IN "
-                f"('{FTS_SESSION_CJK_STALE_KEY}', "
-                "'fts_session_cjk_rebuild_high_water', "
-                "'fts_session_cjk_rebuild_progress')"
-            )
-            return True
-        was_stale = self._execute_write(_do)
-        if was_stale:
+        by a tokenizer-less host, issue #26). See
+        ``_fts_reset_stale_cjk_surface``."""
+        def _recreate():
             # Recreate OUTSIDE the write transaction and OUTSIDE self._lock:
             # _ensure_sessions_fts_cjk_schema manages its own locking (its
-            # crash-atomic transition uses _execute_write, and self._lock is
-            # a plain non-reentrant Lock). Sets fresh CJK-session markers on
-            # a populated DB.
+            # crash-atomic transition uses _execute_write, and self._lock is a
+            # plain non-reentrant Lock). Sets fresh CJK-session markers on a
+            # populated DB.
             self._ensure_sessions_fts_cjk_schema(self._conn)
             self._conn.commit()
+
+        self._fts_reset_stale_cjk_surface(
+            stale_key=FTS_SESSION_CJK_STALE_KEY,
+            trigger_tuple=_FTS_SESSION_CJK_TRIGGERS,
+            drop_tables=(
+                "sessions_fts_cjk", "sessions_fts_cjk_data",
+                "sessions_fts_cjk_idx", "sessions_fts_cjk_content",
+                "sessions_fts_cjk_docsize", "sessions_fts_cjk_config",
+            ),
+            meta_keys=(
+                FTS_SESSION_CJK_STALE_KEY,
+                "fts_session_cjk_rebuild_high_water",
+                "fts_session_cjk_rebuild_progress",
+            ),
+            recreate=_recreate,
+        )
 
     def _fts_external_index_empty_with_source(
         self, conn, source_table: str, fts_table: str
@@ -746,19 +778,26 @@ class SessionSearchMixin:
             )
         return int(hw)
 
-    def _seed_session_fts_rebuild_markers(
-        self, conn, *, force: bool = False
+    def _seed_session_spec_rebuild_markers(
+        self, conn, spec: Dict[str, Any], *, force: bool = False
     ) -> int:
-        """Session Unicode metadata variant of ``_seed_fts_rebuild_markers``.
+        """Shared session-metadata variant of ``_seed_fts_rebuild_markers``.
 
         An empty DB is complete by construction (the triggers cover every
         future row) and must not carry a spurious claim that would make
-        ``fts_optimize_available`` advertise pending work forever.
+        ``fts_optimize_available`` advertise pending work forever. Shared by
+        the Unicode (issue #25) and CJK (issue #26) session specs.
         """
         n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
         if n == 0 and not force:
             return 0
-        return self._seed_fts_rebuild_markers(
+        return self._seed_fts_rebuild_markers(conn, spec, force=force)
+
+    def _seed_session_fts_rebuild_markers(
+        self, conn, *, force: bool = False
+    ) -> int:
+        """Session Unicode metadata variant of ``_seed_fts_rebuild_markers``."""
+        return self._seed_session_spec_rebuild_markers(
             conn, _FTS_SESSION_SPEC, force=force
         )
 
@@ -766,17 +805,8 @@ class SessionSearchMixin:
         self, conn, *, force: bool = False
     ) -> int:
         """Session CJK metadata variant of ``_seed_fts_rebuild_markers``
-        (issue #26).
-
-        An empty DB is complete by construction (the triggers cover every
-        future row) and must not carry a spurious claim that would make
-        ``fts_optimize_available`` advertise pending work forever. Gated on
-        tokenizer capability by the caller.
-        """
-        n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-        if n == 0 and not force:
-            return 0
-        return self._seed_fts_rebuild_markers(
+        (issue #26). Gated on tokenizer capability by the caller."""
+        return self._seed_session_spec_rebuild_markers(
             conn, _FTS_SESSION_CJK_SPEC, force=force
         )
 
@@ -849,67 +879,50 @@ class SessionSearchMixin:
                 self._seed_fts_rebuild_markers(conn, force=True)
         self._execute_write(_do)
 
-    def _repair_session_fts_bookkeeping(self) -> None:
-        """Heal interrupted session Unicode metadata backfill bookkeeping
-        (#25). Reuses ``_repair_missing_progress`` (the shared crash-safe
-        rule) for the orphan high_water-without-progress case, and its own
-        orphan claim-seeding for a fresh external index over a populated DB
-        that lost its markers. Never re-implements the reset-before-replay
-        rule.
+    def _repair_session_spec_bookkeeping(self, spec: Dict[str, Any]) -> None:
+        """Shared session-metadata repair for interrupted backfill bookkeeping
+        (#25 Unicode / #26 CJK). Reuses ``_repair_missing_progress`` (the
+        shared crash-safe rule) for the orphan high_water-without-progress
+        case, and seeds a fresh claim for a fresh external index over a
+        populated DB that lost its markers. Never re-implements the
+        reset-before-replay rule.
         """
         def _do(conn):
             existing_hw = conn.execute(
-                "SELECT value FROM state_meta "
-                "WHERE key = 'fts_session_rebuild_high_water'"
+                "SELECT value FROM state_meta WHERE key = ?",
+                (spec["high_water_key"],),
             ).fetchone()
             if existing_hw is not None:
                 progress = conn.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_session_rebuild_progress'"
+                    "SELECT 1 FROM state_meta WHERE key = ?",
+                    (spec["progress_key"],),
                 ).fetchone()
                 if progress is None:
-                    self._repair_missing_progress(conn, _FTS_SESSION_SPEC)
+                    self._repair_missing_progress(conn, spec)
                 return
             # No claim: a freshly-created external index over a populated DB
             # that lost its markers, or a crash window after schema ensure
             # without a claim. Seed a full backfill (orphan recovery).
             if self._fts_external_index_empty_with_source(
-                conn, "sessions", "sessions_fts"
+                conn, spec["source_table"], spec["fts_table"]
             ):
-                self._seed_session_fts_rebuild_markers(conn, force=True)
+                self._seed_session_spec_rebuild_markers(conn, spec, force=True)
         self._execute_write(_do)
 
-    def _repair_session_cjk_fts_bookkeeping(self) -> None:
-        """Heal interrupted session-CJK backfill bookkeeping (issue #26).
+    def _repair_session_fts_bookkeeping(self) -> None:
+        """Heal interrupted session Unicode metadata backfill bookkeeping
+        (#25). See ``_repair_session_spec_bookkeeping``."""
+        self._repair_session_spec_bookkeeping(_FTS_SESSION_SPEC)
 
-        Reuses ``_repair_missing_progress`` (the shared crash-safe rule) for
-        the orphan high_water-without-progress case, and seeds a fresh CJK
-        claim for a fresh external index over a populated DB that lost its
-        markers. Never re-implements the reset-before-replay rule. Only
-        meaningful on a tokenizer-capable host: an incapable host cannot have
-        created the CJK surface, and must never fabricate durable CJK claims.
+    def _repair_session_cjk_fts_bookkeeping(self) -> None:
+        """Heal interrupted session-CJK backfill bookkeeping (issue #26). See
+        ``_repair_session_spec_bookkeeping``. Only meaningful on a
+        tokenizer-capable host: an incapable host cannot have created the CJK
+        surface, and must never fabricate durable CJK claims.
         """
         if not self._fts_cjk_loaded:
             return
-
-        def _do(conn):
-            existing_hw = conn.execute(
-                "SELECT value FROM state_meta "
-                "WHERE key = 'fts_session_cjk_rebuild_high_water'"
-            ).fetchone()
-            if existing_hw is not None:
-                progress = conn.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_session_cjk_rebuild_progress'"
-                ).fetchone()
-                if progress is None:
-                    self._repair_missing_progress(conn, _FTS_SESSION_CJK_SPEC)
-                return
-            if self._fts_external_index_empty_with_source(
-                conn, "sessions", "sessions_fts_cjk"
-            ):
-                self._seed_session_cjk_fts_rebuild_markers(conn, force=True)
-        self._execute_write(_do)
+        self._repair_session_spec_bookkeeping(_FTS_SESSION_CJK_SPEC)
 
     def fts_optimize_available(self) -> bool:
         """True when `optimize_fts_storage()` has work to do: either this DB

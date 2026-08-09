@@ -2479,18 +2479,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return "tool_name" not in sql
 
     @staticmethod
-    def _db_has_internal_content_sessions_fts(cursor: sqlite3.Cursor) -> bool:
-        """True when sessions_fts is the pre-#25 internal-content shape.
+    @staticmethod
+    def _db_has_internal_content_fts(
+        cursor: sqlite3.Cursor, table: str
+    ) -> bool:
+        """True when the given sessions FTS table is an internal-content shape.
 
-        #25's sessions_fts is external-content over raw (title, id,
-        display_name). The pre-#25 shape stores its own copy (title-only).
-        Detected by the absence of ``content=`` in the stored CREATE.
-        Returns False when sessions_fts doesn't exist yet (fresh DB mid-init):
-        the ensure path creates the external shape directly.
+        The #25/#26 external-content shape declares ``content=`` over the
+        canonical ``sessions`` table; any internal-content shape stores its
+        own copy (title-only, pre-#25/#26). Detected by the absence of
+        ``content=`` in the stored CREATE. Returns False when the table
+        doesn't exist yet (fresh DB mid-init): the ensure path creates the
+        external shape directly.
         """
         row = cursor.execute(
             "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'sessions_fts'"
+            "WHERE type = 'table' AND name = ?",
+            (table,),
         ).fetchone()
         if row is None:
             return False
@@ -2498,25 +2503,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return "content=" not in sql
 
     @staticmethod
+    def _db_has_internal_content_sessions_fts(cursor: sqlite3.Cursor) -> bool:
+        """True when sessions_fts is the pre-#25 internal-content shape."""
+        return SessionDB._db_has_internal_content_fts(cursor, "sessions_fts")
+
+    @staticmethod
     def _db_has_internal_content_sessions_fts_cjk(
         cursor: sqlite3.Cursor,
     ) -> bool:
-        """True when sessions_fts_cjk is the pre-#26 internal title-only shape.
-
-        #26's sessions_fts_cjk is external-content over raw (title, id,
-        display_name). The pre-#26 shape stores its own copy (title-only).
-        Detected by the absence of ``content=`` in the stored CREATE.
-        Returns False when sessions_fts_cjk doesn't exist yet (fresh DB
-        mid-init): the ensure path creates the external shape directly.
-        """
-        row = cursor.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'sessions_fts_cjk'"
-        ).fetchone()
-        if row is None:
-            return False
-        sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
-        return "content=" not in sql
+        """True when sessions_fts_cjk is the pre-#26 internal title-only shape."""
+        return SessionDB._db_has_internal_content_fts(cursor, "sessions_fts_cjk")
 
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""

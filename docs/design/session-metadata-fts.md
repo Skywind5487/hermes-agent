@@ -198,16 +198,16 @@ mingw). The CJK tests build it on the fly in CI or honor a prebuilt
   storage-version settlement is #27).
 - `hermes_state_search.py` — shared `_FTS_MESSAGE_SPEC` / `_FTS_SESSION_SPEC` /
   `_FTS_SESSION_CJK_SPEC`, parameterized `fts_rebuild_status/step`,
-  `_fts_rebuild_finish` (honors the spec's operability gate + `finish_hook`),
-  `_seed_fts_rebuild_markers` / `_seed_session_cjk_fts_rebuild_markers`,
-  `_repair_missing_progress` (the shared crash-safe repair),
-  `_repair_optimize_bookkeeping` / `_repair_session_fts_bookkeeping` /
-  `_repair_session_cjk_fts_bookkeeping`, `_fts_cjk_reset_if_stale` /
-  `_fts_session_cjk_reset_if_stale`, `_fts_rebuild_pause`,
-  `fts_optimize_available` / `optimize_fts_storage` session (+ session-CJK)
-  phase.
-- `hermes_cli/session_recovery.py` — session markers treated as generated /
-  pending in offline recovery.
+  `_fts_rebuild_finish` (honors the spec's operability gate + `finish_hook`;
+  the session-CJK hook gates search-serving on "not stale"),
+  `_seed_fts_rebuild_markers` / `_seed_session_spec_rebuild_markers`,
+  `_repair_missing_progress` (the shared crash-safe repair) /
+  `_repair_session_spec_bookkeeping`, `_fts_reset_stale_cjk_surface` /
+  `_fts_cjk_reset_if_stale` / `_fts_session_cjk_reset_if_stale`,
+  `_fts_rebuild_pause`, `fts_optimize_available` / `optimize_fts_storage`
+  session (+ session-CJK) phase.
+- `hermes_cli/session_recovery.py` — session Unicode + CJK markers treated as
+  generated / pending in offline recovery.
 - `tests/test_session_metadata_fts.py` — rowid-hole migration (incl. legacy
   duplicate-title upgrade), raw Unicode external-content, H/P ownership
   regions, crash/restart (incl. the partial-index H-without-P orphan

@@ -318,6 +318,30 @@ class TestCjkRebuildMarkers:
         finally:
             d.close()
 
+    def test_finish_hook_keeps_search_unavailable_when_stale(
+        self, cjk_so, tmp_path, monkeypatch
+    ):
+        """A stale breadcrumb persisted by an incapable host mid-rebuild (it
+        dropped the CJK triggers, leaving a gap of unknown extent) must keep
+        search-serving OFF even after finish clears the H/P markers — an index
+        with an unknown gap is never served in-process (#77629/#26)."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=50)
+        d = _open_capable(db_path, cjk_so, monkeypatch)
+        try:
+            # Simulate an incapable host persisting the stale breadcrumb
+            # while the rebuild is in flight.
+            d.set_meta(CJK_STALE, "1")
+            while d.fts_session_cjk_rebuild_step():
+                pass
+            # Finish ran (markers cleared) but search must stay unavailable.
+            assert d.get_meta(CJK_HW) is None
+            assert d.get_meta(CJK_PROG) is None
+            assert d.get_meta(CJK_STALE) == "1"
+            assert d._sessions_cjk_available is False
+        finally:
+            d.close()
+
     def test_cjk_markers_survive_reopen_no_reseed(self, cjk_so, tmp_path, monkeypatch):
         """A partial CJK rebuild is not reseeded to zero on reopen — the same
         H/P resume as the Unicode lifecycle."""
