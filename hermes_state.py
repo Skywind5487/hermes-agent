@@ -234,6 +234,23 @@ def _fts_query_positive_terms(raw_query: str) -> List[str]:
     return terms
 
 
+def _split_fts_sql_statements(ddl: str) -> List[str]:
+    """Split a fixed FTS DDL constant into individual statements.
+
+    Statements are separated by blank lines; trigger bodies contain
+    semicolons but no blank lines, so ``split("\n\n")`` is a safe boundary
+    for the module's fixed DDL constants (used by the crash-atomic transition,
+    which cannot use executescript's implicit COMMIT).
+    """
+    return [s.strip() for s in ddl.split("\n\n") if s.strip()]
+
+
+# The #25 sessions_fts DDL split into its four statements (external table +
+# three gated triggers), executed individually inside the crash-atomic
+# transition's BEGIN IMMEDIATE.
+_SESSIONS_FTS_STATEMENTS = _split_fts_sql_statements(SESSIONS_FTS_SQL)
+
+
 def _scrub_surrogates(value: Any) -> Any:
     """Replace lone surrogates when *value* is text; pass anything else through.
 
@@ -2593,67 +2610,77 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not existing and self.get_meta("fts_session_rebuild_high_water") is None:
             self._seed_session_fts_rebuild_markers(cursor)
 
-        ok = self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
+        # ── Crash-atomic schema + catch-up transition (#25) ────────
+        # The durable H capture + old-table teardown committed in the stage
+        # transaction above, so a concurrent writer can commit a session in
+        # the trigger-free window that follows. When the external table is
+        # being created NOW (internal→external conversion or fresh-create over
+        # a populated DB), schema install AND the trigger-owned-region catch-up
+        # must land in ONE BEGIN IMMEDIATE: a window row is caught up, a crash
+        # mid-transition rolls back schema + catch-up together (reopen re-runs
+        # it), and rows committing after the commit are trigger-indexed. When
+        # the table already exists (reopen), the plain IF NOT EXISTS ensure
+        # suffices — triggers are already durable, so no window.
+        if not existing:
+            ok = self._fts_session_schema_transition(cursor)
+        else:
+            ok = self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
         if not ok:
             self._sessions_fts_available = False
             return False
-        # ── Transition catch-up (#25) ──────────────────────────────
-        # The durable H capture + old-table teardown commit in one write
-        # transaction, but the new external table + gated triggers are ensured
-        # afterwards (executescript issues its own COMMIT). A concurrent
-        # writer can therefore commit a session with row_id > H in the window
-        # where NO trigger exists yet — it is neither trigger-indexed nor in
-        # the (P,H] gap supplement, so it would be invisible until a full
-        # rebuild. Catch it up in a fresh BEGIN IMMEDIATE now that the
-        # triggers exist: the NOT EXISTS docsize anti-join makes it
-        # idempotent, and any row committing after this transaction is
-        # trigger-indexed. Covers both the internal→external conversion and
-        # the fresh-create-over-populated path (existing == False either way).
-        if not existing:
-            self._fts_session_transition_catchup(cursor)
         return True
 
-    def _fts_session_transition_catchup(self, cursor) -> None:
-        """Backfill rows that slipped into the trigger-owned region while the
-        #25 external schema was being created (see ``_ensure_sessions_fts_schema``).
+    def _fts_session_schema_transition(self, cursor) -> bool:
+        """Crash-atomic install of the #25 external sessions_fts schema AND
+        the trigger-owned-region catch-up, in one ``BEGIN IMMEDIATE``.
 
-        Rows in the trigger's ownership (``row_id > H OR row_id <= P``) that
-        are not yet in the index are inserted directly; the docsize anti-join
-        dedupes any already-indexed row. Runs in its own write transaction
-        AFTER the triggers exist, so the window is closed: anything committing
-        after this transaction is indexed by the live trigger. A DB with no
-        markers (empty / complete index) has nothing to catch up, so no write
-        is issued. The write is schema-init bookkeeping and must NOT advance
-        the routine-write merge cadence, so ``_write_count`` is restored.
+        Executes the DDL statement-by-statement (CREATE VIRTUAL TABLE + the
+        three gated triggers) and then the catch-up INSERT inside a single
+        write transaction, so the whole transition is atomic: a writer that
+        committed in the trigger-free window (after the stage transaction
+        released the lock but before the triggers existed) is caught up; a
+        writer mid-transaction is blocked; a writer after COMMIT is
+        trigger-indexed; a crash mid-transition rolls everything back, and the
+        reopen re-runs the transition. The catch-up predicate uses
+        ``COALESCE(H, -1)`` / ``COALESCE(P, -1)`` so the no-marker (empty /
+        complete) case is covered too — with no markers every ``row_id > -1``
+        is trigger-owned, which also catches an empty DB's first window row.
+        DDL runs via individual ``execute`` (not ``executescript``, whose
+        implicit COMMIT would break the transaction).
         """
         def _do(conn):
-            hw_row = conn.execute(
-                "SELECT CAST(value AS INTEGER) FROM state_meta "
-                "WHERE key = 'fts_session_rebuild_high_water'"
-            ).fetchone()
-            if hw_row is None:
-                return
-            hw = int(hw_row[0])
-            p_row = conn.execute(
-                "SELECT CAST(value AS INTEGER) FROM state_meta "
-                "WHERE key = 'fts_session_rebuild_progress'"
-            ).fetchone()
-            progress = int(p_row[0]) if p_row is not None else 0
+            for stmt in _SESSIONS_FTS_STATEMENTS:
+                conn.execute(stmt)
             conn.execute(
                 "INSERT INTO sessions_fts(rowid, title, id, display_name) "
                 "SELECT s.row_id, s.title, s.id, s.display_name "
                 "FROM sessions s "
-                "WHERE (s.row_id > ? OR s.row_id <= ?) "
+                "WHERE (s.row_id > COALESCE("
+                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                "     WHERE key = 'fts_session_rebuild_high_water'), -1)"
+                "   OR s.row_id <= COALESCE("
+                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                "     WHERE key = 'fts_session_rebuild_progress'), -1))"
                 "  AND NOT EXISTS ("
                 "    SELECT 1 FROM sessions_fts_docsize d WHERE d.id = s.row_id"
-                "  )",
-                (hw, progress),
+                "  )"
             )
+        # Schema-init bookkeeping must not advance the routine-write merge
+        # cadence (the write-path cadence test asserts exact boundaries).
         before = self._write_count
         try:
             self._execute_write(_do)
+        except sqlite3.OperationalError as exc:
+            if self._is_fts5_unavailable_error(exc):
+                self._warn_fts5_unavailable(exc)
+                return False
+            if self._is_trigram_unavailable_error(exc):
+                self._warn_trigram_unavailable(exc)
+                return False
+            raise
         finally:
             self._write_count = before
+        return True
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.

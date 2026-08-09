@@ -835,30 +835,29 @@ class TestTriggerOwnershipRegions:
         full rebuild."""
         db_path = tmp_path / "legacy.db"
         _build_legacy_message_and_session_fts_db(db_path)  # A(1) B(3) C(7) A-child(8)
-        real_ensure = SessionDB._ensure_fts_schema
+        real_transition = SessionDB._fts_session_schema_transition
 
-        def _ensure_with_window_insert(self, cursor, table_name, ddl):
-            if table_name == "sessions_fts":
-                # Simulate the other-process write in the trigger-free window:
-                # the stage transaction already committed H; insert a row above
-                # it via a second raw connection (no sessions_fts trigger
-                # exists yet, so the row is not indexed).
-                with sqlite3.connect(str(db_path)) as conn:
-                    hw = conn.execute(
-                        "SELECT CAST(value AS INTEGER) FROM state_meta "
-                        "WHERE key = 'fts_session_rebuild_high_water'"
-                    ).fetchone()
-                    hw = int(hw[0]) if hw else 0
-                    conn.execute(
-                        "INSERT INTO sessions (id, source, started_at) "
-                        "VALUES ('W', 'cli', ?)",
-                        (time.time(),),
-                    )
-                    conn.commit()
-            return real_ensure(self, cursor, table_name, ddl)
+        def _transition_with_window_insert(self, cursor):
+            # Simulate the other-process write in the trigger-free window:
+            # the stage transaction already committed H; insert a row above
+            # it via a second raw connection (no sessions_fts trigger exists
+            # yet, so the row is not indexed).
+            with sqlite3.connect(str(db_path)) as conn:
+                hw = conn.execute(
+                    "SELECT CAST(value AS INTEGER) FROM state_meta "
+                    "WHERE key = 'fts_session_rebuild_high_water'"
+                ).fetchone()
+                hw = int(hw[0]) if hw else 0
+                conn.execute(
+                    "INSERT INTO sessions (id, source, started_at) "
+                    "VALUES ('W', 'cli', ?)",
+                    (time.time(),),
+                )
+                conn.commit()
+            return real_transition(self, cursor)
 
         monkeypatch.setattr(
-            SessionDB, "_ensure_fts_schema", _ensure_with_window_insert
+            SessionDB, "_fts_session_schema_transition", _transition_with_window_insert
         )
         r = SessionDB(db_path=db_path)
         try:
@@ -885,29 +884,124 @@ class TestTriggerOwnershipRegions:
         up, not left invisible."""
         db_path = tmp_path / "s.db"
         _build_populated_sessions_db(db_path, n=50)  # no sessions_fts yet
-        real_ensure = SessionDB._ensure_fts_schema
+        real_transition = SessionDB._fts_session_schema_transition
 
-        def _ensure_with_window_insert(self, cursor, table_name, ddl):
-            if table_name == "sessions_fts":
-                with sqlite3.connect(str(db_path)) as conn:
-                    hw = conn.execute(
-                        "SELECT CAST(value AS INTEGER) FROM state_meta "
-                        "WHERE key = 'fts_session_rebuild_high_water'"
-                    ).fetchone()
-                    hw = int(hw[0]) if hw else 0
-                    conn.execute(
-                        "INSERT INTO sessions (id, source, started_at) "
-                        "VALUES ('W', 'cli', ?)",
-                        (time.time(),),
-                    )
-                    conn.commit()
-            return real_ensure(self, cursor, table_name, ddl)
+        def _transition_with_window_insert(self, cursor):
+            with sqlite3.connect(str(db_path)) as conn:
+                hw = conn.execute(
+                    "SELECT CAST(value AS INTEGER) FROM state_meta "
+                    "WHERE key = 'fts_session_rebuild_high_water'"
+                ).fetchone()
+                hw = int(hw[0]) if hw else 0
+                conn.execute(
+                    "INSERT INTO sessions (id, source, started_at) "
+                    "VALUES ('W', 'cli', ?)",
+                    (time.time(),),
+                )
+                conn.commit()
+            return real_transition(self, cursor)
 
         monkeypatch.setattr(
-            SessionDB, "_ensure_fts_schema", _ensure_with_window_insert
+            SessionDB, "_fts_session_schema_transition", _transition_with_window_insert
         )
         r = SessionDB(db_path=db_path)
         try:
+            assert _raw_metadata_match_ids(r, "W") == ["W"]
+            result = r.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True, result
+            n_sessions = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            n_docs = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions_fts_docsize"
+            ).fetchone()[0]
+            assert n_docs == n_sessions
+        finally:
+            r.close()
+
+    def test_empty_legacy_first_row_window_is_caught_up(
+        self, tmp_path, monkeypatch
+    ):
+        """Case A: on a legacy empty DB the H/P markers are deliberately
+        absent (complete-by-construction), so an early-return on 'no markers'
+        would drop a FIRST row inserted by another connection in the
+        trigger-free window. The crash-atomic transition's COALESCE(H,-1)
+        predicate makes every row trigger-owned, so the first window row is
+        caught up and immediately searchable."""
+        db_path = tmp_path / "legacy-empty.db"
+        _build_legacy_empty_session_fts_db(db_path)  # old internal FTS, 0 rows
+        real_transition = SessionDB._fts_session_schema_transition
+
+        def _transition_with_first_row(self, cursor):
+            # Insert the FIRST session via a second connection in the
+            # trigger-free window (the old internal table + triggers were
+            # dropped by the stage commit; no external trigger exists yet).
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "INSERT INTO sessions (id, source, started_at) "
+                    "VALUES ('W', 'cli', ?)",
+                    (time.time(),),
+                )
+                conn.commit()
+            return real_transition(self, cursor)
+
+        monkeypatch.setattr(
+            SessionDB, "_fts_session_schema_transition", _transition_with_first_row
+        )
+        r = SessionDB(db_path=db_path)
+        try:
+            # The first window row is immediately searchable (COALESCE(H,-1)
+            # covers the no-marker case).
+            assert _raw_metadata_match_ids(r, "W") == ["W"]
+            result = r.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True, result
+            n_sessions = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            n_docs = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions_fts_docsize"
+            ).fetchone()[0]
+            assert n_docs == n_sessions
+        finally:
+            r.close()
+
+    def test_populated_crash_before_transition_reopen_catches_up(
+        self, tmp_path
+    ):
+        """Case B: schema/triggers committed but the catch-up never became
+        durable (a crash between the old separate transactions). With the
+        crash-atomic transition this state means schema + catch-up rolled back
+        together, so a reopen re-runs the transition and a >H window row is
+        caught up — never left invisible."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=50)  # 50 sessions, no sessions_fts
+        w = SessionDB(db_path=db_path)  # completes the atomic transition
+        w.close()
+        # Simulate the crash window: external schema + triggers rolled back,
+        # H/P markers durable, and a >H row committed in the trigger-free
+        # window (no trigger existed to index it).
+        with sqlite3.connect(db_path) as conn:
+            for t in (
+                "sessions_fts", "sessions_fts_data", "sessions_fts_idx",
+                "sessions_fts_content", "sessions_fts_docsize",
+                "sessions_fts_config",
+            ):
+                conn.execute(f"DROP TABLE IF EXISTS {t}")
+            for trig in (
+                "sessions_fts_insert", "sessions_fts_delete",
+                "sessions_fts_update",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) "
+                "VALUES ('W', 'cli', ?)",
+                (time.time(),),
+            )
+            conn.commit()
+        r = SessionDB(db_path=db_path)
+        try:
+            # The >H row is immediately searchable after the reopened atomic
+            # transition catches it up.
             assert _raw_metadata_match_ids(r, "W") == ["W"]
             result = r.optimize_fts_storage(vacuum=False)
             assert result["ok"] is True, result

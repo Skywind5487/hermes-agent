@@ -64,14 +64,19 @@ Reuses the accepted message-FTS seam (upstream #76832):
   construction, and an `H=0/P=0` pair would never enter the rebuild (status
   total ≤ 0) yet would leave `optimize_fts_storage` permanently pending as
   `backfill_incomplete`;
-- after the new external table + gated triggers are ensured, a **transition
-  catch-up** runs in its own `BEGIN IMMEDIATE` (a `>H OR <=P` insert with a
-  docsize anti-join): a concurrent writer can commit a `>H` row in the window
-  between the stage transaction's COMMIT and the trigger install, and that
-  row is neither trigger-indexed nor in the `(P,H]` gap supplement — the
-  catch-up closes the window (idempotent; rows committing after it are
-  trigger-indexed). Applies to both the internal→external conversion and the
-  fresh-create-over-populated path;
+- when the external table is created, the schema install (CREATE VIRTUAL
+  TABLE + the three gated triggers) AND the **transition catch-up** land in
+  ONE crash-atomic `BEGIN IMMEDIATE` (DDL executed statement-by-statement —
+  `executescript`'s implicit COMMIT would break the transaction). The
+  catch-up is a `>H OR <=P` insert with a docsize anti-join whose predicate
+  uses `COALESCE(H, -1)` / `COALESCE(P, -1)`, so it also covers the
+  no-marker (empty / complete) case: with no markers every `row_id > -1` is
+  trigger-owned, catching an empty DB's first window row too. This closes the
+  trigger-free window (a concurrent writer committed after the stage
+  transaction released the lock but before the triggers existed is caught
+  up; a crash mid-transition rolls back schema + catch-up together and the
+  reopen re-runs it). Applies to both the internal→external conversion and
+  the fresh-create-over-populated path;
 - `H` present / `P` missing never replays from zero over a maybe-partial index:
   either a proven boundary is recovered or the index is reset known-empty
   (`'delete-all'`) first;
@@ -153,8 +158,9 @@ lane instead of trusting a partial result.
 - `tests/test_session_metadata_fts.py` — rowid-hole migration (incl. legacy
   duplicate-title upgrade), raw Unicode external-content, H/P ownership
   regions, crash/restart (incl. the partial-index H-without-P orphan
-  reset/replay regression), the trigger-install window race (two-connection
-  catch-up regressions for both the internal→external and fresh-create paths),
+  reset/replay regression), the crash-atomic schema+catch-up transition
+  (two-connection window regressions for the internal→external, fresh-create,
+  empty-first-row, and populated crash-reopen paths),
   bounded-gap search (conservative Unicode-fold supplement + its explicit
   non-parity edge, multi-token implicit-AND and OR no-hide regressions,
   sanitizer-quoted `[._-]` punctuation + quoted-boolean + PUA/U+1018C
