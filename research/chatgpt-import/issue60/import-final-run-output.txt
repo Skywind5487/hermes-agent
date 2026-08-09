@@ -1,0 +1,122 @@
+======================================================================
+PHASE 1: FIX EXISTING DB GAPS
+======================================================================
+  Loaded 5447 conversations from export
+  CANNOT FIX: 20231013_125540_0041efa3, user_id=None
+  Existing conv_ids: 4654
+
+======================================================================
+PHASE 2: IMPORT MISSING CONVERSATIONS
+======================================================================
+
+  To import: 793 conversations
+    batch   1:   9 sessions,   17 msgs, 0.15s
+    batch   2:  10 sessions,   19 msgs, 0.17s
+    batch   3:  10 sessions,   34 msgs, 0.98s
+    batch   4:  10 sessions,   44 msgs, 0.40s
+    batch   5:  10 sessions,  172 msgs, 0.55s
+    batch   6:  10 sessions,   28 msgs, 0.05s
+    batch   7:  10 sessions,   73 msgs, 0.06s
+    batch   8:  10 sessions,   54 msgs, 0.05s
+    batch   9:  10 sessions,   36 msgs, 0.03s
+    batch  10:  10 sessions,   48 msgs, 0.34s
+    batch  11:  10 sessions,   90 msgs, 0.62s
+    batch  12:  10 sessions,   58 msgs, 0.12s
+    batch  13:  10 sessions,  321 msgs, 0.63s
+    batch  14:  10 sessions,  108 msgs, 0.18s
+    batch  15:  10 sessions,  157 msgs, 0.40s
+    batch  16:  10 sessions,  346 msgs, 0.36s
+    batch  17:  10 sessions,   28 msgs, 0.12s
+    batch  18:  10 sessions,   28 msgs, 0.05s
+    batch  19:  10 sessions,   20 msgs, 0.02s
+    batch  20:  10 sessions,   25 msgs, 0.07s
+    batch  21:  10 sessions,   20 msgs, 0.08s
+    batch  22:  10 sessions,   20 msgs, 0.04s
+    batch  23:  10 sessions,   28 msgs, 0.15s
+    batch  24:  10 sessions,   50 msgs, 0.13s
+    batch  25:  10 sessions,   20 msgs, 0.04s
+    batch  26:  10 sessions,   21 msgs, 0.02s
+    batch  27:  10 sessions,   20 msgs, 0.02s
+    batch  28:  10 sessions,   20 msgs, 0.01s
+    batch  29:  10 sessions,   40 msgs, 0.04s
+    batch  30:  10 sessions,   90 msgs, 0.11s
+    batch  31:  10 sessions,   32 msgs, 0.04s
+    batch  32:  10 sessions,   44 msgs, 0.03s
+    batch  33:  10 sessions,   31 msgs, 0.04s
+    batch  34:  10 sessions,   22 msgs, 0.02s
+    batch  35:  10 sessions,   29 msgs, 0.07s
+    batch  36:  10 sessions,   18 msgs, 0.03s
+    batch  37:  10 sessions,   20 msgs, 0.01s
+    batch  38:  10 sessions,   22 msgs, 0.02s
+    batch  39:  10 sessions,   21 msgs, 0.02s
+    batch  40:  10 sessions,   24 msgs, 0.02s
+    batch  41:  10 sessions,   19 msgs, 0.04s
+    batch  42:  10 sessions,   29 msgs, 0.02s
+    batch  43:  10 sessions,   18 msgs, 0.01s
+    batch  44:  10 sessions,   19 msgs, 0.01s
+    batch  45:  10 sessions,   19 msgs, 0.01s
+    batch  46:  10 sessions,   40 msgs, 0.03s
+    batch  47:  10 sessions,   22 msgs, 0.05s
+    batch  48:  10 sessions,   19 msgs, 0.02s
+    batch  49:  10 sessions,   45 msgs, 0.06s
+    batch  50:  10 sessions,   18 msgs, 0.15s
+    batch  51:  10 sessions,   23 msgs, 0.03s
+    batch  52:  10 sessions,   31 msgs, 0.07s
+    batch  53:  10 sessions,   20 msgs, 0.05s
+    batch  54:  10 sessions,   24 msgs, 0.01s
+    batch  55:  10 sessions,   20 msgs, 0.01s
+    batch  56:  10 sessions,   20 msgs, 0.03s
+    batch  57:  10 sessions,   20 msgs, 0.02s
+    batch  58:  10 sessions,   19 msgs, 0.01s
+    batch  59:  10 sessions,   23 msgs, 0.03s
+    batch  60:  10 sessions,   24 msgs, 0.02s
+    batch  61:  10 sessions,   20 msgs, 0.01s
+    batch  62:  10 sessions,   73 msgs, 0.06s
+    batch  63:  10 sessions,   27 msgs, 0.01s
+    batch  64:  10 sessions,   22 msgs, 0.01s
+    batch  65:  10 sessions,   19 msgs, 0.07s
+    batch  66:  10 sessions,   24 msgs, 0.03s
+    batch  67:  10 sessions,   43 msgs, 0.04s
+    batch  68:  10 sessions,   30 msgs, 0.03s
+    batch  69:  10 sessions,   20 msgs, 0.01s
+    batch  70:  10 sessions,   26 msgs, 0.01s
+    batch  71:  10 sessions,   35 msgs, 0.06s
+    batch  72:  10 sessions,   19 msgs, 0.02s
+    batch  73:  10 sessions,   29 msgs, 0.01s
+    batch  74:  10 sessions,   22 msgs, 0.02s
+    batch  75:  10 sessions,   30 msgs, 0.02s
+    batch  76:  10 sessions,   39 msgs, 0.07s
+    batch  77:  10 sessions,   19 msgs, 0.01s
+    batch  78:  10 sessions,   21 msgs, 0.02s
+    batch  79:  10 sessions,   28 msgs, 0.02s
+    batch  80:   3 sessions,    6 msgs, 0.00s
+
+  Import complete: 792 sessions, 3322 msgs in 7.5s
+  Rate: 105 sessions/s
+
+======================================================================
+FINAL VERIFICATION
+======================================================================
+
+  Sessions: 5447
+  Messages: 89434
+  Duplicate conv_ids: 0
+  Without conv_id: 1
+
+  Reasoning distribution:
+     62518  no reasoning
+     10551  reasoning_content
+       455  reasoning
+     15910  reasoning+reasoning_content
+
+  '絆線' in new data: 0
+
+  Source breakdown:
+    chatgpt-export             5447
+    discord                     621
+    cron                        253
+    cli                          15
+
+======================================================================
+DONE
+======================================================================

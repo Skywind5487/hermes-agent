@@ -1,0 +1,50 @@
+{
+  "issue": 60,
+  "canonical_db": {
+    "path": "/home/skywind/hermes-recovery/runs/20260807-081043/state.recovered.patched.db",
+    "sha256": "23cfa3c8adb94ed403058329ae7e252e1d4c4bc01ead76e22ac7d0ff99948104",
+    "counts": {
+      "sessions": 7268,
+      "messages": 231513,
+      "gateway_routing": 78
+    },
+    "opened_mode": "mode=ro&immutable=1 + PRAGMA query_only=ON",
+    "mutations_performed": false
+  },
+  "stage2_archive": {
+    "basename": "issue60-stage2-evidence-20260809-211718.tar.gz",
+    "sha256": "97889244b3fef393338e4c3ffdd3378d415bdbe5904e5026ee36b91919b19ae5"
+  },
+  "stage1_archive": {
+    "basename": "issue60-evidence-20260809-130215.tar.gz",
+    "sha256": "04068a446399695324cfd700ec3aeb3f149fa254187ffe7f695f1a32b900e268"
+  },
+  "main_transcript": {
+    "session_id": "20260616_100300_58622e7c",
+    "sha256": "e0e378f43eeaf5ed597b4248ff20de1759c7602fd1bc60e3d87c66c65002c2b8",
+    "committed_publicly": false,
+    "reason": "public repo; raw transcript contains unrelated/private historical context"
+  },
+  "origin_session": {
+    "session_id": "20260616_054313_151a9806",
+    "migration_start_message_id": 90307,
+    "topic_pivot_message_id": 90416
+  },
+  "recovered_final_importer": {
+    "historical_path": "/tmp/chatgpt-export/import_final.py",
+    "session_id": "20260616_100300_58622e7c",
+    "message_id": 188425,
+    "sha256": "e8f2c22a844f4330a5b2d4bbe1871223940d5f8993f1666e7aedf9b9a85c1192"
+  },
+  "final_run_output": {
+    "session_id": "20260616_100300_58622e7c",
+    "message_id": 188428,
+    "sha256": "f17b63778823b1d738630405fb51120c79588ed1f048f1e570a5090580bd087d"
+  },
+  "stage2_results": {
+    "chatgpt_export_sessions": 5447,
+    "prehermes_exact_match_rows": 0,
+    "anomaly_exact_match_rows": 0,
+    "verified_nonzero_crossmatch_sessions": 0
+  }
+}
