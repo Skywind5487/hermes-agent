@@ -66,26 +66,28 @@ Reuses the accepted message-FTS seam (upstream #76832):
 `_fts_metadata_candidates(raw_query)` is the raw Unicode lane over
 `(title, id, display_name)`. While the backfill is pending it supplements only
 the bounded gap `(P, H]` from canonical rows and deduplicates by `row_id`, so
-migration never silently hides a matching session. The existing normalized /
-infix `%LIKE%` fallback in `list_sessions_rich(search_query=...)` is preserved
-unchanged until #30 deliberately replaces it.
+migration never silently hides a matching session. It is wired into the
+production title-lineage resolution path (`_fts_numbered_variants` delegates to
+it for non-CJK titles), and `list_sessions_rich(search_query=...)` now also
+matches the raw `display_name` dimension. The existing normalized / infix
+`%LIKE%` fallback is preserved until #30 deliberately replaces it.
 
 ## Files
 
 - `hermes_state_common.py` — `SESSIONS_FTS_SQL` (external DDL + gated narrow
-  triggers), `SESSION_TABLE_REBUILD_SQL` / `SESSION_INDEX_SQL_STATEMENTS`,
-  `FTS_STORAGE_VERSION = 2`.
+  triggers), `SESSION_TABLE_REBUILD_SQL` / `SESSION_INDEX_SQL_STATEMENTS`.
 - `hermes_state.py` — `_migrate_sessions_row_id`, `_ensure_sessions_fts_schema`,
   `_db_has_internal_content_sessions_fts`, `_backfill_sessions_fts_cjk`,
   `_session_fts_rebuild_gap`, `_fts_metadata_candidates`, updated
   `_fts_numbered_variants`.
-- `hermes_state_schema.py` — `_init_schema` wiring, `fts_storage_version`
-  stamp requires session-settled.
+- `hermes_state_schema.py` — `_init_schema` wiring (the `fts_storage_version`
+  stamp stays message-scoped; unified storage-version settlement is #27).
 - `hermes_state_search.py` — shared `_FTS_MESSAGE_SPEC` / `_FTS_SESSION_SPEC`,
   parameterized `fts_rebuild_status/step`, `_fts_rebuild_finish`,
-  `_seed_fts_rebuild_markers`, `_repair_optimize_bookkeeping`,
-  `_fts_rebuild_pause`, session wrappers + `_repair_session_fts_bookkeeping`,
-  `fts_optimize_available` / `optimize_fts_storage` session phase.
+  `_seed_fts_rebuild_markers`, `_repair_missing_progress` (the shared crash-safe
+  repair), `_repair_optimize_bookkeeping` / `_repair_session_fts_bookkeeping`,
+  `_fts_rebuild_pause`, `fts_optimize_available` / `optimize_fts_storage`
+  session phase.
 - `hermes_cli/session_recovery.py` — session markers treated as generated /
   pending in offline recovery.
 - `tests/test_session_metadata_fts.py` — rowid-hole migration, raw Unicode
