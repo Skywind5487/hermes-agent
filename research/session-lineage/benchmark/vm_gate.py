@@ -29,7 +29,7 @@ def run_text(cmd,cwd=None):
 
 
 def read_text(path):
-    try: return Path(path).read_text(errors="replace")
+    try: return Path(path).read_text(encoding="utf-8", errors="replace")
     except Exception: return ""
 
 
