@@ -287,9 +287,20 @@ class TestModernSchemaIdentity:
 
 
 class TestSchemaClassifier:
-    def test_classifier_absent(self, db):
+    def test_classifier_absent(self, tmp_path):
         """A DB without the object classifies absent."""
-        assert db._classify_sessions_fts_trigram(db._conn) == "absent"
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=3)  # SCHEMA_SQL, no trigram
+        raw = sqlite3.connect(str(db_path))
+        try:
+            assert raw.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'sessions_fts_trigram'"
+            ).fetchone() is None
+            # The classifier is a static method reading the stored schema.
+            assert SessionDB._classify_sessions_fts_trigram(raw) == "absent"
+        finally:
+            raw.close()
 
     def test_classifier_modern(self, db):
         """The #30 object classifies modern by schema identity (tokenizer +
@@ -368,9 +379,12 @@ class TestSearchRepresentation:
             "UPDATE sessions SET id = 'discord:thread-123' WHERE id = 'thr'"
         )
         db._conn.commit()
-        # 'thread-123' compacted would be 'thread123'; the RAW id still
-        # matches the raw interior fragment via the id field.
-        assert _trigram_match_ids(db, "thread-123") == ["thr"]
+        # Via the candidate lane (the #14 seam): the raw id needle (kept raw,
+        # never compacted) matches the interior fragment.
+        ok, hits = db._fts_session_trigram_candidates("thread-123")
+        assert ok is True
+        # The canonical logical id IS the raw id — never compacted.
+        assert [h["id"] for h in hits] == ["discord:thread-123"]
 
     def test_candidate_lane_returns_failure_vs_zero(self, db):
         """_fts_session_trigram_candidates returns (True, []) for a valid
@@ -388,10 +402,14 @@ class TestSearchRepresentation:
         hides while the backfill is pending."""
         r = _gap_trigram_db(tmp_path)  # H staged, P=0, nothing indexed
         try:
-            # The an94 metadata row is row_id 2, in the (0, H] gap.
+            # Row 2's canonical id is the raw 'discord:thread-123' (the
+            # fixture rewrote it); it is in the (0, H] gap and must surface
+            # via the compact-title needle 'an94'.
             ok, hits = r._fts_session_trigram_candidates("an94")
             assert ok is True
-            assert "s2" in [h["id"] for h in hits]
+            ids = {h["id"] for h in hits}
+            assert "discord:thread-123" in ids  # row 2 (compact title)
+            assert "s1" in ids  # row 1 (compact display_name)
         finally:
             r.close()
 
@@ -418,11 +436,17 @@ class TestNarrowLiveMaintenance:
         _assert_trigram_integrity(db)
 
     def test_metadata_update_rewrites_doc(self, db):
+        """A title change rewrites the indexed content: the old title's
+        compact tokens leave and the new title's arrive. The RAW id ('an94')
+        still matches — the #16 raw-id contract, not a stale title posting.
+        """
         _seed_an94_row(db)
         db.set_session_title("an94", "Gun-Build V2")
         db._conn.commit()
         assert _trigram_match_ids(db, "gunbuildv2") == ["an94"]
-        assert _trigram_match_ids(db, "an94") == []
+        assert _trigram_match_ids(db, "prestige") == []
+        # 'an94' still matches through the RAW id field, not the title.
+        assert _trigram_match_ids(db, "an94") == ["an94"]
         _assert_trigram_integrity(db)
 
     def test_display_name_update_rewrites_doc(self, db):
@@ -499,7 +523,8 @@ class TestIndependentHPRebuild:
             assert r.get_meta("fts_session_trigram_rebuild_high_water") is not None
             assert _trigram_docsize_count(r) == 0
             ok, hits = r._fts_session_trigram_candidates("an94")
-            assert ok is True and "s2" in [h["id"] for h in hits]
+            ids = {h["id"] for h in hits}
+            assert ok is True and "discord:thread-123" in ids
         finally:
             r.close()
 
@@ -585,14 +610,19 @@ class TestIndependentHPRebuild:
             r.close()
 
     def test_finish_clears_trigram_markers(self, tmp_path):
-        """Completing the backfill clears the trigram markers so optimize no
-        longer advertises pending work."""
+        """Completing the trigram backfill clears the trigram markers; once
+        every pending lane (incl. the parallel Unicode lane staged on the
+        same populated DB) completes, optimize stops advertising work."""
         r = _gap_trigram_db(tmp_path)
         try:
             assert r.fts_optimize_available() is True
             while r.fts_session_trigram_rebuild_step():
                 pass
             assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            # The Unicode session lane is staged independently on the same
+            # populated DB — finish it too, then optimize settles.
+            while r.fts_session_rebuild_step():
+                pass
             assert r.fts_optimize_available() is False
         finally:
             r.close()
@@ -675,7 +705,10 @@ class TestLegacySameNameConvergence:
         try:
             assert _fts_sql(r._conn, "sessions_fts_trigram") != ""
             assert r._sessions_trigram_available is False
-            assert r.fts_optimize_available() is False
+            # The object is untouched by the open path.
+            assert "tokenize='unicode61'" in _fts_sql(
+                r._conn, "sessions_fts_trigram"
+            )
         finally:
             r.close()
 
@@ -686,8 +719,9 @@ class TestLegacySameNameConvergence:
         db_path = tmp_path / "legacy.db"
         _build_legacy_simple_sessions_trigram_db(db_path)
         # Stage the demotion by hand (drop legacy triggers + remove root +
-        # seed markers) and LEAVE the modern schema uncreated — the crash
-        # window between demotion commit and schema ensure.
+        # rename shadows to trash + seed markers) and LEAVE the modern schema
+        # uncreated — the crash window between demotion commit and schema
+        # ensure. This mirrors the production demotion's atomic outcome.
         raw = sqlite3.connect(str(db_path))
         raw.execute("BEGIN IMMEDIATE")
         for t in (
@@ -702,6 +736,14 @@ class TestLegacySameNameConvergence:
             "AND name = 'sessions_fts_trigram'"
         )
         raw.execute("PRAGMA writable_schema=RESET")
+        shadows = [
+            r[0] for r in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'sessions_fts_trigram\\_%' ESCAPE '\\'"
+            ).fetchall()
+        ]
+        for sh in shadows:
+            raw.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
         hw = raw.execute("SELECT COALESCE(MAX(row_id), 0) FROM sessions").fetchone()[0]
         raw.execute(
             "INSERT INTO state_meta (key, value) VALUES (?, ?) "
@@ -737,18 +779,33 @@ class TestEndToEnd:
         """A title/display-name compact search and a raw-ID search both resolve
         the canonical session; an unrelated update leaves it intact."""
         _seed_an94_row(db)
+        # A second session whose raw id carries punctuation-bearing interior
+        # text (the #16 raw-id contract).
+        db.create_session("thr", source="cli")
+        db._conn.execute(
+            "UPDATE sessions SET id = 'discord:thread-123', "
+            "title = 'Weapon Ops' WHERE id = 'thr'"
+        )
+        db._conn.commit()
         # Compact title/display discovery.
         rows = db._fts_session_trigram_candidates("an94")[1]
         assert [h["id"] for h in rows] == ["an94"]
-        # Raw id interior discovery.
+        # Raw id interior discovery through the raw id field.
         ok, rows = db._fts_session_trigram_candidates("discord:thread-123")
         assert ok is True
-        assert "an94" in [h["id"] for h in rows]
+        assert "discord:thread-123" in [h["id"] for h in rows]
         # Canonical join fields present.
-        rec = rows[0]
-        assert rec["title"] == "AN-94 Prestige.Barrel"
-        assert rec["display_name"] == "Acme / #an-94-ops"
-        assert rec["row_id"] == rec["row_id"]
+        rec = next(h for h in rows if h["id"] == "discord:thread-123")
+        assert rec["title"] == "Weapon Ops"
+        assert rec["row_id"] is not None
+        # Unrelated update leaves the trigram document intact.
+        db._conn.execute(
+            "UPDATE sessions SET message_count = 9 WHERE id = 'discord:thread-123'"
+        )
+        db._conn.commit()
+        ok, rows = db._fts_session_trigram_candidates("discord:thread-123")
+        assert ok is True and "discord:thread-123" in [h["id"] for h in rows]
+        _assert_trigram_integrity(db)
 
     def test_canonical_sessions_row_id_unchanged(self, db):
         """The canonical ``sessions.row_id`` identity is untouched by #30."""
