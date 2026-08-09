@@ -189,3 +189,25 @@ Pinned by three new regression tests
 (`test_classifier_simple_wrong_column_shape_unknown`,
 `test_classifier_trigram_missing_id_column_unknown`,
 `test_classifier_modern_root_incompatible_view_unknown`).
+
+### Round-4 hardening — exact source-VIEW identity (2026-08-09)
+
+Round-4 review (P2): `_sessions_trigram_src_compatible` checked only the
+output column NAMES via PRAGMA table_info — it could not see a VIEW with the
+right four names but rewired expressions (e.g. `display_name AS id`, raw
+title), and a same-name TABLE shadow was treated as "VIEW missing, healable"
+(`CREATE VIEW IF NOT EXISTS` silently no-ops over a table, so it is never
+healed). Also, FTS5 itself was not verified as part of the root identity.
+
+`_sessions_trigram_src_compatible` now confirms the source object is an
+**actual VIEW** (`sqlite_master.type == 'view'`; a same-name table returns
+incompatible → fail closed) and that its stored definition is the **canonical
+#30 projection** (`_sessions_trigram_src_definition_matches` — whitespace- and
+`IF NOT EXISTS`/trailing-`;`-normalized comparison against the statement the
+code itself creates), so only the exact `compact(title)` / raw `id` /
+`compact(display_name)` VIEW is accepted. The classifier additionally requires
+the root to be a `CREATE VIRTUAL TABLE ... USING fts5` declaration.
+
+Pinned by two new regression tests
+(`test_classifier_modern_root_miswired_view_unknown`,
+`test_classifier_modern_root_same_name_table_src_unknown`).

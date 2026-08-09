@@ -319,6 +319,65 @@ def _build_modern_root_incompatible_view_db(db_path):
     conn.close()
 
 
+def _build_modern_root_miswired_view_db(db_path):
+    """DB whose modern root references a source VIEW whose output column NAMES
+    are right (row_id/title/id/display_name) but whose EXPRESSIONS are rewired
+    (``display_name AS id``, ``id AS display_name``, raw title) — PRAGMA
+    table_info alone cannot see the miswiring; the stored definition must be
+    checked against the canonical compact/raw projection. Must classify
+    unknown and fail closed."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIEW sessions_fts_trigram_src AS "
+        "SELECT row_id, title, display_name AS id, id AS display_name "
+        "FROM sessions"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, id, display_name, "
+        "content='sessions_fts_trigram_src', content_rowid='row_id', "
+        "tokenize='trigram')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_modern_root_same_name_table_src_db(db_path):
+    """DB whose modern root references a same-name TABLE (not a VIEW) as its
+    content source. ``CREATE VIEW IF NOT EXISTS`` silently no-ops over a
+    table, so the mismatch is never healable and must classify unknown / fail
+    closed — the same-name table survives untouched."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE TABLE sessions_fts_trigram_src ("
+        "row_id INTEGER PRIMARY KEY, title TEXT, id TEXT, display_name TEXT)"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, id, display_name, "
+        "content='sessions_fts_trigram_src', content_rowid='row_id', "
+        "tokenize='trigram')"
+    )
+    conn.commit()
+    conn.close()
+
+
 def _seed_an94_row(db):
     """Insert the canonical #30 sample metadata row (live, > H on a fresh
     DB with no markers) so search fixtures share one shape."""
@@ -498,6 +557,50 @@ class TestSchemaClassifier:
             # Untouched: the incompatible VIEW survives as built.
             sql = _view_sql(r._conn, "sessions_fts_trigram_src")
             assert "row_id, title" in sql
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+    def test_classifier_modern_root_miswired_view_unknown(self, tmp_path):
+        """A modern root whose source VIEW has the right output column NAMES
+        (row_id/title/id/display_name) but rewired expressions (raw title,
+        ``display_name AS id``, ``id AS display_name``) must classify unknown
+        — PRAGMA table_info cannot see the miswiring; the stored definition
+        must match the canonical compact/raw projection."""
+        db_path = tmp_path / "miswired_view.db"
+        _build_modern_root_miswired_view_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            # Untouched: the miswired VIEW survives as built.
+            sql = _view_sql(r._conn, "sessions_fts_trigram_src")
+            assert "display_name AS id" in sql
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+    def test_classifier_modern_root_same_name_table_src_unknown(self, tmp_path):
+        """A modern root whose content source is a same-name TABLE (not a
+        VIEW) must classify unknown — ``CREATE VIEW IF NOT EXISTS`` silently
+        no-ops over a table, so the mismatch is never healable and must fail
+        closed (the table survives untouched)."""
+        db_path = tmp_path / "same_name_table.db"
+        _build_modern_root_same_name_table_src_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            # The same-name table is not replaced / deleted.
+            obj = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'sessions_fts_trigram_src'"
+            ).fetchone()
+            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "table"
             assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
         finally:
             r.close()

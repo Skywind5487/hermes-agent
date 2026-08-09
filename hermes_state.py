@@ -2752,22 +2752,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _sessions_trigram_src_compatible(cursor) -> bool:
-        """True when the derived source VIEW (if present) projects exactly the
-        ``(row_id, title, id, display_name)`` shape the modern index expects.
+        """True when the derived source object (if present) is the exact #30
+        projection: an actual VIEW — never a same-name table, which
+        ``CREATE VIEW IF NOT EXISTS`` silently no-ops over — whose stored
+        definition projects ``compact(title)``, raw ``id``, and
+        ``compact(display_name)`` as ``row_id/title/id/display_name``.
 
-        A MISSING VIEW is treated as compatible — the crash-atomic transition
-        / reopen ensure re-creates it via ``CREATE VIEW IF NOT EXISTS``. A
-        PRESENT but mismatched VIEW is incompatible: the index would read the
-        wrong content, so the same-name object must fail closed.
+        A MISSING object is treated as compatible (the crash-atomic transition
+        / reopen ensure re-creates the VIEW via ``CREATE VIEW IF NOT
+        EXISTS``); a PRESENT but mismatched object (a same-name table shadow,
+        or a VIEW with the right output column names but rewired expressions)
+        is incompatible — the index would read the wrong content, so the
+        same-name object must fail closed.
         """
         row = cursor.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'view' AND name = 'sessions_fts_trigram_src'"
+            "SELECT type, sql FROM sqlite_master "
+            "WHERE name = 'sessions_fts_trigram_src'"
         ).fetchone()
         if row is None:
-            return True
-        cols = SessionDB._fts_declared_columns(cursor, "sessions_fts_trigram_src")
-        return cols == frozenset({"row_id", "title", "id", "display_name"})
+            return True  # absent — the transition / reopen ensure recreates it
+        obj_type = row["type"] if isinstance(row, sqlite3.Row) else row[0]
+        if obj_type != "view":
+            # Same-name TABLE shadows the VIEW: CREATE VIEW IF NOT EXISTS
+            # silently no-ops over a table, so this is never healable.
+            return False
+        sql = row["sql"] if isinstance(row, sqlite3.Row) else row[1]
+        return SessionDB._sessions_trigram_src_definition_matches(sql)
+
+    @staticmethod
+    def _sessions_trigram_src_definition_matches(stored_sql: str) -> bool:
+        """True when the stored VIEW definition is the canonical #30
+        projection (modulo SQLite's stored-form normalization):
+        ``compact(title)``, raw ``id``, ``compact(display_name)`` read from
+        canonical ``sessions``.
+
+        Column NAMES alone are not enough — a VIEW with the right four output
+        names but rewired expressions (e.g. ``display_name AS id``, or a raw
+        title) feeds the wrong data into the index and PRAGMA table_info
+        cannot see it. The stored DDL is compared (whitespace- and
+        `IF NOT EXISTS` / trailing-`;`-normalized) against the canonical
+        statement the code itself creates, so only the exact derived
+        projection is accepted.
+        """
+        canonical = _SESSIONS_FTS_TRIGRAM_SRC_STATEMENT
+
+        def _norm(s: str) -> str:
+            t = s.replace("IF NOT EXISTS", "").strip()
+            if t.endswith(";"):
+                t = t[:-1]
+            return " ".join(t.split())
+
+        return _norm(stored_sql) == _norm(canonical)
 
     @staticmethod
     def _classify_sessions_fts_trigram(cursor) -> str:
@@ -2786,13 +2821,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         - ``"modern_trigram"`` — the #30 identity: FTS5 ``tokenize='trigram'``
           + ``content='sessions_fts_trigram_src'`` +
           ``content_rowid='row_id'`` + EXACTLY the logical
-          ``(title, id, display_name)`` columns + a compatible derived source
+          ``(title, id, display_name)`` columns + the canonical derived source
           VIEW (when one is present). Runtime tokenizer capability is separate
           from schema identity: a host without built-in trigram may still
           carry a modern schema — unavailable there, not legacy.
         - ``"unknown_same_name"`` — an unrecognized same-name object (any
-          near-match that differs in column shape or VIEW projection). Fail
-          closed / diagnostic; never blindly delete or demote it.
+          near-match that differs in column shape, VIEW projection, or is not
+          an FTS5 vtable at all). Fail closed / diagnostic; never blindly
+          delete or demote it.
 
         ``cursor`` may be a Cursor or a Connection.
         """
@@ -2803,6 +2839,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if row is None:
             return "absent"
         sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+        # FTS5 itself is part of #34's identity: the same-name object must be
+        # a ``CREATE VIRTUAL TABLE ... USING fts5`` declaration.
+        if "CREATE VIRTUAL TABLE" not in sql or "USING fts5" not in sql:
+            return "unknown_same_name"
         # Recognized historical Hermes shape: FTS5 tokenize='simple' + INTERNAL
         # content + EXACTLY the title-only logical column set. The column set
         # is verified via PRAGMA table_info (reads the DDL column list without
@@ -2817,8 +2857,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Modern #30 identity. The content/content_rowid/tokenizer attributes
         # come from the stored DDL; the EXACT logical column set comes from
         # PRAGMA table_info (a bare ``"id" in sql`` check is fooled by
-        # ``content_rowid='row_id'``), and a present-but-mismatched source VIEW
-        # would feed wrong content into the index — so both must hold.
+        # ``content_rowid='row_id'``), and the source object must be the
+        # canonical derived VIEW (not a table shadow, not a miswired VIEW) —
+        # otherwise the index reads the wrong content.
         if (
             "tokenize='trigram'" in sql
             and "content='sessions_fts_trigram_src'" in sql
