@@ -33,7 +33,7 @@ def stats(values):
 
 def rss_kb():
     try:
-        for line in Path("/proc/self/status").read_text().splitlines():
+        for line in Path("/proc/self/status").read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("VmRSS:"): return int(line.split()[1])
     except (FileNotFoundError, ValueError): pass
     return None
