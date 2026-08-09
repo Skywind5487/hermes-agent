@@ -166,6 +166,17 @@ def _fts_unicode61_fold(text: Optional[str]) -> str:
     return stripped.casefold()
 
 
+def _is_unicode61_token_char(ch: str) -> bool:
+    """True when unicode61 treats *ch* as a token character.
+
+    unicode61's default token categories are L* (letters), N* (numbers) and
+    Co (Private Use). ``str.isalnum()`` covers L*/N* but MISSES Co, so it is
+    not a faithful boundary: a PUA codepoint such as U+E000 is indexable and
+    MATCH-able, yet isalnum() would drop it and cause a gap miss.
+    """
+    return ch.isalnum() or unicodedata.category(ch) == "Co"
+
+
 def _fts_query_positive_terms(raw_query: str) -> List[str]:
     """Conservative lexical terms for the #25 gap supplement's FTS-superset test.
 
@@ -180,8 +191,10 @@ def _fts_query_positive_terms(raw_query: str) -> List[str]:
 
     Tokenization follows unicode61's token-character set, splitting MORE
     aggressively rather than less: unicode61's token characters are Unicode
-    letters and digits, and EVERYTHING else — whitespace, punctuation, and
-    notably ``_`` (which Python's ``\\w`` wrongly keeps) — is a separator.
+    letters, digits, and Private-Use codepoints (categories L*, N*, Co — see
+    ``_is_unicode61_token_char``), and EVERYTHING else — whitespace,
+    punctuation, and notably ``_`` (which Python's ``\\w`` wrongly keeps) —
+    is a separator.
     The query sanitizer quotes ``[._-]`` terms as FTS phrases, but the index
     still tokenizes them the same way (``"foo_bar"`` → phrase ``foo bar``
     against a ``foo bar`` document), so the gap must too: ``foo_bar`` /
@@ -197,10 +210,13 @@ def _fts_query_positive_terms(raw_query: str) -> List[str]:
     is ANY-term, keeping them can only add false positives, never a false
     negative.
     """
-    # Map every non-token character — anything that is not a Unicode letter
-    # or digit, including '_' — to a space (mirrors unicode61's
-    # token-character set exactly).
-    cleaned = "".join(ch if ch.isalnum() else " " for ch in raw_query)
+    # Map every non-token character — anything that is not a unicode61 token
+    # character (letters, digits, Private-Use; see _is_unicode61_token_char),
+    # including '_' — to a space (mirrors unicode61's token-character set
+    # exactly).
+    cleaned = "".join(
+        ch if _is_unicode61_token_char(ch) else " " for ch in raw_query
+    )
     terms: List[str] = []
     for token in cleaned.split():
         folded = _fts_unicode61_fold(token.rstrip("*"))

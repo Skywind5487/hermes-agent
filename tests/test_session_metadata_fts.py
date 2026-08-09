@@ -962,6 +962,9 @@ class TestBoundedGapSearch:
         assert _fts_query_positive_terms('"AND"') == ["and"]
         assert _fts_query_positive_terms('"foo bar"') == ["foo", "bar"]
         assert _fts_query_positive_terms("École") == ["ecole"]
+        # Private-Use codepoints (unicode61 category Co) are token chars too.
+        assert _fts_query_positive_terms("\ue000") == ["\ue000"]
+        assert _fts_query_positive_terms("a\ue000b") == ["a\ue000b"]
 
     @pytest.mark.parametrize("query", ["foo_bar", "foo-bar", "foo.bar"])
     def test_gap_supplement_punctuation_query_no_hide(self, tmp_path, query):
@@ -1011,6 +1014,28 @@ class TestBoundedGapSearch:
                 pass
             assert r.get_meta("fts_session_rebuild_high_water") is None
             assert "C" in _raw_metadata_match_ids(r, '"AND"')
+        finally:
+            r.close()
+
+    def test_gap_supplement_private_use_codepoint_no_hide(self, tmp_path):
+        """Private-Use codepoints (Unicode category Co) are unicode61 token
+        characters — U+E000 is indexable and MATCH-able — so the term
+        extractor must keep them too (isalnum() alone drops Co). A gap row
+        carrying the PUA token must be surfaced, or it hides until backfill."""
+        r = _three_region_db(tmp_path)  # A(1)/B(3) indexed, C(7) in gap
+        try:
+            r.set_session_title("A", "\ue000 alpha")  # <= P, indexed
+            r.set_session_title("C", "\ue000 beta")   # (P,H], gap
+            # Indexed control: U+E000 is a unicode61 token.
+            assert _raw_metadata_match_ids(r, "\ue000") == ["A"]
+            # Gap supplement must ALSO surface C.
+            hits = _metadata_search_ids(r, "\ue000")
+            assert "A" in hits and "C" in hits
+            # After backfill completes, C is index-findable too.
+            while r.fts_session_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            assert "C" in _raw_metadata_match_ids(r, "\ue000")
         finally:
             r.close()
 

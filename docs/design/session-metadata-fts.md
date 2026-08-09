@@ -91,8 +91,9 @@ decompose + drop combining marks + casefold) instead of SQLite's ASCII-only
 (`_fts_query_positive_terms` — multi-token implicit AND, `OR`, quoted phrases,
 prefix `*`), so `MATCH 'ecole'` finds `École` in the gap and `MATCH 'Alpha
 Project'` finds a gap row titled `Alpha middle Project` exactly as the indexed
-lane would. Terms split on unicode61's token-character set (Unicode letters
-and digits only), so the sanitizer-quoted `[._-]` punctuation is a separator
+lane would. Terms split on unicode61's token-character set — Unicode letters,
+digits, and Private-Use codepoints (categories `L*`, `N*`, `Co`) — so the
+sanitizer-quoted `[._-]` punctuation is a separator
 too: `foo_bar` / `foo-bar` / `foo.bar` all yield the terms (`foo`, `bar`)
 exactly as the index tokenizes a `foo bar` document — a term that kept `_` as
 a literal would MISS a session the FTS lane finds. Boolean operator words
