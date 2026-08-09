@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -137,6 +138,28 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     except (PermissionError, OSError, OverflowError):
         return False
     return False
+
+
+def _fts_unicode61_fold(text: Optional[str]) -> str:
+    """Fold ``text`` the way FTS5's unicode61 tokenizer folds before indexing.
+
+    unicode61 applies Unicode case folding and, by default, removes diacritics
+    from Latin scripts, so ``École`` indexes as ``ecole`` and matches both
+    ``MATCH 'école'`` and ``MATCH 'ecole'``. The #25 bounded-gap supplement
+    must match the same queries the index does (otherwise a session searchable
+    at ``<= P`` silently vanishes while it sits in ``(P, H]``), so it folds
+    with the same rules instead of SQLite's ASCII-only ``LOWER()``.
+
+    This is a close approximation of SQLite's internal folding for Latin
+    scripts (NFKD-decompose, drop combining marks, casefold) — the gap lane is
+    a temporary migration fallback, not the authoritative index.
+    """
+    text = text or ""
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = "".join(
+        ch for ch in decomposed if unicodedata.category(ch) != "Mn"
+    )
+    return stripped.casefold()
 
 
 def _scrub_surrogates(value: Any) -> Any:
@@ -5656,35 +5679,50 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return progress, high_water
 
-    def _fts_metadata_candidates(self, raw_query: str) -> List[Dict[str, Any]]:
+    def _fts_metadata_candidates(
+        self, raw_query: str
+    ) -> Tuple[bool, List[Dict[str, Any]]]:
         """Raw Unicode session-metadata candidates matching ``raw_query``.
 
         Covers title, logical session id, and display_name (issue #25) via the
         external-content ``sessions_fts``. While the #25 backfill is pending,
         the bounded historical gap ``(P, H]`` is supplemented from canonical
-        rows over the same raw-substring dimensions and deduplicated by
-        ``row_id``, so migration never silently hides matching sessions:
-        rows ``<= P`` are already indexed, rows ``> H`` are live-indexed, and
-        only ``(P, H]`` is supplemented.
+        rows and deduplicated by ``row_id``, so migration never silently hides
+        matching sessions: rows ``<= P`` are already indexed, rows ``> H`` are
+        live-indexed, and only ``(P, H]`` is supplemented.
 
-        Returns a list of dicts (``id``, ``title``, ``display_name``,
-        ``started_at``, ``row_id``). Raw Unicode only — no normalization
-        policy (normalized arbitrary infix is owned by #30).
+        Returns ``(fts_ok, candidates)`` — ``fts_ok`` is False when the
+        ``sessions_fts`` MATCH lane itself failed (table unavailable /
+        corrupt), so callers can fall back to the LIKE lane instead of
+        trusting a partial result; candidates is a list of dicts (``id``,
+        ``title``, ``display_name``, ``started_at``, ``row_id``) merged from
+        both lanes and sorted ``started_at DESC`` (the resume-ordering that
+        ``resolve_session_by_title`` relies on — never a lane-then-gap
+        concatenation). Raw Unicode only — no normalization policy
+        (normalized arbitrary infix is owned by #30).
+
+        The gap supplement folds values with ``_fts_unicode61_fold`` — the
+        same case-fold + diacritic-removal the unicode61 tokenizer applies —
+        so ``MATCH 'ecole'`` finds ``École`` in the gap exactly as it does in
+        the index. SQLite's ``LOWER()`` only folds ASCII and would make a gap
+        row vanish/reappear across the backfill boundary.
         """
         sanitized = self._sanitize_fts5_query(raw_query)
         if not sanitized:
-            return []
-        # The gap supplement folds columns with LOWER(...) LIKE, so the needle
-        # must be lowercased too (SQLite's LIKE is case-insensitive for ASCII
-        # only, so folding both sides is required for non-ASCII match parity
-        # with the case-insensitive unicode61 FTS lane).
-        escaped = (
-            raw_query.lower()
-            .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        )
-        needle = f"%{escaped}%"
+            return True, []
+        needle = _fts_unicode61_fold(raw_query)
         gap = self._session_fts_rebuild_gap()
+        fts_ok = True
         by_row_id: Dict[int, Dict[str, Any]] = {}
+
+        def _candidate(c) -> Dict[str, Any]:
+            return {
+                "id": c["id"],
+                "title": c["title"],
+                "display_name": c["display_name"],
+                "started_at": c["started_at"],
+                "row_id": c["row_id"],
+            }
 
         with self._read_ctx() as conn:
             try:
@@ -5693,22 +5731,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "       s.started_at, s.row_id AS row_id "
                     "FROM sessions_fts f "
                     "JOIN sessions s ON s.row_id = f.rowid "
-                    "WHERE sessions_fts MATCH ? "
-                    "ORDER BY s.started_at DESC",
+                    "WHERE sessions_fts MATCH ? ",
                     (sanitized,),
                 )
                 for c in cursor:
-                    by_row_id[c["row_id"]] = {
-                        "id": c["id"],
-                        "title": c["title"],
-                        "display_name": c["display_name"],
-                        "started_at": c["started_at"],
-                        "row_id": c["row_id"],
-                    }
+                    by_row_id[c["row_id"]] = _candidate(c)
             except sqlite3.OperationalError:
-                # FTS lane unavailable for this query — the gap supplement
-                # below still runs; the rest falls back to the legacy LIKE
-                # lane where the caller provides one.
+                # FTS lane unavailable/corrupt: signal failure so callers can
+                # fall back to the LIKE lane instead of trusting a partial
+                # result; the gap supplement below still runs.
+                fts_ok = False
                 logging.debug(
                     "sessions_fts MATCH failed for %r", sanitized, exc_info=True,
                 )
@@ -5717,22 +5749,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 gap_rows = conn.execute(
                     "SELECT id, title, display_name, started_at, row_id "
                     "FROM sessions "
-                    "WHERE row_id > ? AND row_id <= ? "
-                    "AND (LOWER(COALESCE(title, '')) LIKE ? ESCAPE '\\' "
-                    "  OR LOWER(COALESCE(id, '')) LIKE ? ESCAPE '\\' "
-                    "  OR LOWER(COALESCE(display_name, '')) LIKE ? ESCAPE '\\') "
-                    "ORDER BY started_at DESC",
-                    (progress, high_water, needle, needle, needle),
+                    "WHERE row_id > ? AND row_id <= ? ",
+                    (progress, high_water),
                 ).fetchall()
                 for c in gap_rows:
-                    by_row_id.setdefault(c["row_id"], {
-                        "id": c["id"],
-                        "title": c["title"],
-                        "display_name": c["display_name"],
-                        "started_at": c["started_at"],
-                        "row_id": c["row_id"],
-                    })
-        return list(by_row_id.values())
+                    if (
+                        needle in _fts_unicode61_fold(c["title"])
+                        or needle in _fts_unicode61_fold(c["id"])
+                        or needle in _fts_unicode61_fold(c["display_name"])
+                    ):
+                        by_row_id.setdefault(c["row_id"], _candidate(c))
+        # Global merge ordering, not lane-then-gap: resolve_session_by_title
+        # takes candidates[0] and must resume the LATEST continuation even
+        # when the newer one is still in the gap.
+        return fts_ok, sorted(
+            by_row_id.values(), key=lambda c: c["started_at"], reverse=True
+        )
 
     def _fts_numbered_variants(
         self, title: str
@@ -5812,8 +5844,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return filtered
 
         # Non-CJK: the shared raw Unicode lane already merges the FTS
-        # candidates with the bounded (P, H] gap and dedupes by row_id.
-        candidates = self._fts_metadata_candidates(title)
+        # candidates with the bounded (P, H] gap, dedupes by row_id, and sorts
+        # globally by started_at DESC. When the sessions_fts lane itself
+        # failed, signal fallback to LIKE (None) rather than trusting a
+        # partial result.
+        fts_ok, candidates = self._fts_metadata_candidates(title)
+        if not fts_ok:
+            return None
         if not candidates:
             return candidates
         return [

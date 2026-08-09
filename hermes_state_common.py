@@ -457,6 +457,14 @@ CREATE TABLE sessions_new (
 # Indexes on ``sessions`` that DROP TABLE removes during the row_id swap and
 # the migration must recreate inside the same transaction (all IF NOT EXISTS
 # so the later SCHEMA_SQL / DEFERRED_INDEX_SQL passes no-op on them).
+#
+# ``idx_sessions_title_unique`` is deliberately NOT here: it is a UNIQUE index
+# and legacy DBs can carry duplicate titles (the existing post-migration
+# repair in ``_init_schema`` clears the older duplicates before creating it).
+# Rebuilding it inside the migration's transaction would raise
+# ``UNIQUE constraint failed`` and roll back the whole open for exactly the
+# legacy DBs the migration exists to upgrade — the migration must stay
+# reachable until that repair runs.
 SESSION_INDEX_SQL_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id)",
@@ -470,8 +478,6 @@ SESSION_INDEX_SQL_STATEMENTS = (
     "ON sessions(handoff_state, started_at)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash "
     "ON sessions(system_prompt_hash)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-    "ON sessions(title) WHERE title IS NOT NULL",
 )
 
 

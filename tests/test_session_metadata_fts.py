@@ -298,6 +298,46 @@ class TestNamedRowIdMigration:
         finally:
             session_db.close()
 
+    def test_legacy_duplicate_titles_do_not_break_open(self, tmp_path):
+        """A legacy DB with duplicate titles (allowed before the unique-title
+        constraint was enforced) must still open after the row_id migration.
+
+        The migration must NOT rebuild ``idx_sessions_title_unique`` inside
+        its swap transaction — a duplicate title would raise
+        ``UNIQUE constraint failed``, roll back the whole open, and the
+        existing post-migration duplicate repair would never run.
+        """
+        db_path = tmp_path / "legacy.db"
+        _build_legacy_sessions_db(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE sessions SET title = 'dupe-title' "
+                "WHERE id IN ('A', 'B')"
+            )
+            conn.commit()
+
+        session_db = SessionDB(db_path=db_path)
+        try:
+            rows = {
+                r["id"]: r["title"] for r in session_db._conn.execute(
+                    "SELECT id, title FROM sessions"
+                ).fetchall()
+            }
+            # Every row survives; the duplicate is repaired by the existing
+            # post-migration block (older rowid loses the alias).
+            assert set(rows) == {"A", "B", "C", "A-child"}
+            assert rows["A"] is None
+            assert rows["B"] == "dupe-title"
+            assert rows["C"] == "Gamma Project"
+            # The unique title index now exists (built after the repair).
+            idx = session_db._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'idx_sessions_title_unique'"
+            ).fetchone()
+            assert idx is not None
+        finally:
+            session_db.close()
+
 
 # =========================================================================
 # Raw Unicode external-content sessions_fts — helpers
@@ -318,9 +358,17 @@ def _set_session_rebuild_markers(db, high_water, progress):
 
 
 def _assert_sessions_fts_integrity(db):
-    """FTS5 integrity-check raises on a corrupt external-content index."""
+    """FTS5 integrity-check in the mode that also verifies external-content /
+    content consistency (``rank = 1``).
+
+    The plain ``integrity-check`` only checks the index's internal shadow-table
+    structure; it does NOT detect an orphan posting whose canonical row was
+    deleted. The ``rank = 1`` form additionally cross-checks the index against
+    the ``sessions`` content table, which is what catches a stale posting left
+    by a broken delete trigger.
+    """
     db._conn.execute(
-        "INSERT INTO sessions_fts(sessions_fts) VALUES('integrity-check')"
+        "INSERT INTO sessions_fts(sessions_fts, rank) VALUES('integrity-check', 1)"
     )
 
 
@@ -334,6 +382,22 @@ def _raw_metadata_match_ids(db, query):
             (query,),
         ).fetchall()
     return [r["id"] for r in rows]
+
+
+def _raw_fts_rowids(db, query):
+    """Return the FTS rowids (sessions.row_id values) that MATCH query, read
+    DIRECTLY from the index — no canonical-sessions JOIN.
+
+    This is the delete-test probe: a stale posting left behind by a broken
+    delete trigger would still MATCH here even though its canonical row is
+    gone, whereas the JOIN-based ``_raw_metadata_match_ids`` would hide it.
+    """
+    with db._read_ctx() as conn:
+        rows = conn.execute(
+            "SELECT rowid FROM sessions_fts WHERE sessions_fts MATCH ?",
+            (query,),
+        ).fetchall()
+    return [r["rowid"] for r in rows]
 
 
 def _gap_db(tmp_path):
@@ -505,20 +569,32 @@ class TestTriggerOwnershipRegions:
         """Deleting a ``<=P`` row removes its already-indexed document."""
         r = _three_region_db(tmp_path)
         try:
-            r.delete_session("A")  # row_id 1, indexed
-            assert "A" not in _raw_metadata_match_ids(r, "title")
-            _assert_sessions_fts_integrity(r)
+            # A (row 1) is indexed with title "Alpha Project".
+            assert _raw_fts_rowids(r, "alpha") == [1]
+            r.delete_session("A")
+            # Direct index probe: no stale posting survives the delete, and
+            # the canonical row is gone too. (The rank=1 consistency check is
+            # intentionally NOT used here: the (P,H] gap rows are legitimately
+            # unindexed mid-rebuild, so full-content consistency is expected
+            # only after the backfill completes.)
+            assert _raw_fts_rowids(r, "alpha") == []
+            assert _raw_metadata_match_ids(r, "alpha") == []
         finally:
             r.close()
 
     def test_delete_gap_row_does_not_issue_fts_delete(self, tmp_path):
         """Deleting a ``(P,H]`` row (never indexed) must not issue an
-        external-content FTS delete; integrity stays healthy."""
+        external-content FTS delete; the index stays free of stale postings
+        and the canonical row is simply absent."""
         r = _three_region_db(tmp_path)
         try:
-            r.delete_session("C")  # row_id 3, in (P,H]
-            _assert_sessions_fts_integrity(r)
-            # Row is simply absent — backfill later finds no canonical row.
+            # C (row 7) is in (P,H] — never indexed, so no posting exists.
+            assert _raw_fts_rowids(r, "gamma") == []
+            r.delete_session("C")
+            # Still no posting (a broken trigger would have tried to 'delete'
+            # an unindexed doc and either corrupted the index or left a
+            # posting); the canonical row is simply absent.
+            assert _raw_fts_rowids(r, "gamma") == []
             assert r.get_session("C") is None
         finally:
             r.close()
@@ -528,11 +604,30 @@ class TestTriggerOwnershipRegions:
         removes its live document."""
         r = _three_region_db(tmp_path)
         try:
-            r.create_session("E", source="cli")  # row_id 5 > H
+            r.create_session("E", source="cli")  # row_id > H
             r.set_session_title("E", "Live Echo")
-            assert _raw_metadata_match_ids(r, "echo") == ["E"]
+            assert _raw_fts_rowids(r, "echo") != []
             r.delete_session("E")
-            assert "E" not in _raw_metadata_match_ids(r, "echo")
+            # Direct index probe: the live document is gone, not hidden by a
+            # canonical-row JOIN.
+            assert _raw_fts_rowids(r, "echo") == []
+        finally:
+            r.close()
+
+    def test_deleted_row_leaves_no_orphan_in_completed_index(self, tmp_path):
+        """After the backfill completes (index fully consistent), deleting an
+        indexed row must leave NO orphan posting — proven by the rank=1
+        external-content consistency check, which a plain integrity-check
+        would miss."""
+        r = _gap_db(tmp_path)  # H=8, P=0, empty index
+        try:
+            while r.fts_session_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            # Full index, one live delete.
+            r.delete_session("A")
+            assert _raw_fts_rowids(r, "alpha") == []
+            # rank=1 cross-checks the index against the content table.
             _assert_sessions_fts_integrity(r)
         finally:
             r.close()
@@ -542,8 +637,11 @@ class TestTriggerOwnershipRegions:
         indexed; integrity stays healthy."""
         r = _three_region_db(tmp_path)
         try:
-            r.set_session_title("C", "New Title C")  # row_id 3, in (P,H]
-            _assert_sessions_fts_integrity(r)
+            r.set_session_title("C", "New Title C")  # row 7 in (P,H]
+            # The gap row is still not indexed (gate is off), and the index
+            # carries no stale entry for the old title either.
+            assert _raw_fts_rowids(r, "gamma") == []
+            assert _raw_fts_rowids(r, "newtitle") == []
         finally:
             r.close()
 
@@ -552,7 +650,7 @@ class TestTriggerOwnershipRegions:
         immediately while the historical backfill remains incomplete."""
         r = _three_region_db(tmp_path)
         try:
-            r.create_session("E", source="cli")  # row_id 5 > H
+            r.create_session("E", source="cli")  # row_id > H
             r.set_session_title("E", "Fresh Live Title")
             assert _raw_metadata_match_ids(r, "fresh") == ["E"]
         finally:
@@ -567,7 +665,8 @@ class TestTriggerOwnershipRegions:
 def _metadata_search_ids(db, query):
     """Search session metadata through the raw Unicode lane + bounded (P,H]
     supplement (issue #25). Returns logical session ids, deduplicated."""
-    return [c["id"] for c in db._fts_metadata_candidates(query)]
+    _, candidates = db._fts_metadata_candidates(query)
+    return [c["id"] for c in candidates]
 
 
 def _build_populated_sessions_db(db_path, n=1200):
@@ -671,6 +770,70 @@ class TestBoundedGapSearch:
         finally:
             r.close()
 
+    def test_gap_supplement_unicode_folding_matches_fts(self, tmp_path):
+        """The bounded-gap supplement folds with the same Unicode rules as the
+        unicode61 index (case fold + diacritic removal), so both 'ecole' and
+        'école' find a gap row titled 'École des Beaux-Arts' — a session must
+        not vanish while it sits in (P,H] just because it is not backfilled
+        yet (SQLite's ASCII-only LOWER() would hide it)."""
+        r = _gap_db(tmp_path)  # H=8, P=0: every row is in the gap
+        try:
+            r.set_session_title("C", "École des Beaux-Arts")  # row 7 in gap
+            # FTS lane alone finds nothing: C is in the gap, not indexed.
+            assert _raw_metadata_match_ids(r, "ecole") == []
+            # The Unicode-aware supplement finds it for both spellings.
+            assert _metadata_search_ids(r, "ecole") == ["C"]
+            assert _metadata_search_ids(r, "école") == ["C"]
+        finally:
+            r.close()
+
+    def test_resolve_title_prefers_newer_gap_continuation(self, tmp_path):
+        """resolve_session_by_title must resume the LATEST continuation even
+        when the newer one is still in the (P,H] gap and the older one is
+        already indexed — the FTS+gap merge is sorted globally by
+        started_at DESC, not lane-then-gap."""
+        r = _three_region_db(tmp_path)  # P=3, H=8: A(1)/B(3) indexed, C(7) gap
+        try:
+            t0 = 1_000_000.0
+            r._conn.execute(
+                "UPDATE sessions SET title = 'Project #2', started_at = ? "
+                "WHERE id = 'A'",
+                (t0,),
+            )
+            r._conn.execute(
+                "UPDATE sessions SET title = 'Project #3', started_at = ? "
+                "WHERE id = 'C'",
+                (t0 + 100,),
+            )
+            r._conn.commit()
+            # A (row 1, <= P) is indexed -> its FTS doc is now "Project #2".
+            # C (row 7, gap) is not indexed -> only the supplement sees it.
+            assert r.resolve_session_by_title("Project") == "C"
+        finally:
+            r.close()
+
+    def test_resolve_title_falls_back_to_like_when_fts_lane_fails(
+        self, tmp_path
+    ):
+        """If the sessions_fts MATCH lane itself fails (table unavailable /
+        corrupt), numbered-title resolution must signal the LIKE fallback
+        instead of returning a partial/no-match result."""
+        db_path = tmp_path / "s.db"
+        w = SessionDB(db_path=db_path)
+        w.create_session("base", source="cli")
+        w.create_session("base2", source="cli")
+        w.set_session_title("base2", "Base Title #2")
+        w.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r.resolve_session_by_title("Base Title") == "base2"
+            # Break only the session FTS lane (message FTS stays alive).
+            r._conn.execute("DROP TABLE sessions_fts")
+            r._conn.commit()
+            assert r.resolve_session_by_title("Base Title") == "base2"
+        finally:
+            r.close()
+
 
 # =========================================================================
 # Group F — concurrency + shared throttle
@@ -679,9 +842,16 @@ class TestBoundedGapSearch:
 
 class TestConcurrencyAndThrottle:
     def test_two_runners_claim_disjoint_chunks(self, tmp_path):
-        """Two concurrent rebuild runners cannot claim/settle the same chunk:
+        """Two CONCURRENT rebuild runners cannot claim/settle the same chunk:
         progress advances through non-overlapping ranges, every document
-        appears exactly once, and the index stays healthy."""
+        appears exactly once, and the index stays healthy.
+
+        The runners are two threads with a barrier so both genuinely enter
+        the claim together — a naive ``a.step() or b.step()`` short-circuits
+        and never actually races.
+        """
+        import threading
+
         db_path = tmp_path / "s.db"
         _build_populated_sessions_db(db_path, n=1200)
         r1 = SessionDB(db_path=db_path)  # stages H=1200, P=0
@@ -689,12 +859,28 @@ class TestConcurrencyAndThrottle:
         try:
             assert r1.get_meta("fts_session_rebuild_high_water") == "1200"
             assert r2.get_meta("fts_session_rebuild_high_water") == "1200"
-            guards = 0
-            while (r1.fts_session_rebuild_step()
-                   or r2.fts_session_rebuild_step()):
-                guards += 1
-                assert guards < 1000, "rebuild loop did not terminate"
+
+            barrier = threading.Barrier(2)
+
+            def _runner(db, out):
+                barrier.wait()  # both runners enter the claim together
+                while db.fts_session_rebuild_step():
+                    pass
+                out["done"] = True
+
+            outs = ({}, {})
+            t1 = threading.Thread(target=_runner, args=(r1, outs[0]))
+            t2 = threading.Thread(target=_runner, args=(r2, outs[1]))
+            t1.start()
+            t2.start()
+            t1.join(timeout=120)
+            t2.join(timeout=120)
+            assert not t1.is_alive() and not t2.is_alive(), "runner stuck"
+            assert outs[0].get("done") and outs[1].get("done")
+
+            # Both runners saw completion; the markers were cleared once.
             assert r1.get_meta("fts_session_rebuild_high_water") is None
+            assert r2.get_meta("fts_session_rebuild_high_water") is None
             n_sessions = r1._conn.execute(
                 "SELECT COUNT(*) FROM sessions"
             ).fetchone()[0]
@@ -708,7 +894,8 @@ class TestConcurrencyAndThrottle:
             ).fetchone()[0]
             assert dup == 0
             r1._conn.execute(
-                "INSERT INTO sessions_fts(sessions_fts) VALUES('integrity-check')"
+                "INSERT INTO sessions_fts(sessions_fts, rank) "
+                "VALUES('integrity-check', 1)"
             )
         finally:
             r1.close()
