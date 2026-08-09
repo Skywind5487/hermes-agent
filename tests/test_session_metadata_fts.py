@@ -44,6 +44,69 @@ def _row_id_map(conn):
     }
 
 
+# The pre-#25 sessions shape: ``id TEXT PRIMARY KEY`` with NO named row_id.
+# (SCHEMA_SQL now declares the new shape, so fixtures that need a real legacy
+# table must demote ``sessions`` to this explicitly.)
+_LEGACY_SESSIONS_DDL = """
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    system_prompt_hash TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    compression_failure_cooldown_until REAL,
+    compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+)
+"""
+
+
 def _build_legacy_sessions_db(db_path):
     """Build a pre-#25 DB by hand: sessions WITHOUT ``row_id`` (``id TEXT
     PRIMARY KEY``), with explicit hidden rowids that contain deleted-row
@@ -55,6 +118,9 @@ def _build_legacy_sessions_db(db_path):
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.executescript(SCHEMA_SQL)
+    # Demote sessions to the pre-#25 shape (no named row_id).
+    conn.execute("DROP TABLE sessions")
+    conn.executescript(_LEGACY_SESSIONS_DDL)
 
     t0 = time.time()
     for rowid, sid, started_at, title in (
@@ -131,7 +197,9 @@ class TestNamedRowIdMigration:
 
         session_db = SessionDB(db_path=db_path)
         try:
-            assert _row_id_map(session_db._conn) == {"A": 1, "B": 3, "C": 7}
+            assert _row_id_map(session_db._conn) == {
+                "A": 1, "B": 3, "C": 7, "A-child": 8,
+            }
             # id stays NOT NULL UNIQUE (logical identity).
             ids = {
                 r["name"]: r for r in session_db._conn.execute(
@@ -219,7 +287,9 @@ class TestNamedRowIdMigration:
 
         session_db = SessionDB(db_path=db_path)
         try:
-            assert _row_id_map(session_db._conn) == {"A": 1, "B": 3, "C": 7}
+            assert _row_id_map(session_db._conn) == {
+                "A": 1, "B": 3, "C": 7, "A-child": 8,
+            }
             leftover = session_db._conn.execute(
                 "SELECT 1 FROM sqlite_master "
                 "WHERE type = 'table' AND name = 'sessions_new'"

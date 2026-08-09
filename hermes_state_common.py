@@ -193,7 +193,8 @@ CREATE TABLE IF NOT EXISTS system_prompts (
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     source TEXT NOT NULL,
     user_id TEXT,
     session_key TEXT,
@@ -378,6 +379,100 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
 CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
     ON sessions(system_prompt_hash);
 """
+
+
+# ── Sessions named row_id migration (#25) ──────────────────────────────
+# SQLite cannot ALTER a PRIMARY KEY, so giving ``sessions`` a named
+# ``row_id INTEGER PRIMARY KEY AUTOINCREMENT`` (the stable storage/document
+# identity the external-content ``sessions_fts`` needs) requires a full table
+# rebuild. The migration runs as ONE explicit BEGIN IMMEDIATE transaction:
+# create -> copy with the OLD hidden ``rowid`` copied verbatim into
+# ``row_id`` (an order-preserving copy is NOT enough — deleted-row holes must
+# be preserved exactly) -> verify count + ``{id: row_id}`` identity -> drop
+# old -> rename -> recreate indexes. Foreign keys stay OFF only outside that
+# transaction and are re-verified afterward. Do NOT use ``executescript()``
+# inside the swap — it issues an implicit COMMIT and defeats the transaction
+# boundary (see the donor-bug note in docs/research/issue-32-*.md).
+SESSION_TABLE_REBUILD_SQL = """
+CREATE TABLE sessions_new (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    system_prompt_hash TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    compression_failure_cooldown_until REAL,
+    compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+)
+"""
+
+
+# Indexes on ``sessions`` that DROP TABLE removes during the row_id swap and
+# the migration must recreate inside the same transaction (all IF NOT EXISTS
+# so the later SCHEMA_SQL / DEFERRED_INDEX_SQL passes no-op on them).
+SESSION_INDEX_SQL_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_session_key "
+    "ON sessions(session_key, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer ON sessions("
+    "source, user_id, chat_id, chat_type, thread_id, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state "
+    "ON sessions(handoff_state, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash "
+    "ON sessions(system_prompt_hash)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
+    "ON sessions(title) WHERE title IS NOT NULL",
+)
 
 
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──
