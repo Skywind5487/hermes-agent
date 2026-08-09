@@ -1,77 +1,69 @@
 # Session-search lineage research
 
-This directory is the durable repo home for the research that supersedes the long-form discussion in issue #29.
+This directory is the durable repo home for session-lineage winner-resolution research.
 
-## Source of truth
+## Current source of truth
 
-- Active algorithm / benchmark decision ticket: #45
-- Code / exact-line / provenance research: #46
-- Upstream and analogous prior-art research: #47
-- Historical ADR / exploratory benchmark log: #29
-- Production candidate-search dependency: #14
+- **#54 — current umbrella/final gate:** measurement-space audit + final `Pure TEMP` vs fixed 3-stage shared decision on the production VM.
+- `research/session-lineage/benchmark/README.md` — durable benchmark method, orthogonal measurement basis, coverage, data generation, results map, planner traps, and explicit unmeasured cells.
+- `research/session-lineage/benchmark/run.py` — clone-and-run local two-finalist entry point.
 
-Issue #29 is historical evidence, not the active decision record.
+No production winner is selected yet.
 
-## Current research model
+## Evidence / historical research
 
-Every algorithm is described on three independent axes:
+- #45 — algorithm/design-space convergence and local graveyard/final-duel discussion; superseded as the current status ticket by #54.
+- #46 / PR #49 — code / exact-line / provenance research and production semantic discrepancy.
+- #47 / PR #48 — upstream and analogous prior art.
+- #50 / PR #53 — TEMP connection lifecycle, WAL read connection, explicit snapshot transaction, and non-WAL fallback mechanics.
+- #51 / PR #52 — depth-64 provenance and bounded-work safety intent.
+- #29 — historical ADR / exploratory benchmark log. Historical evidence only.
+- #14 — production candidate-search dependency / ordering context.
 
-1. **Scheduling / 走法** — sequential, shared, rank-priority shared, or memory-preserving scheduler switch.
-2. **Reuse / 記憶** — none, result-only memory, or accumulated known coverage.
-3. **Representation / 容器** — recursive SQL set/queue, completed CTE results, Python dict, or another query-local representation.
+## Research model
+
+Keep three algorithm axes separate:
+
+1. **Scheduling / 走法** — ranked sequential, shared batch, staged, or hybrid.
+2. **Reuse / 記憶** — none, completed immutable coverage, or mutable keyed `node -> root` memo.
+3. **Representation / 容器** — recursive SQL set/queue, completed CTE results, TEMP table, Python reference, or persistent-schema lower bound.
 
 Cycle protection, missing-parent behavior, compression-edge semantics, and runaway-work bounds are cross-cutting safety requirements rather than separate algorithm families.
 
-## Benchmark provenance
+## Benchmark model
 
-The current `hermes_lineage_benchmark.py` is a reconstructed harness created on 2026-08-09 after the original exploratory source was not persisted. Its exact reconstructed source is preserved in four comments on #29 and in the saved benchmark bundle. It is useful for algorithm-shape evidence, but its existing correctness oracle and scenario matrix are not authoritative enough for the next decision.
+The benchmark starts after ranked **distinct candidate sessions** already exist. It measures lineage resolution/winner selection, not FTS/title candidate generation or final hydration.
 
-The next benchmark revision should live in this directory as normal versioned repo code, e.g.:
+The measurable-space audit is more important than any one scenario name. Its workload/environment/resource bases include:
 
-- `benchmark.py` — algorithm runners + measurements;
-- `scenarios.md` or a data module — workload definitions and rationale;
-- correctness fixtures separated from performance workloads.
+- candidate count and result K;
+- lineage diversity/concentration and Kth-root rank;
+- compression-depth distribution and candidate density within lineages;
+- blocked/interleaved/random ordering and modern-vs-legacy mix;
+- reachability and malformed/cycle/missing/boundary semantics;
+- algorithm, cache/connection state, DB background size, journal route, TEMP policy, runtime/hardware;
+- work budget, statements, memory, and disk/temp footprint.
 
-Do not paste another large benchmark source into an issue once the repo version exists.
+Current local work fully crossed `23 algorithms × 16 performance scenarios × 2 cache modes`, then narrowed to the two finalists. The workload bases are a designed fractional-factorial sample, not a full Cartesian product. See `benchmark/README.md` for exact cells and missing dimensions.
 
-## Benchmark-v2 workload model
+## Current finalists
 
-Model the ranked **candidate-to-lineage distribution after search**. Topic similarity is not lineage identity.
+1. **Pure TEMP keyed memo** — ranked early stop with mutable query-local `node -> root`; multi-statement logical search requires an explicit read transaction for snapshot consistency.
+2. **Fixed 3-stage shared CTE** — one SQLite statement, no new table, completed-stage reuse, and global bounded work.
 
-Canonical axes:
+Local synthetic/WAL evidence leans TEMP but is **not** the production decision. #54 must add the e2-micro/runtime gate, memory/disk accounting, true/closer VM-cold behavior, and a bounded non-WAL fallback measurement.
 
-- lineage diversity: one / few / many / dominant + long tail;
-- rank placement: winners early / duplicate prefix / interleaved / clustered;
-- ancestry depth: boundary / shallow / deep;
-- candidate density within lineage: dense / sparse-gapped / one-per-lineage;
-- candidate count: small / medium / upper scan regime;
-- result K: at least 1 / 3 / 10, without assuming 3 is fixed.
+## Benchmark artifacts
 
-Representative user-facing shapes:
+- `benchmark/README.md` — methods + measurable-space coverage + findings + limitations.
+- `benchmark/measurement_space.csv` — scenario coordinates in the orthogonalized workload basis.
+- `benchmark/scenarios.py` — deterministic synthetic data/scenario generator.
+- `benchmark/temp_memo.py` — TEMP finalist implementation used by the clone-runnable harness.
+- `benchmark/fixed3_optimized.py` — planner-corrected fixed-shared finalist.
+- `benchmark/final_duel.py` — two-finalist measurement runner.
+- `benchmark/run.py` — easy local entry point.
+- `benchmark/results/graveyard_summary.csv` — aggregate results for 23 historical/current implemented resolver shapes.
+- `benchmark/results/correctness_summary.csv` — graveyard semantic/adversarial summary.
+- `benchmark/results/final_duel_combined.csv` — per-scenario local finalist evidence.
 
-- project-focused query: concentrated in one/few project lineages;
-- handoff/fresh-session continuation: same semantic project across independent roots;
-- common/daily lookup: many unrelated roots;
-- mixed/Zipf: one dominant lineage plus incidental roots.
-
-Correctness/adversarial fixtures must separately cover compression vs branch/delegation/tool boundaries, cycle, missing parent, current-lineage exclusions, legacy rotated histories vs in-place compaction, and work-budget safety.
-
-## Explicit discussion-only directions
-
-Do not promote these without new evidence:
-
-- TEMP-table memo;
-- single-row recursive state machine / encoded `covered` blob;
-- persistent root column except as a theoretical read-path lower bound;
-- full sessions-graph load into Python;
-- downward component flood relying on unique compression child;
-- candidate contraction followed by independent per-head traversal.
-
-## Immediate research questions
-
-- What minimum knowledge representation can be consumed by both sequential and shared schedulers?
-- Can a scheduler switch preserve already-discovered coverage instead of restarting?
-- Can candidate-local shared contraction add anything beyond shared traversal itself?
-- How far can SQLite queue priority + streaming limits go before seed-specific state prevents merging?
-- Is Python dict memo the simpler solution once SQL requires mutable coverage semantics?
-- What failure intent does the current depth fuse protect, and can a clearer work guard replace it?
+Do not paste another large benchmark source into an issue now that the repo benchmark package exists.
