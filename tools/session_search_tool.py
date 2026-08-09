@@ -149,8 +149,28 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
 
 
 def _resolve_lineage(db, session_id: str) -> str:
-    """Convenience: return only the lineage root (ignores compression hop)."""
-    return _resolve_to_parent(db, session_id)[0]
+    """Resolve the session-search compression lineage root.
+
+    Production ``SessionDB`` exposes the same positive compression-continuation
+    resolver used by SQL winner selection. Keep the old generic-parent helper
+    only as a compatibility fallback for small test doubles / older DB objects.
+    A failed production resolution is conservative: keep the session separate
+    instead of broadening current/title exclusion to an unproven ancestor.
+    """
+    if not session_id:
+        return session_id
+    resolver = getattr(db, "resolve_compression_lineage", None)
+    if resolver is None:
+        return _resolve_to_parent(db, session_id)[0]
+    try:
+        return resolver(session_id) or session_id
+    except Exception:
+        logging.debug(
+            "compression lineage resolution failed for %s",
+            session_id,
+            exc_info=True,
+        )
+        return session_id
 
 
 def _is_compression_ended(db, session_id: str) -> bool:
@@ -652,18 +672,36 @@ def _title_match_result(
     if session_meta.get("source") in _HIDDEN_SESSION_SOURCES:
         return None
 
+    # Title matching only needs a lightweight anchor before bounded hydration.
+    # Do not load the whole transcript via get_messages().
+    anchor_id = None
     try:
-        messages = db.get_messages(session_id)
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND active = 1 "
+                "ORDER BY id LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if row is not None:
+            anchor_id = row["id"]
     except Exception:
-        logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
-        messages = []
+        logging.debug(
+            "first-message anchor lookup failed for title match %s",
+            session_id,
+            exc_info=True,
+        )
 
-    anchor_id = messages[0].get("id") if messages else None
     if anchor_id is not None:
         try:
             view = db.get_anchored_view(session_id, anchor_id, window=5, bookend=3)
         except Exception:
-            logging.debug("get_anchored_view failed for title match %s/%s", session_id, anchor_id, exc_info=True)
+            logging.debug(
+                "get_anchored_view failed for title match %s/%s",
+                session_id,
+                anchor_id,
+                exc_info=True,
+            )
             view = {}
     else:
         view = {}
@@ -677,11 +715,11 @@ def _title_match_result(
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
-        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
-        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
-        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
+        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or [])],
+        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or [])],
+        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or [])],
         "messages_before": view.get("messages_before", 0),
-        "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
+        "messages_after": view.get("messages_after", 0),
         "_lineage_root": lineage_root,
     }
     if lineage_root and lineage_root != session_id:

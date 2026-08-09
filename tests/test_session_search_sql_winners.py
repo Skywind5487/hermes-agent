@@ -6,7 +6,7 @@ import logging
 import pytest
 
 from hermes_state import SessionDB
-from tools.session_search_tool import _order_for_recall, _resolve_to_parent, session_search
+from tools.session_search_tool import _order_for_recall, _resolve_lineage, session_search
 
 
 @pytest.fixture
@@ -28,8 +28,17 @@ def _create(db, session_id, source="cli", parent=None):
         db._conn.commit()
 
 
+def _mark_compression_end(db, session_id):
+    db._conn.execute(
+        "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+        (session_id,),
+    )
+    db._conn.commit()
+
+
 def test_sql_winners_keep_best_hit_per_lineage_and_preserve_candidate_scan(db):
     _create(db, "root", source="cli")
+    _mark_compression_end(db, "root")
     _create(db, "child", source="cli", parent="root")
     _create(db, "other", source="cli")
     root_id = _message(db, "root", "needle root")
@@ -59,6 +68,7 @@ def test_sql_winners_keep_best_hit_per_lineage_and_preserve_candidate_scan(db):
 
 def test_sql_winners_match_existing_python_oracle_for_all_temporal_orders(db):
     _create(db, "oracle-root", source="telegram")
+    _mark_compression_end(db, "oracle-root")
     _create(db, "oracle-child", source="cron", parent="oracle-root")
     _create(db, "oracle-other", source="cli")
     _create(db, "oracle-cron", source="cron")
@@ -78,7 +88,7 @@ def test_sql_winners_match_existing_python_oracle_for_all_temporal_orders(db):
         expected = []
         seen = set()
         for hit in _order_for_recall(raw):
-            root = _resolve_to_parent(db, hit["session_id"])
+            root = _resolve_lineage(db, hit["session_id"])
             if root in seen:
                 continue
             seen.add(root)
@@ -136,6 +146,7 @@ def test_sql_winners_apply_source_priority_before_final_limit(db):
 
 def test_sql_winners_exclude_current_and_explicit_lineages(db):
     _create(db, "current-root", source="cli")
+    _mark_compression_end(db, "current-root")
     _create(db, "current-child", source="cli", parent="current-root")
     _create(db, "excluded", source="cli")
     _create(db, "kept", source="cli")
@@ -153,36 +164,31 @@ def test_sql_winners_exclude_current_and_explicit_lineages(db):
     assert [row["lineage_root_id"] for row in result["winners"]] == ["kept"]
 
 
-def test_sql_winners_handle_missing_parent_cycle_and_depth_cap(db):
+def test_sql_winners_fail_closed_on_missing_parent_and_positive_cycle(db):
     _create(db, "missing-parent-child", source="cli")
     db._conn.execute("PRAGMA foreign_keys = OFF")
     db._conn.execute(
         "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
         ("missing-parent", "missing-parent-child"),
     )
-    db._conn.commit()
-    db._conn.execute("PRAGMA foreign_keys = ON")
     _create(db, "cycle-a", source="cli")
     _create(db, "cycle-b", source="cli")
-    db._conn.execute("PRAGMA foreign_keys = OFF")
     db._conn.execute(
-        "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+        "UPDATE sessions SET parent_session_id = ?, end_reason = 'compression' WHERE id = ?",
         ("cycle-b", "cycle-a"),
     )
     db._conn.execute(
-        "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+        "UPDATE sessions SET parent_session_id = ?, end_reason = 'compression' WHERE id = ?",
         ("cycle-a", "cycle-b"),
     )
     db._conn.commit()
     db._conn.execute("PRAGMA foreign_keys = ON")
-    _create(db, "depth-root", source="cli")
-    _create(db, "depth-child", source="cli", parent="depth-root")
-    _create(db, "depth-grandchild", source="cli", parent="depth-child")
+    _create(db, "good-root", source="cli")
     for sid in (
         "missing-parent-child",
         "cycle-a",
         "cycle-b",
-        "depth-grandchild",
+        "good-root",
     ):
         _message(db, sid, "edge needle")
 
@@ -190,13 +196,60 @@ def test_sql_winners_handle_missing_parent_cycle_and_depth_cap(db):
         "edge",
         role_filter=["user"],
         result_limit=10,
-        lineage_depth_cap=1,
     )
     by_session = {row["session_id"]: row for row in result["winners"]}
 
-    assert by_session["missing-parent-child"]["lineage_root_id"] == "missing-parent-child"
-    assert by_session["cycle-a"]["lineage_root_id"] in {"cycle-a", "cycle-b"}
-    assert by_session["depth-grandchild"]["lineage_root_id"] == "depth-child"
+    assert "missing-parent-child" not in by_session
+    assert "cycle-a" not in by_session
+    assert "cycle-b" not in by_session
+    assert by_session["good-root"]["lineage_root_id"] == "good-root"
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_sql_winners_keep_branch_delegate_and_tool_parentage_separate(db):
+    _create(db, "compressed-root", source="cli")
+    _mark_compression_end(db, "compressed-root")
+    _create(db, "continuation", source="cli", parent="compressed-root")
+    _create(db, "branch", source="cli", parent="compressed-root")
+    _create(db, "delegate", source="cli", parent="compressed-root")
+    _create(db, "tool-child", source="tool", parent="compressed-root")
+    _create(db, "foreign-marker", source="cli", parent="compressed-root")
+    db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        (json.dumps({"_branched_from": "compressed-root"}), "branch"),
+    )
+    db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        (json.dumps({"_delegate_from": "compressed-root"}), "delegate"),
+    )
+    db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        (json.dumps({"_delegate_from": "some-other-parent"}), "foreign-marker"),
+    )
+    db._conn.commit()
+    for sid in (
+        "compressed-root",
+        "continuation",
+        "branch",
+        "delegate",
+        "tool-child",
+        "foreign-marker",
+    ):
+        _message(db, sid, "semantic needle")
+
+    result = db.search_session_winners(
+        "semantic",
+        role_filter=["user"],
+        result_limit=10,
+    )
+    roots = {row["lineage_root_id"] for row in result["winners"]}
+
+    assert roots == {"compressed-root", "branch", "delegate", "tool-child"}
+    assert _resolve_lineage(db, "continuation") == "compressed-root"
+    assert _resolve_lineage(db, "foreign-marker") == "compressed-root"
+    assert _resolve_lineage(db, "branch") == "branch"
+    assert _resolve_lineage(db, "delegate") == "delegate"
+    assert _resolve_lineage(db, "tool-child") == "tool-child"
 
 
 def test_discovery_does_not_hydrate_candidate_context(db, caplog):
