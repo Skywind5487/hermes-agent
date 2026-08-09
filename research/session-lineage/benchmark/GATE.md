@@ -1,71 +1,63 @@
-# #54 production-shaped gate addendum
+# #54 production gate addendum — historical broad gate
 
-This addendum extends the existing two-finalist benchmark without changing the current production shortlist. `Pure TEMP` and `Fixed 3-stage shared CTE` remain the finalists; `per_seed_point` is only a sequential/no-memo crossover ablation to answer whether very small post-search work is cheaper than constructing reusable state.
+> **Superseded for the current resolver architecture decision by `FOCUSED_GATE.md`.**
+>
+> Keep this file as the broader environment/resource gate archive. Its earlier
+> "Pure TEMP vs Fixed3 remain the finalists" framing is no longer current.
 
-## Scripts
+The scripts described here remain useful for broader environment questions:
 
-### Synthetic VM / WSL gate
+- VM/runtime receipt;
+- DB-size scaling;
+- Fixed3 EQP regression checks;
+- first/second/warm reader lifecycle;
+- non-WAL rollback-journal fallback;
+- TEMP-store policy;
+- pathological `B` curves;
+- frozen production-topology profiling.
 
-Run the same synthetic gate on e2-micro and WSL:
+For the next production decision, run:
+
+```bash
+python research/session-lineage/benchmark/run.py \
+  --focused-gate \
+  --output-dir /tmp/hermes-lineage-20260809
+```
+
+See `FOCUSED_GATE.md` for the current no-memo vs Python-memo decision surface and the role of TEMP/Fixed3 as references.
+
+## Broad synthetic gate
+
+The original broad gate is still available:
 
 ```bash
 python research/session-lineage/benchmark/run.py --gate \
-  --output-dir /tmp/hermes-lineage-gate
+  --output-dir /tmp/hermes-lineage-broad
 ```
 
 Fast smoke:
 
 ```bash
 python research/session-lineage/benchmark/run.py --quick-gate \
-  --output-dir /tmp/hermes-lineage-gate-smoke
+  --output-dir /tmp/hermes-lineage-broad-smoke
 ```
 
-`vm_gate.py` never opens a production `state.db`. It records a machine/runtime receipt and produces:
+`vm_gate.py` never opens a production `state.db`. It records a machine/runtime receipt and emits small-C, full-consume, pathological-budget, DB-size, lifecycle, non-WAL, TEMP-store, and EQP evidence.
 
-- `small_c.csv` — C=3,5,10,20,30,50,100,300 sequential-vs-TEMP-vs-Fixed crossover;
-- `full_consume.csv` — K unreachable, so all candidates must be consumed;
-- `budget_pathological.csv` — 10k-hop and long+concentrated stress across B;
-- `db_size.csv` — 0/20k/250k unrelated filler scaling;
-- `lifecycle.csv` — first/second/warm reuse on the same connection;
-- `nonwal_delete.csv` — `journal_mode=DELETE` locked-writer fallback, Python lock wait and competing SQLite writer latency;
-- `temp_store.csv` — DEFAULT/FILE/MEMORY TEMP policy and logical TEMP pages;
-- `eqp.json` — Fixed query plan; gate fails on a full `sessions`/`child` scan;
-- `receipt.json` — Python/SQLite source ID and compile options, CPU/affinity/cgroup/memory/disk/mount, git identity, and best-effort `hermes-gateway.service` identity.
+## Frozen recovered production topology
 
-This gate is still synthetic and begins after ranked candidates exist.
+The recovery source of truth remains the read-only canonical DB named by #20/#22 and the production profiler. Do not bypass its SHA/sidecar safety checks.
 
-### Frozen recovered production topology (WSL only)
+Static topology evidence is separate from post-search candidate telemetry. The focused architecture gate no longer requires new query-distribution telemetry before the VM duel.
 
-The recovery source of truth is #20/#22. By default `production_profile.py` accepts only:
+## What this broad gate can still answer
 
-```text
-/home/skywind/hermes-recovery/runs/20260807-081043/state.recovered.patched.db
-SHA-256 23cfa3c8adb94ed403058329ae7e252e1d4c4bc01ead76e22ac7d0ff99948104
-```
+- whether Fixed3 first-prepare cost exists on the deployment runtime;
+- whether a full-session planner regression returns;
+- how broad all-consume/shared work behaves;
+- how pathological latency grows with `B`;
+- how rollback-journal fallback affects resolver/writer latency;
+- whether TEMP policy changes latency/footprint;
+- whether unrelated DB growth changes lookup-shaped resolver cost.
 
-Run:
-
-```bash
-python research/session-lineage/benchmark/production_profile.py \
-  --out /tmp/hermes-production-lineage-profile
-```
-
-Safety is fail-closed: wrong SHA, symlink, or non-empty `-wal`/`-shm`/`-journal` sidecar aborts. The database is opened `mode=ro&immutable=1` with `query_only=ON`; no TEMP table, journal change, migration, VACUUM, FTS build, or finalist replay is performed. SHA/stat are checked again after profiling.
-
-The profile records canonical row counts, quick/foreign-key health, schema/FTS presence, generic parent edges, positive compression-continuation edges, missing parents, branch/delegate/tool markers, lineage depth and lineage-size distributions, and pathological static topology. It deliberately does **not** invent post-search candidate distributions from arbitrary query strings.
-
-If #20 later names a replacement authoritative master, update the recorded path/hash from that source of truth before profiling; do not bypass the hash guard against an unverified file.
-
-## What the new gate can decide
-
-- whether Fixed's first-prepare penalty exists on e2-micro and how it changes on the second call of the same reader;
-- whether the old full-table planner regression returns on the deployment SQLite;
-- whether small work favors a no-memo sequential lower bound;
-- where all-consume work favors a one-statement shared resolver;
-- how pathological latency grows with the global work fuse B;
-- how expensive non-WAL fallback is for both the Hermes Python lock and a competing rollback-journal writer;
-- whether TEMP policy materially changes latency/footprint;
-- whether 20k→250k unrelated DB growth changes lookup-shaped resolver cost;
-- whether the recovered production corpus actually has deep/dense compression topology.
-
-It cannot, by itself, select the final B or reconstruct real `C/K/Kth-root-rank` search distributions. Final B should be bracketed by (a) production-derived normal work/depth distribution and (b) the e2-micro pathological B→latency/resource curve. Real ranked-candidate distributions require bounded telemetry at the post-search candidate seam or a safe recorded-candidate replay.
+These are useful secondary/diagnostic dimensions, but they are not a reason to reopen the old TEMP-vs-Fixed-only finalist framing.
