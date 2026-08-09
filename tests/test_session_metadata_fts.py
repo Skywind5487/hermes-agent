@@ -556,6 +556,23 @@ def _metadata_search_ids(db, query):
     return [c["id"] for c in db._fts_metadata_candidates(query)]
 
 
+def _build_populated_sessions_db(db_path, n=1200):
+    """Build a DB with ``n`` sessions (explicit row_ids 1..n) and NO
+    sessions_fts, so the open stages a full H/P claim over an empty external
+    index (the real #25 migration shape)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.executemany(
+        "INSERT INTO sessions (row_id, id, source, started_at, title) "
+        "VALUES (?, ?, 'cli', ?, ?)",
+        [(i, f"s{i}", t0 + i, f"Title {i}") for i in range(1, n + 1)],
+    )
+    conn.commit()
+    conn.close()
+
+
 class TestBoundedGapSearch:
     def test_gap_session_searchable_via_bounded_supplement(self, tmp_path):
         """A session whose row_id is in the unbackfilled (P,H] gap is still
@@ -637,5 +654,86 @@ class TestBoundedGapSearch:
             assert r.get_meta("fts_session_rebuild_high_water") is None
             assert _metadata_search_ids(r, "gamma") == []
             _assert_sessions_fts_integrity(r)
+        finally:
+            r.close()
+
+
+# =========================================================================
+# Group F — concurrency + shared throttle
+# =========================================================================
+
+
+class TestConcurrencyAndThrottle:
+    def test_two_runners_claim_disjoint_chunks(self, tmp_path):
+        """Two concurrent rebuild runners cannot claim/settle the same chunk:
+        progress advances through non-overlapping ranges, every document
+        appears exactly once, and the index stays healthy."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=1200)
+        r1 = SessionDB(db_path=db_path)  # stages H=1200, P=0
+        r2 = SessionDB(db_path=db_path)
+        try:
+            assert r1.get_meta("fts_session_rebuild_high_water") == "1200"
+            assert r2.get_meta("fts_session_rebuild_high_water") == "1200"
+            guards = 0
+            while (r1.fts_session_rebuild_step()
+                   or r2.fts_session_rebuild_step()):
+                guards += 1
+                assert guards < 1000, "rebuild loop did not terminate"
+            assert r1.get_meta("fts_session_rebuild_high_water") is None
+            n_sessions = r1._conn.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            n_docs = r1._conn.execute(
+                "SELECT COUNT(*) FROM sessions_fts_docsize"
+            ).fetchone()[0]
+            assert n_docs == n_sessions
+            dup = r1._conn.execute(
+                "SELECT COUNT(*) FROM (SELECT rowid FROM sessions_fts_docsize "
+                "GROUP BY rowid HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+            assert dup == 0
+            r1._conn.execute(
+                "INSERT INTO sessions_fts(sessions_fts) VALUES('integrity-check')"
+            )
+        finally:
+            r1.close()
+            r2.close()
+
+    def test_shared_pause_formula_monkeypatched(self, tmp_path, monkeypatch):
+        """The shared pause is max(min_pause, build_time * duty_factor), proven
+        without wall-clock sleeps."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=20)
+        r = SessionDB(db_path=db_path)
+        try:
+            r._FTS_REBUILD_DUTY_FACTOR = 4.0
+            r._FTS_REBUILD_MIN_PAUSE = 0.2
+            sleeps = []
+            monkeypatch.setattr("hermes_state_search.time.sleep", sleeps.append)
+            r._fts_rebuild_pause(0.5)   # 0.5 * 4.0 = 2.0 >= 0.2
+            assert sleeps[-1] == 2.0
+            r._fts_rebuild_pause(0.01)  # 0.01 * 4.0 = 0.04 < min 0.2
+            assert sleeps[-1] == 0.2
+        finally:
+            r.close()
+
+    def test_session_loop_routes_through_shared_pause(self, tmp_path, monkeypatch):
+        """optimize_fts_storage's session backfill phase uses the SAME shared
+        pause helper as the message rebuild — no session copy of the policy."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=1200)
+        r = SessionDB(db_path=db_path)
+        try:
+            sleeps = []
+            monkeypatch.setattr("hermes_state_search.time.sleep", sleeps.append)
+            result = r.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            # The only chunks optimize runs here are the session backfill ones
+            # (no messages, no trash, no cjk tokenizer), so every recorded
+            # pause went through the shared helper and honors the floor.
+            assert sleeps
+            assert all(s >= r._FTS_REBUILD_MIN_PAUSE for s in sleeps)
+            assert r.get_meta("fts_session_rebuild_high_water") is None
         finally:
             r.close()
