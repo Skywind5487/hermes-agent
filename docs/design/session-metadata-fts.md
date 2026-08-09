@@ -72,13 +72,26 @@ it for non-CJK titles), and `list_sessions_rich(search_query=...)` now also
 matches the raw `display_name` dimension. The existing normalized / infix
 `%LIKE%` fallback is preserved until #30 deliberately replaces it.
 
+Gap semantics match the index: the supplement folds both sides with
+`_fts_unicode61_fold` (Unicode case-fold + diacritic removal, mirroring
+unicode61) instead of SQLite's ASCII-only `LOWER()`, so `MATCH 'ecole'` finds
+`École` in the gap exactly as it does in the index. The merged FTS+gap result
+is sorted globally by `started_at DESC` (never lane-then-gap), which is what
+`resolve_session_by_title` relies on to resume the latest continuation. The
+helper returns `(fts_ok, candidates)`: when the `sessions_fts` MATCH lane
+itself fails, `fts_ok` is False so title resolution falls back to the LIKE
+lane instead of trusting a partial result.
+
 ## Files
 
 - `hermes_state_common.py` — `SESSIONS_FTS_SQL` (external DDL + gated narrow
-  triggers), `SESSION_TABLE_REBUILD_SQL` / `SESSION_INDEX_SQL_STATEMENTS`.
+  triggers), `SESSION_TABLE_REBUILD_SQL` / `SESSION_INDEX_SQL_STATEMENTS`
+  (the unique title index is deliberately excluded: the existing post-migration
+  duplicate-title repair owns it).
 - `hermes_state.py` — `_migrate_sessions_row_id`, `_ensure_sessions_fts_schema`,
   `_db_has_internal_content_sessions_fts`, `_backfill_sessions_fts_cjk`,
-  `_session_fts_rebuild_gap`, `_fts_metadata_candidates`, updated
+  `_session_fts_rebuild_gap`, `_fts_unicode61_fold`, `_fts_metadata_candidates`
+  (returns `(fts_ok, candidates)` sorted globally), updated
   `_fts_numbered_variants`.
 - `hermes_state_schema.py` — `_init_schema` wiring (the `fts_storage_version`
   stamp stays message-scoped; unified storage-version settlement is #27).
@@ -90,6 +103,9 @@ matches the raw `display_name` dimension. The existing normalized / infix
   session phase.
 - `hermes_cli/session_recovery.py` — session markers treated as generated /
   pending in offline recovery.
-- `tests/test_session_metadata_fts.py` — rowid-hole migration, raw Unicode
-  external-content, H/P ownership regions, crash/restart, bounded-gap search +
-  finish, concurrency + shared throttle.
+- `tests/test_session_metadata_fts.py` — rowid-hole migration (incl. legacy
+  duplicate-title upgrade), raw Unicode external-content, H/P ownership
+  regions, crash/restart, bounded-gap search (incl. Unicode-fold parity and
+  cross-lane ordering), finish, delete probes that read the index directly and
+  a `rank=1` consistency check on completed indexes, two real concurrent
+  runners (thread + barrier), shared throttle.
