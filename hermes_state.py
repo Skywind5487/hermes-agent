@@ -177,16 +177,28 @@ def _fts_query_positive_terms(raw_query: str) -> List[str]:
     accepted (the backfilled index restores exact semantics), but a MISS is
     not: a session that MATCHes once backfilled must never be hidden while
     it sits in the ``(P, H]`` gap.
+
+    Tokenization follows unicode61's token-character set, splitting MORE
+    aggressively rather than less: unicode61's token characters are Unicode
+    letters and digits, and EVERYTHING else — whitespace, punctuation, and
+    notably ``_`` (which Python's ``\\w`` wrongly keeps) — is a separator.
+    The query sanitizer quotes ``[._-]`` terms as FTS phrases, but the index
+    still tokenizes them the same way (``"foo_bar"`` → phrase ``foo bar``
+    against a ``foo bar`` document), so the gap must too: ``foo_bar`` /
+    ``foo-bar`` / ``foo.bar`` all yield the terms (``foo``, ``bar``). A term
+    that kept the separator literal (``"foo_bar"``) would MISS a session the
+    indexed lane finds. (CJK runs are deliberately left as whole terms here;
+    per-codepoint CJK tokenization belongs to the #26 CJK lane.)
     """
-    # Drop FTS5 boolean operators, then split on anything that is not a
-    # letter/digit (close enough to unicode61 tokenization for a conservative
-    # superset). Trailing '*' prefix markers fold into the term itself
-    # (substring containment covers prefix matching).
+    # Drop FTS5 boolean operators, then map every non-token character —
+    # anything that is not a Unicode letter or digit, including '_' — to a
+    # space (mirrors unicode61's token-character set exactly).
     cleaned = re.sub(
         r"\b(?:AND|OR|NOT|NEAR)\b", " ", raw_query, flags=re.IGNORECASE
     )
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in cleaned)
     terms: List[str] = []
-    for token in re.split(r"[^\w]+", cleaned, flags=re.UNICODE):
+    for token in cleaned.split():
         folded = _fts_unicode61_fold(token.rstrip("*"))
         if folded:
             terms.append(folded)

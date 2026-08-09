@@ -19,6 +19,7 @@ from hermes_state import (
     LEGACY_FTS_SQL,
     SCHEMA_SQL,
     SessionDB,
+    _fts_query_positive_terms,
     _fts_unicode61_fold,
 )
 
@@ -943,6 +944,46 @@ class TestBoundedGapSearch:
             assert _raw_metadata_match_ids(r, "alpha OR beta") == []
             # The gap supplement surfaces C via the 'alpha' term.
             assert "C" in _metadata_search_ids(r, "alpha OR beta")
+        finally:
+            r.close()
+
+    def test_positive_term_extractor_splits_punctuation(self):
+        """The term extractor splits on EVERY non-token character — including
+        '_', which Python's ``\\w`` wrongly treats as a word char — so the gap
+        predicate stays a superset of the FTS predicate across the
+        sanitizer-quoted [._-] punctuation."""
+        assert _fts_query_positive_terms("foo_bar") == ["foo", "bar"]
+        assert _fts_query_positive_terms("foo-bar") == ["foo", "bar"]
+        assert _fts_query_positive_terms("foo.bar") == ["foo", "bar"]
+        assert _fts_query_positive_terms("Alpha Project") == ["alpha", "project"]
+        assert _fts_query_positive_terms("alpha OR beta") == ["alpha", "beta"]
+        assert _fts_query_positive_terms("École") == ["ecole"]
+
+    @pytest.mark.parametrize("query", ["foo_bar", "foo-bar", "foo.bar"])
+    def test_gap_supplement_punctuation_query_no_hide(self, tmp_path, query):
+        """Punctuation the sanitizer quotes into an FTS phrase ('.', '-', '_')
+        must not hide a gap row: the index tokenizes a 'foo bar ...' document
+        and a 'foo_bar' query to the same two tokens, so the gap supplement
+        must too — the term extractor treats all three as separators, never a
+        literal part of the term."""
+        r = _three_region_db(tmp_path)  # A(1)/B(3) indexed, C(7) in gap
+        try:
+            # Distinct titles (the unique-title constraint forbids sharing the
+            # exact string) that both carry the adjacent 'foo bar' phrase.
+            r.set_session_title("A", "foo bar alpha")  # <= P, indexed
+            r.set_session_title("C", "foo bar beta")   # (P,H], gap
+            # Indexed control via the same sanitized quoted phrase the FTS
+            # lane uses (a bare '.foo.'/'-' query is not valid FTS5 syntax).
+            sanitized = r._sanitize_fts5_query(query)
+            assert _raw_metadata_match_ids(r, sanitized) == ["A"]
+            # Gap supplement must ALSO surface C.
+            hits = _metadata_search_ids(r, query)
+            assert "A" in hits and "C" in hits
+            # After backfill completes, C is index-findable too.
+            while r.fts_session_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            assert "C" in _raw_metadata_match_ids(r, sanitized)
         finally:
             r.close()
 
