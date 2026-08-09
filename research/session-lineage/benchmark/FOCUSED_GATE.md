@@ -1,170 +1,76 @@
-# #54 focused resolver gate — current source of truth
+# #54 focused resolver gate — decision record
 
-> Status: research only. No production winner or final global `B` selected yet.
+> Status: **gate complete**.
 >
-> This file supersedes the older "Pure TEMP vs Fixed3 only" finalist framing in
-> `README.md`, `GATE.md`, and early #54 comments. Those remain historical evidence.
+> Selected production resolver shape: **`python_dict_memo`**.
+>
+> Selected global successful-row-lookup budget: **`B = 1500`**.
+>
+> Raw e2-micro evidence: `results/focused_vm_gate_20260809.md`.
 
-## Decision now
+This file supersedes the older "Pure TEMP vs Fixed3 only" finalist framing in
+`README.md`, `GATE.md`, and early #54 comments. Those remain historical evidence.
 
-The architecture question is intentionally small:
+## Final architecture decision
 
-1. **`per_seed_no_memo`** — ranked sequential indexed point traversal, no reuse;
-2. **`python_dict_memo`** — the same scheduler plus query-local `node -> root`
-   path compression;
-3. **Pure TEMP** — existing overlap/memo reference;
-4. **Fixed3** — existing one-statement SQL reference.
+Use ranked sequential indexed point traversal with a tiny **query-local**
+`node -> resolved_root` memo/path compression map.
 
-The first two are the current KISS production decision candidates. TEMP and
-Fixed3 remain references because their earlier measurements are useful, but they
-are no longer privileged as the only finalists.
+Keep:
 
-A lazy-candidate SQL state machine is deliberately not implemented here. It is a
-separate SQL exploration direction; do not grow this gate into another algorithm
-zoo.
-
-## Why the decision narrowed
-
-The resolver receives **ranked distinct owning-session IDs**. Duplicate FTS rows
-have already been collapsed before this seam.
-
-Current evidence separates three workload classes:
-
-### 1. Hermes-normal observed topology
-
-Observed post-adoption positive compression ancestry is shallow (currently depth
-0/1 in the recovered corpus). When `K` is reached in the first few ranked
-candidates, candidate-level early stop matters more than shared ancestry reuse.
-
-### 2. Historical/import compatibility
-
-The robust frozen-corpus extreme is:
-
-```text
-max positive compression depth = 14
-max lineage size               = 15
-```
-
-The focused fixture ranks all 15 members deepest-to-root before two independent
-roots. This deliberately maximizes repeated ancestry before `K=3` can be
-satisfied.
-
-For the one-lineage full-consume form:
-
-```text
-no memo: 15 + 14 + ... + 1 = 120 successful row lookups
-memo:    15 successful row lookups, then query-local hits
-```
-
-This is compatibility evidence, not normal Hermes workload weighting. #60 owns
-the exact ChatGPT import/merge provenance of pre-Hermes historical rows.
-
-### 3. Safety only
-
-Synthetic 5k/10k chains are retained only for:
-
-- global work-budget behavior;
-- malformed/pathological future DB protection;
-- latency/resource growth as `B` changes.
-
-They must not be averaged into normal performance evidence.
-
-## Files
-
-- `python_memo.py` — hardened graveyard-#19 style Python dict/path-compression resolver;
-- `focused_scenarios.py` — current-normal + real historical extreme fixtures;
-- `focused_vm_gate.py` — VM runner producing the focused decision evidence;
-- `tests/test_focused_gate.py` — correctness, historical-envelope, reuse, and bound assertions;
-- `per_seed.py` — no-memo sequential baseline;
-- `temp_memo.py` / `fixed3_optimized.py` — references.
-
-## Hardened Python memo contract
-
-`python_dict_memo()` has:
-
-- one deferred read transaction for the entire multi-statement logical search;
+- one deferred read transaction for the whole logical search;
 - ranked candidate-level early stop;
-- query-local `node -> resolved_root` memo;
-- path compression;
+- query-local path compression only;
 - local cycle detection;
 - missing-parent fail closed;
-- global successful-row-lookup budget `B`;
-- no persistent schema or cross-query cache.
+- global successful-row-lookup budget `B=1500`;
+- no persistent schema and no cross-query cache.
 
-The synthetic benchmark uses `edge_kind='compression'`. Production integration
-must replace that synthetic predicate with current Hermes positive
-compression-continuation semantics without changing the scheduler/safety contract.
+TEMP and Fixed3 remain reference evidence only. A lazy-candidate SQL state machine
+remains a separate SQL exploration direction and is not required for this
+production implementation.
 
-## Focused VM run
+## Why memo wins
 
-From the research branch:
+The focused e2-micro run used PR #55 head
+`444c161218b00166bda73f2ec5a21f250e2049bc`, a clean worktree, a 35-second CPU
+precondition, and disposable synthetic DBs only. Eleven focused/contract tests
+passed.
 
-```bash
-python research/session-lineage/benchmark/run.py \
-  --focused-gate \
-  --output-dir /tmp/hermes-lineage-20260809
-```
+### Hermes-normal shallow cases
 
-Full mode automatically performs a **35-second CPU precondition before timing**.
-This is deliberate: the production e2-micro previously showed an approximately
-28-second shared-core burst window followed by the sustained regime. Sleeping
-would not consume burst credits, so the runner uses CPU work and records what it
-did in `precondition.json`. This avoids accidentally comparing algorithms only
-inside the unusually fast burst state.
+| case | no memo median | memo median |
+|---|---:|---:|
+| depth0, C=300, K=3 at rank 3 | 0.037460 ms | 0.038469 ms |
+| depth1, C=300, K=3 at rank 3 | 0.051469 ms | 0.053704 ms |
 
-Smoke first if desired:
+Memo's shallow overhead is only about 3–4%, or roughly 0.001–0.002 ms here.
 
-```bash
-python research/session-lineage/benchmark/run.py \
-  --quick-focused-gate \
-  --output-dir /tmp/hermes-lineage-smoke
-```
+### Historical/import compatibility extreme
 
-Quick smoke skips the CPU precondition and is **not acceptance timing**.
+| case | no memo median | memo median | memo speedup |
+|---|---:|---:|---:|
+| depth14/size15, deepest-to-root then two roots | 0.592984 ms | 0.124840 ms | ~4.75x |
+| depth14/size15 full-consume | 0.619249 ms | 0.114357 ms | ~5.42x |
 
-The focused runner never opens production `state.db`.
-
-Outputs:
+The full-consume fixture deterministically confirms the work reduction:
 
 ```text
-focused-vm-gate/
-├── receipt.json
-├── tests.txt
-├── precondition.json
-├── focused_gate.csv
-├── focused_budget.csv
-├── fixed3_eqp.json
-└── suite_meta.json
+no memo = 120 successful row lookups
+memo    = 15 successful row lookups
 ```
 
-`receipt.json` records runtime/machine/git context. `precondition.json` records
-the CPU burn used to enter the intended sustained timing regime.
-`focused_gate.csv` contains normal + historical compatibility performance.
-`focused_budget.csv` is safety only and contains **only no-memo + Python memo**;
-TEMP/Fixed3 are references and are not repeatedly stressed across every `B` cell.
+TEMP and Fixed3 are also slower than the best KISS candidate across these focused
+cells, by roughly 3.4x–7.9x on median.
 
-## How to decide after the VM run
+That is enough to pay for the tiny dict: essentially no normal-path penalty, but a
+large compatibility/repeated-ancestry reduction.
 
-### Architecture winner
-
-Prefer the simpler no-memo traversal if:
-
-- it wins/essentially ties memo on both shallow normal fixtures; and
-- its real historical depth14/size15 cost remains comfortably small.
-
-Keep the tiny Python memo if:
-
-- its normal-path overhead is negligible; and
-- it materially reduces the real historical compatibility fixture.
-
-TEMP/Fixed3 should displace the KISS candidates only if they show a clear VM
-advantage that justifies their additional integration/runtime complexity.
-
-### `B` is a separate decision
+## Final `B = 1500`
 
 Do not derive `B` from max depth alone.
 
-Frozen-corpus no-memo work envelopes already established in #54:
+Frozen-corpus work envelopes already established in #54 are:
 
 ```text
 C <= 300   -> <= 554 successful node visits
@@ -172,16 +78,86 @@ C <= 1000  -> <= 1254 successful node visits
 historical one-lineage adversary -> <= 120 visits
 ```
 
-These are compatibility/normal-corpus envelopes, not a malformed-future-DB fuse.
-Choose final `B` by placing a safety margin above legitimate work and checking the
-VM `focused_budget.csv` latency/resource curve.
+`B=1500` covers the hard `C<=1000` legitimate frozen-corpus envelope with about
+20% headroom while still bounding malformed/future paths.
 
-## Not blocked by #60
+The e2-micro safety sweep contains non-monotonic 100–200ms stalls caused by the
+already-attributed shared-core quota regime, so there is no honest single
+wall-time "cliff" to fit. The budget is therefore selected primarily from the
+logical legitimate-work envelope plus a modest margin, with the VM curve used as
+a sanity check rather than a false precision threshold.
 
-#60 is concurrently reconstructing ChatGPT historical import/merge provenance by
-reading archived chats and DB fields. The focused resolver VM run does not need to
-wait for it.
+## Runtime caveat
 
-Only revise the workload interpretation if #60 proves that the historical
-lineage topology has a materially different provenance/meaning. Do not let DB
-archaeology reopen the resolver algorithm space by default.
+The saved VM receipt shows the focused run used `/usr/bin/python3` linked against
+SQLite 3.40.1, not a Hermes-managed embedded/runtime interpreter.
+
+This does **not** reopen the architecture decision: no-memo and memo use the same
+indexed point-lookup shape, and the decisive difference is query-local reuse.
+The caveat matters more to planner-heavy TEMP/Fixed references.
+
+Production integration must still run the normal Hermes test/runtime path before
+merge. Do not add another broad algorithm benchmark solely because of this
+receipt difference.
+
+## Workload interpretation
+
+### Hermes-normal observed topology
+
+Observed post-adoption positive compression ancestry is shallow (depth 0/1 in the
+recovered corpus). Candidate-level early stop therefore dominates normal work.
+
+### Historical/import compatibility
+
+The robust frozen-corpus extreme remains:
+
+```text
+max positive compression depth = 14
+max lineage size               = 15
+```
+
+This is compatibility evidence, not normal Hermes weighting. #60 independently
+owns the exact ChatGPT import/merge provenance of pre-Hermes historical rows.
+Its result may refine provenance wording, but should not reopen the resolver
+algorithm space unless it materially changes the compatibility requirement.
+
+### Safety only
+
+Synthetic 5k/10k chains are only for malformed/pathological protection and budget
+cost. Do not average them into normal performance ranking.
+
+## Production integration contract
+
+The benchmark's synthetic schema uses `edge_kind='compression'`. Production code
+must substitute current Hermes positive compression-continuation semantics while
+preserving:
+
+1. ranked distinct owning-session candidates in;
+2. candidate-level early stop at K roots;
+3. one logical read snapshot;
+4. query-local `node -> root` memo/path compression;
+5. cycle and missing-parent fail-closed behavior;
+6. global successful-row-lookup budget `B=1500`;
+7. deterministic diagnostics/work counters suitable for tests.
+
+## Durable evidence
+
+- `results/focused_vm_gate_20260809.md` — exact VM receipt, test output, focused
+  performance CSV, budget CSV, and source package SHA-256.
+- `python_memo.py` — hardened research candidate.
+- `focused_scenarios.py` — shallow normal + depth14/size15 fixtures.
+- `focused_vm_gate.py` — production-VM focused runner.
+- `tests/test_focused_gate.py` — exactness/reuse/budget assertions.
+- `per_seed.py` — no-memo reference candidate.
+- `temp_memo.py` / `fixed3_optimized.py` — historical references.
+
+## Closed / do not reopen by default
+
+- TEMP vs Fixed3 as the only finalist set;
+- broad algorithm-zoo expansion;
+- e2-micro 8x burst/sustained cliff attribution;
+- whether memo reuse is worth its normal-path overhead;
+- production resolver mechanism;
+- global budget value (`B=1500`).
+
+Next work is **production integration**, not more resolver research.
