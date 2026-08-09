@@ -297,3 +297,235 @@ class TestNamedRowIdMigration:
             assert leftover is None
         finally:
             session_db.close()
+
+
+# =========================================================================
+# Raw Unicode external-content sessions_fts — helpers
+# =========================================================================
+
+
+def _fts_sql(conn, table):
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return (row[0] if isinstance(row, sqlite3.Row) else row[0]) if row else ""
+
+
+def _set_session_rebuild_markers(db, high_water, progress):
+    db.set_meta("fts_session_rebuild_high_water", str(high_water))
+    db.set_meta("fts_session_rebuild_progress", str(progress))
+
+
+def _assert_sessions_fts_integrity(db):
+    """FTS5 integrity-check raises on a corrupt external-content index."""
+    db._conn.execute(
+        "INSERT INTO sessions_fts(sessions_fts) VALUES('integrity-check')"
+    )
+
+
+def _raw_metadata_match_ids(db, query):
+    """Return session ids whose raw Unicode metadata document MATCHes query."""
+    with db._read_ctx() as conn:
+        rows = conn.execute(
+            "SELECT s.id FROM sessions_fts f "
+            "JOIN sessions s ON s.row_id = f.rowid "
+            "WHERE sessions_fts MATCH ?",
+            (query,),
+        ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _three_region_db(tmp_path):
+    """SessionDB with rows 1..4 and H=4, P=2 → ``<=P``={1,2}, ``(P,H]``={3,4},
+    and (after a fresh insert) ``>H`` rows. Pre-seeds the external index by
+    re-opening a populated DB so rebuild markers exist."""
+    db_path = tmp_path / "s.db"
+    w = SessionDB(db_path=db_path)
+    for sid in ("A", "B", "C", "D"):
+        w.create_session(sid, source="cli")
+        w.set_session_title(sid, f"Title {sid}")
+    w.close()
+    r = SessionDB(db_path=db_path)
+    _set_session_rebuild_markers(r, 4, 2)
+    return r
+
+
+# =========================================================================
+# Group B — raw Unicode external-content shape and search dimensions
+# =========================================================================
+
+
+class TestUnicodeExternalContent:
+    def test_sessions_fts_ddl_is_external_content_raw_metadata(self, db):
+        """sessions_fts is external-content over raw (title, id, display_name)
+        keyed by named ``row_id``."""
+        sql = _fts_sql(db._conn, "sessions_fts")
+        assert "content='sessions'" in sql
+        assert "content_rowid='row_id'" in sql
+        assert "tokenize='unicode61'" in sql
+        for col in ("title", "id", "display_name"):
+            assert col in sql
+
+    def test_raw_unicode_search_covers_title_id_display_name(self, db):
+        db.create_session("s1", source="cli")
+        db.set_session_title("s1", "Alpha Project")
+        db._conn.execute(
+            "UPDATE sessions SET display_name = 'Alpha Display' WHERE id = 's1'"
+        )
+        db._conn.commit()
+        assert _raw_metadata_match_ids(db, "alpha") == ["s1"]      # title
+        assert _raw_metadata_match_ids(db, "s1") == ["s1"]         # logical id
+        assert _raw_metadata_match_ids(db, "display") == ["s1"]    # display_name
+
+    def test_unrelated_metadata_update_does_not_rewrite_fts(self, db):
+        """Only narrow UPDATE OF title/id/display_name maintain the index; an
+        unrelated column write must not fire the FTS update trigger."""
+        db.create_session("s1", source="cli")
+        db.set_session_title("s1", "Alpha")
+        db._conn.execute(
+            "UPDATE sessions SET message_count = 5 WHERE id = 's1'"
+        )
+        db._conn.commit()
+        assert _raw_metadata_match_ids(db, "alpha") == ["s1"]
+        trig = db._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'sessions_fts_update'"
+        ).fetchone()
+        sql = trig[0] if not isinstance(trig, sqlite3.Row) else trig["sql"]
+        compact = " ".join(sql.split())
+        assert "AFTER UPDATE OF title, id, display_name" in compact
+
+
+# =========================================================================
+# Group C — crash/restart H/P bookkeeping
+# =========================================================================
+
+
+class TestRebuildMarkers:
+    def test_populated_db_stages_rebuild_markers(self, tmp_path):
+        """Opening a populated DB with an external sessions_fts must stage the
+        durable H/P rebuild claim (never serve an empty index as complete)."""
+        db_path = tmp_path / "s.db"
+        w = SessionDB(db_path=db_path)
+        w.create_session("A", source="cli")
+        w.create_session("B", source="cli")
+        w.create_session("C", source="cli")
+        w.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r.get_meta("fts_session_rebuild_high_water") is not None
+            assert r.get_meta("fts_session_rebuild_progress") == "0"
+        finally:
+            r.close()
+
+    def test_empty_db_has_no_markers(self, db):
+        """An empty DB's index is complete by construction — no claim."""
+        assert db.get_meta("fts_session_rebuild_high_water") is None
+
+    def test_markers_survive_reopen_no_reseed(self, tmp_path):
+        """A completed/advanced progress must never be reseeded to zero on
+        reopen."""
+        db_path = tmp_path / "s.db"
+        w = SessionDB(db_path=db_path)
+        w.create_session("A", source="cli")
+        w.create_session("B", source="cli")
+        w.close()
+        r = SessionDB(db_path=db_path)
+        _set_session_rebuild_markers(r, 2, 1)
+        r.close()
+        r2 = SessionDB(db_path=db_path)
+        try:
+            assert r2.get_meta("fts_session_rebuild_high_water") == "2"
+            assert r2.get_meta("fts_session_rebuild_progress") == "1"
+        finally:
+            r2.close()
+
+    def test_crash_after_claim_before_schema_resumes(self, tmp_path):
+        """Durable markers with the external table missing (death between the
+        claim commit and the schema ensure) must re-ensure the external schema
+        on reopen — never stamp the migration complete."""
+        db_path = tmp_path / "s.db"
+        w = SessionDB(db_path=db_path)
+        w.create_session("A", source="cli")
+        w.create_session("B", source="cli")
+        w.close()
+        with sqlite3.connect(db_path) as conn:
+            for t in (
+                "sessions_fts", "sessions_fts_data", "sessions_fts_idx",
+                "sessions_fts_content", "sessions_fts_docsize",
+                "sessions_fts_config",
+            ):
+                conn.execute(f"DROP TABLE IF EXISTS {t}")
+            conn.commit()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert "content='sessions'" in _fts_sql(r._conn, "sessions_fts")
+            # Backfill still pending (markers present), not stamped done.
+            assert r.get_meta("fts_session_rebuild_high_water") is not None
+        finally:
+            r.close()
+
+
+# =========================================================================
+# Group D — trigger ownership regions (<=P, (P,H], >H) + deletes + integrity
+# =========================================================================
+
+
+class TestTriggerOwnershipRegions:
+    def test_delete_indexed_prefix_row_removes_doc(self, tmp_path):
+        """Deleting a ``<=P`` row removes its already-indexed document."""
+        r = _three_region_db(tmp_path)
+        try:
+            r.delete_session("A")  # row_id 1, indexed
+            assert "A" not in _raw_metadata_match_ids(r, "title")
+            _assert_sessions_fts_integrity(r)
+        finally:
+            r.close()
+
+    def test_delete_gap_row_does_not_issue_fts_delete(self, tmp_path):
+        """Deleting a ``(P,H]`` row (never indexed) must not issue an
+        external-content FTS delete; integrity stays healthy."""
+        r = _three_region_db(tmp_path)
+        try:
+            r.delete_session("C")  # row_id 3, in (P,H]
+            _assert_sessions_fts_integrity(r)
+            # Row is simply absent — backfill later finds no canonical row.
+            assert r.get_session("C") is None
+        finally:
+            r.close()
+
+    def test_delete_live_row_removes_doc(self, tmp_path):
+        """Deleting a ``>H`` live row (indexed by the trigger at insert time)
+        removes its live document."""
+        r = _three_region_db(tmp_path)
+        try:
+            r.create_session("E", source="cli")  # row_id 5 > H
+            r.set_session_title("E", "Live Echo")
+            assert _raw_metadata_match_ids(r, "echo") == ["E"]
+            r.delete_session("E")
+            assert "E" not in _raw_metadata_match_ids(r, "echo")
+            _assert_sessions_fts_integrity(r)
+        finally:
+            r.close()
+
+    def test_gap_region_update_does_not_corrupt_index(self, tmp_path):
+        """Updating a ``(P,H]`` row must not rewrite a document that was never
+        indexed; integrity stays healthy."""
+        r = _three_region_db(tmp_path)
+        try:
+            r.set_session_title("C", "New Title C")  # row_id 3, in (P,H]
+            _assert_sessions_fts_integrity(r)
+        finally:
+            r.close()
+
+    def test_live_session_searchable_while_backfill_pending(self, tmp_path):
+        """A session created after high-water capture is searchable
+        immediately while the historical backfill remains incomplete."""
+        r = _three_region_db(tmp_path)
+        try:
+            r.create_session("E", source="cli")  # row_id 5 > H
+            r.set_session_title("E", "Fresh Live Title")
+            assert _raw_metadata_match_ids(r, "fresh") == ["E"]
+        finally:
+            r.close()
