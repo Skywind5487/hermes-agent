@@ -21,6 +21,13 @@ Research context: [`docs/research/issue-32-stable-row-id-unicode-session-fts.md`
    the historical rows are backfilled by the resumable chunk engine, sharing
    the message rebuild's crash-safe claim/repair/finish rules and its single
    monkeypatchable pause helper.
+4. The sessions_fts upgrade is **decoupled from the message-FTS layout**: it
+   runs on BOTH the legacy v22-inline-messages path and the v23 path.
+   `_migrate_sessions_row_id()` rebuilds `sessions` via `DROP TABLE`, which
+   carries away any pre-#25 `sessions_fts_*` triggers with it — so the
+   sessions ensure must not live inside the message `else` branch, or a
+   legacy-message DB would strand the old internal title-only `sessions_fts`
+   with no triggers and no H/P claim.
 
 ## Ownership model
 
@@ -72,13 +79,18 @@ it for non-CJK titles), and `list_sessions_rich(search_query=...)` now also
 matches the raw `display_name` dimension. The existing normalized / infix
 `%LIKE%` fallback is preserved until #30 deliberately replaces it.
 
-Gap semantics match the index: the supplement folds both sides with
-`_fts_unicode61_fold` (Unicode case-fold + diacritic removal, mirroring
-unicode61) instead of SQLite's ASCII-only `LOWER()`, so `MATCH 'ecole'` finds
-`École` in the gap exactly as it does in the index. The merged FTS+gap result
-is sorted globally by `started_at DESC` (never lane-then-gap), which is what
-`resolve_session_by_title` relies on to resume the latest continuation. The
-helper returns `(fts_ok, candidates)`: when the `sessions_fts` MATCH lane
+Gap semantics approximate the index conservatively: the supplement folds both
+sides with `_fts_unicode61_fold` (NFKD decompose + drop combining marks +
+casefold) instead of SQLite's ASCII-only `LOWER()`, so `MATCH 'ecole'` finds
+`École` in the gap as it does in the index. This is deliberately a
+conservative Unicode approximation, NOT exact unicode61 parity (the real
+tokenizer folds per Unicode 6.1, strips Latin-script diacritics, and preserves
+single-codepoint multi-diacritic characters such as `ộ`), so the gap lane can
+produce a temporary false positive that disappears after backfill — accepted,
+because #25's core risk is migration MISSING a result. The merged FTS+gap
+result is sorted globally by `started_at DESC` (never lane-then-gap), which is
+what `resolve_session_by_title` relies on to resume the latest continuation.
+The helper returns `(fts_ok, candidates)`: when the `sessions_fts` MATCH lane
 itself fails, `fts_ok` is False so title resolution falls back to the LIKE
 lane instead of trusting a partial result.
 
@@ -93,8 +105,10 @@ lane instead of trusting a partial result.
   `_session_fts_rebuild_gap`, `_fts_unicode61_fold`, `_fts_metadata_candidates`
   (returns `(fts_ok, candidates)` sorted globally), updated
   `_fts_numbered_variants`.
-- `hermes_state_schema.py` — `_init_schema` wiring (the `fts_storage_version`
-  stamp stays message-scoped; unified storage-version settlement is #27).
+- `hermes_state_schema.py` — `_init_schema` wiring: the sessions-FTS block is
+  placed OUTSIDE the message legacy/`else` branch so it runs for every message
+  layout (the `fts_storage_version` stamp stays message-scoped; unified
+  storage-version settlement is #27).
 - `hermes_state_search.py` — shared `_FTS_MESSAGE_SPEC` / `_FTS_SESSION_SPEC`,
   parameterized `fts_rebuild_status/step`, `_fts_rebuild_finish`,
   `_seed_fts_rebuild_markers`, `_repair_missing_progress` (the shared crash-safe
@@ -105,7 +119,9 @@ lane instead of trusting a partial result.
   pending in offline recovery.
 - `tests/test_session_metadata_fts.py` — rowid-hole migration (incl. legacy
   duplicate-title upgrade), raw Unicode external-content, H/P ownership
-  regions, crash/restart, bounded-gap search (incl. Unicode-fold parity and
-  cross-lane ordering), finish, delete probes that read the index directly and
-  a `rank=1` consistency check on completed indexes, two real concurrent
-  runners (thread + barrier), shared throttle.
+  regions, crash/restart, bounded-gap search (incl. conservative Unicode-fold
+  supplement and its explicit non-parity edge, cross-lane ordering), finish,
+  delete probes that read the index directly and a `rank=1` consistency check
+  on completed indexes, two real concurrent runners (thread + barrier), shared
+  throttle, and a legacy-message × old-session-FTS cross-layout upgrade path
+  (one optimize settles both).
