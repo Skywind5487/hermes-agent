@@ -14,6 +14,7 @@ is present. The degraded/unavailable-host tests that need no tokenizer always
 run.
 """
 
+import os
 import sqlite3
 import shutil
 import subprocess
@@ -27,6 +28,19 @@ from hermes_state import SCHEMA_SQL, SessionDB
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "native" / "fts5_cjk" / "fts5_cjk.c"
 VENDOR = REPO / "native" / "fts5_cjk" / "vendor"
+
+
+def _loadable_extension(path: Path) -> bool:
+    """True when ``path`` is a real loadable FTS5 extension on this build."""
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.enable_load_extension(True)
+        probe.load_extension(str(path))
+        return True
+    except Exception:
+        return False
+    finally:
+        probe.close()
 
 
 def _build_populated_sessions_db(db_path, n=1200):
@@ -73,11 +87,24 @@ def db(tmp_path):
 
 @pytest.fixture(scope="session")
 def cjk_so(tmp_path_factory):
-    """Build the cjk_unicode61 loadable tokenizer from source; skip when no C
-    toolchain / extension loading is available (mirrors test_fts_cjk_bigram)."""
+    """Provide a loadable cjk_unicode61 tokenizer extension.
+
+    Honors a prebuilt artifact supplied via ``HERMES_FTS5_CJK_SO`` (e.g. a
+    Windows ``.dll`` cross-compiled from ``native/fts5_cjk/fts5_cjk.c`` with
+    mingw) so capable-host tests run without a local C toolchain — the same
+    env override production's ``fts5_cjk_so_path()`` honors. Otherwise builds
+    from source (CI/Linux images ship gcc). Skips when neither is available.
+    """
+    prebuilt = os.environ.get("HERMES_FTS5_CJK_SO")
+    if prebuilt:
+        p = Path(prebuilt)
+        if p.is_file() and _loadable_extension(p):
+            return p
+        pytest.skip(f"HERMES_FTS5_CJK_SO set but not loadable: {p}")
     if shutil.which("gcc") is None or not SRC.exists():
         pytest.skip("no C toolchain / tokenizer source")
-    out = tmp_path_factory.mktemp("fts5cjk") / "libfts5_cjk.so"
+    ext = "dll" if os.name == "nt" else "so"
+    out = tmp_path_factory.mktemp("fts5cjk") / f"libfts5_cjk.{ext}"
     try:
         subprocess.run(
             ["gcc", "-shared", "-fPIC", "-O2", f"-I{VENDOR}", str(SRC),
@@ -86,14 +113,8 @@ def cjk_so(tmp_path_factory):
         )
     except subprocess.CalledProcessError as e:
         pytest.skip(f"tokenizer build failed: {e.stderr[:200]}")
-    probe = sqlite3.connect(":memory:")
-    try:
-        probe.enable_load_extension(True)
-        probe.load_extension(str(out))
-    except Exception as e:
-        pytest.skip(f"extension loading unavailable: {e}")
-    finally:
-        probe.close()
+    if not _loadable_extension(out):
+        pytest.skip("built tokenizer not loadable in this build")
     return out
 
 
@@ -407,10 +428,14 @@ class TestCjkDegradation:
         db_path = tmp_path / "s.db"
         _build_populated_sessions_db(db_path, n=20)
         w = _open_capable(db_path, cjk_so, monkeypatch)
-        w.fts_session_cjk_rebuild_step()  # partial progress
+        # Opening a populated DB stages CJK H=20, P=0. Force a partial
+        # in-flight progress so the degradation path is exercised
+        # deterministically (a single step could otherwise complete the small
+        # index in one chunk and clear the markers).
+        w.set_meta(CJK_PROG, "5")
         hw = w.get_meta(CJK_HW)
         prog = w.get_meta(CJK_PROG)
-        assert hw is not None
+        assert hw == "20" and prog == "5"
         w.close()
 
         r = _open_incapable(db_path, tmp_path, monkeypatch)
@@ -470,12 +495,16 @@ class TestCjkSearchSeam:
         d = _open_capable(db_path, cjk_so, monkeypatch)
         try:
             assert d._sessions_cjk_available is False
+            # A pending CJK backfill must not serve the CJK lane.
             servable, candidates = d._fts_cjk_metadata_candidates("標題")
             assert servable is False
             assert candidates is None
-            # But canonical fallback still finds the row.
-            _, uni = d._fts_metadata_candidates("標題")
-            assert any(c["id"] == "s1" for c in uni)
+            # But canonical fallback (the Unicode lane) still finds the same
+            # session through its ASCII token while CJK is pending.
+            d.create_session("s51", source="cli")
+            d.set_session_title("s51", "CJK 標題 Plan")
+            _, uni = d._fts_metadata_candidates("plan")
+            assert any(c["id"] == "s51" for c in uni)
         finally:
             d.close()
 

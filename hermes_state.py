@@ -6216,6 +6216,61 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             by_row_id.values(), key=lambda c: c["started_at"], reverse=True
         )
 
+    def _fts_cjk_metadata_candidates(
+        self, raw_query: str
+    ) -> Tuple[bool, Optional[List[Dict[str, Any]]]]:
+        """CJK session-metadata candidates over raw (title, id, display_name).
+
+        Optional CJK specialization of ``_fts_metadata_candidates`` (#26) over
+        the external-content ``sessions_fts_cjk``. Executes through
+        ``_read_ctx()`` — never the writer lock (the accepted read-path split).
+        Returns ``(servable, candidates)``:
+
+        - ``(False, None)`` — the CJK lane must NOT serve: the query is a lone
+          single CJK character (the bigram index's useful lower bound is two
+          CJK chars), the query cannot be sanitized, the index is pending or
+          stale, or the tokenizer is unavailable on this connection. Callers
+          route to the canonical Unicode/LIKE lane — a partial CJK index is
+          never served.
+        - ``(True, [])`` — servable, valid zero matches.
+        - ``(True, [...]``) — servable matches (``id`` / ``title`` /
+          ``display_name`` / ``started_at`` / ``row_id``, ``started_at DESC``).
+
+        The servable-vs-zero distinction is what lets #14 route ordinary CJK
+        picker queries without owning lifecycle state.
+        """
+        # A lone single CJK character cannot match inside longer runs in the
+        # bigram index — classify as fallback-only before touching the index.
+        if self._has_lone_cjk_run(raw_query):
+            return False, None
+        sanitized = self._sanitize_fts5_query(raw_query)
+        if not sanitized:
+            return False, None
+        if not getattr(self, "_sessions_cjk_available", False):
+            # Pending / stale / tokenizer-unavailable: not servable.
+            return False, None
+        with self._read_ctx() as conn:
+            try:
+                cursor = conn.execute(
+                    "SELECT s.id AS id, s.title, s.display_name, "
+                    "       s.started_at, s.row_id AS row_id "
+                    "FROM sessions_fts_cjk f "
+                    "JOIN sessions s ON s.row_id = f.rowid "
+                    "WHERE sessions_fts_cjk MATCH ? "
+                    "ORDER BY s.started_at DESC",
+                    (sanitized,),
+                )
+                candidates = [dict(row) for row in cursor]
+            except sqlite3.OperationalError:
+                # CJK lane unavailable/corrupt on this connection: signal
+                # fallback, never trust a partial result.
+                logging.debug(
+                    "sessions_fts_cjk MATCH failed for %r, falling back",
+                    raw_query, exc_info=True,
+                )
+                return False, None
+        return True, candidates
+
     def _fts_numbered_variants(
         self, title: str
     ) -> Optional[List[Dict[str, Any]]]:
@@ -6226,15 +6281,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         id / display_name and supplements the bounded ``(P, H]`` rebuild gap —
         title resolution therefore never returns incomplete results
         mid-backfill and the gap logic lives in exactly one place. CJK titles
-        keep their dedicated ``sessions_fts_cjk`` lane + gap supplement (the
-        CJK lifecycle is owned by #26).
+        delegate to the dedicated ``sessions_fts_cjk`` lane
+        (``_fts_cjk_metadata_candidates``), which owns the pending / stale /
+        unavailable / lone-char fallback decision; it never serves a partial
+        CJK index.
 
         Returns None to signal fallback to LIKE (e.g. FTS5 runtime error or
-        the target table unavailable). Returns empty list when no matches.
+        the target table unavailable / pending / stale). Returns empty list
+        when no matches.
         """
         is_cjk = self._contains_cjk(title)
-        if is_cjk and not getattr(self, "_sessions_cjk_available", False):
-            return None
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
         # An unsanitizable query must signal "use the LIKE fallback" (None),
@@ -6243,55 +6299,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
 
         if is_cjk:
-            fts_table = "sessions_fts_cjk"
-            sanitized = self._sanitize_fts5_query(title)
-            if not sanitized:
-                return None
-            with self._lock:
-                try:
-                    cursor = self._conn.execute(
-                        f"SELECT s.id AS id, s.title, s.started_at "
-                        f"FROM {fts_table} f "
-                        f"JOIN sessions s ON s.row_id = f.rowid "
-                        f"WHERE {fts_table} MATCH ? "
-                        f"ORDER BY s.started_at DESC",
-                        (sanitized,),
-                    )
-                    candidates = list(cursor)
-                except sqlite3.OperationalError:
-                    logging.debug(
-                        "%s MATCH failed for %r, falling back to LIKE",
-                        fts_table, sanitized, exc_info=True,
-                    )
-                    return None
-            filtered = [
+            servable, candidates = self._fts_cjk_metadata_candidates(title)
+            if not servable:
+                return None  # canonical LIKE fallback
+            return [
                 c for c in candidates
                 if c["title"] and c["title"].startswith(f"{escaped} #")
             ]
-            # Bounded-gap supplement (same rule as the Unicode lane, kept local
-            # for the CJK table which #26 will take over).
-            gap = self._session_fts_rebuild_gap()
-            if gap is not None:
-                progress, high_water = gap
-                with self._read_ctx() as conn:
-                    gap_rows = conn.execute(
-                        "SELECT id, title, started_at FROM sessions "
-                        "WHERE title LIKE ? ESCAPE '\\' "
-                        "AND row_id > ? AND row_id <= ? "
-                        "ORDER BY started_at DESC",
-                        (f"{escaped} #%", progress, high_water),
-                    ).fetchall()
-                gap_filtered = [
-                    c for c in gap_rows
-                    if c["title"] and c["title"].startswith(f"{escaped} #")
-                ]
-                by_id = {c["id"]: c for c in filtered}
-                for c in gap_filtered:
-                    by_id.setdefault(c["id"], c)
-                filtered = sorted(
-                    by_id.values(), key=lambda c: c["started_at"], reverse=True
-                )
-            return filtered
 
         # Non-CJK: the shared raw Unicode lane already merges the FTS
         # candidates with the bounded (P, H] gap, dedupes by row_id, and sorts
