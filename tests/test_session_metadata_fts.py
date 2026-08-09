@@ -951,12 +951,16 @@ class TestBoundedGapSearch:
         """The term extractor splits on EVERY non-token character — including
         '_', which Python's ``\\w`` wrongly treats as a word char — so the gap
         predicate stays a superset of the FTS predicate across the
-        sanitizer-quoted [._-] punctuation."""
+        sanitizer-quoted [._-] punctuation. Boolean operator WORDS are kept
+        as terms: a quoted '"AND"' is a literal FTS phrase, not an operator,
+        so stripping it would empty the gap terms and hide a matched row."""
         assert _fts_query_positive_terms("foo_bar") == ["foo", "bar"]
         assert _fts_query_positive_terms("foo-bar") == ["foo", "bar"]
         assert _fts_query_positive_terms("foo.bar") == ["foo", "bar"]
         assert _fts_query_positive_terms("Alpha Project") == ["alpha", "project"]
-        assert _fts_query_positive_terms("alpha OR beta") == ["alpha", "beta"]
+        assert _fts_query_positive_terms("alpha OR beta") == ["alpha", "or", "beta"]
+        assert _fts_query_positive_terms('"AND"') == ["and"]
+        assert _fts_query_positive_terms('"foo bar"') == ["foo", "bar"]
         assert _fts_query_positive_terms("École") == ["ecole"]
 
     @pytest.mark.parametrize("query", ["foo_bar", "foo-bar", "foo.bar"])
@@ -984,6 +988,29 @@ class TestBoundedGapSearch:
                 pass
             assert r.get_meta("fts_session_rebuild_high_water") is None
             assert "C" in _raw_metadata_match_ids(r, sanitized)
+        finally:
+            r.close()
+
+    def test_gap_supplement_quoted_boolean_literal_no_hide(self, tmp_path):
+        """A quoted boolean word ('"AND"') is a literal FTS phrase (the
+        sanitizer protects balanced quotes), NOT an operator — so the term
+        extractor must keep it as a term. An indexed 'AND' row is hit, a gap
+        row carrying the 'and' token must be surfaced too, and after backfill
+        it stays index-findable."""
+        r = _three_region_db(tmp_path)  # A(1)/B(3) indexed, C(7) in gap
+        try:
+            r.set_session_title("A", "AND")         # <= P, indexed
+            r.set_session_title("C", "AND beyond")  # (P,H], gap
+            # Indexed control: '"AND"' is a valid quoted-phrase query.
+            assert _raw_metadata_match_ids(r, '"AND"') == ["A"]
+            # Gap supplement must ALSO surface C (keeps 'and' as a term).
+            hits = _metadata_search_ids(r, '"AND"')
+            assert "A" in hits and "C" in hits
+            # After backfill completes, C is index-findable too.
+            while r.fts_session_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            assert "C" in _raw_metadata_match_ids(r, '"AND"')
         finally:
             r.close()
 

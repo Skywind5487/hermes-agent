@@ -189,14 +189,18 @@ def _fts_query_positive_terms(raw_query: str) -> List[str]:
     that kept the separator literal (``"foo_bar"``) would MISS a session the
     indexed lane finds. (CJK runs are deliberately left as whole terms here;
     per-codepoint CJK tokenization belongs to the #26 CJK lane.)
+
+    Boolean operator WORDS are deliberately kept as terms. A quoted
+    ``"AND"`` is a literal FTS phrase — the sanitizer protects balanced
+    quotes — so stripping ``AND|OR|NOT|NEAR`` would empty the terms for that
+    query and hide an indexed-matched row from the gap. Because the predicate
+    is ANY-term, keeping them can only add false positives, never a false
+    negative.
     """
-    # Drop FTS5 boolean operators, then map every non-token character —
-    # anything that is not a Unicode letter or digit, including '_' — to a
-    # space (mirrors unicode61's token-character set exactly).
-    cleaned = re.sub(
-        r"\b(?:AND|OR|NOT|NEAR)\b", " ", raw_query, flags=re.IGNORECASE
-    )
-    cleaned = "".join(ch if ch.isalnum() else " " for ch in cleaned)
+    # Map every non-token character — anything that is not a Unicode letter
+    # or digit, including '_' — to a space (mirrors unicode61's
+    # token-character set exactly).
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in raw_query)
     terms: List[str] = []
     for token in cleaned.split():
         folded = _fts_unicode61_fold(token.rstrip("*"))

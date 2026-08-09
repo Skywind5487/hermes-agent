@@ -95,7 +95,11 @@ lane would. Terms split on unicode61's token-character set (Unicode letters
 and digits only), so the sanitizer-quoted `[._-]` punctuation is a separator
 too: `foo_bar` / `foo-bar` / `foo.bar` all yield the terms (`foo`, `bar`)
 exactly as the index tokenizes a `foo bar` document — a term that kept `_` as
-a literal would MISS a session the FTS lane finds. Over-matching is accepted
+a literal would MISS a session the FTS lane finds. Boolean operator words
+(`and`/`or`/`not`/`near`) are deliberately kept as terms too: a quoted
+`"AND"` is a literal FTS phrase (the sanitizer protects balanced quotes), so
+stripping them would empty the terms for that query and hide a matched row —
+keeping them can only over-match, never miss. Over-matching is accepted
 (the backfilled index restores exact semantics); a MISS is not. The fold is deliberately a conservative Unicode
 approximation, NOT exact unicode61 parity (the real tokenizer folds per
 Unicode 6.1, strips Latin-script diacritics, and preserves single-codepoint
