@@ -19,12 +19,14 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
     FTS_CJK_STALE_KEY,
+    FTS_SESSION_CJK_STALE_KEY,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    _FTS_SESSION_CJK_TRIGGERS,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -74,6 +76,38 @@ _FTS_SESSION_SPEC = {
     "reset_tables": ("sessions_fts",),
     "available": lambda self: getattr(self, "_sessions_fts_available", False),
     "trigram_available": lambda self: False,
+}
+
+# Optional CJK session-metadata specialization (issue #26) of the SAME
+# generic rebuild engine: identical external-content raw (title, id,
+# display_name) document keyed by named row_id, its OWN H/P marker pair and
+# stale key (never the Unicode-session pair, never the message-CJK pair).
+#
+# The worker gate is ``_sessions_cjk_worker_operable`` (can this process
+# build/maintain the CJK index) — NOT ``_sessions_cjk_available`` (search
+# serving). The donor deadlock was one boolean doing both jobs: pending made
+# serving false, the same false blocked the worker, finish never ran, search
+# never became available. The #77629 invariant (optional capability gates
+# finish exactly as it gates step) is honored by routing both through this
+# same callback and by the availability gate in ``_fts_rebuild_finish``.
+# ``finish_hook`` flips search-serving on only after the boundary sweep
+# clears the CJK markers.
+_FTS_SESSION_CJK_SPEC = {
+    "name": "sessions_cjk",
+    "high_water_key": "fts_session_cjk_rebuild_high_water",
+    "progress_key": "fts_session_cjk_rebuild_progress",
+    "fts_table": "sessions_fts_cjk",
+    "fts_columns": ("title", "id", "display_name"),
+    "source_table": "sessions",
+    "source_columns": ("title", "id", "display_name"),
+    "row_key": "row_id",
+    "trigram_fts": None,
+    "trigram_columns": (),
+    "trigram_where": None,
+    "reset_tables": ("sessions_fts_cjk",),
+    "available": lambda self: getattr(self, "_sessions_cjk_worker_operable", False),
+    "trigram_available": lambda self: False,
+    "finish_hook": lambda self: setattr(self, "_sessions_cjk_available", True),
 }
 
 
@@ -652,6 +686,24 @@ class SessionSearchMixin:
             return 0
         return self._seed_fts_rebuild_markers(
             conn, _FTS_SESSION_SPEC, force=force
+        )
+
+    def _seed_session_cjk_fts_rebuild_markers(
+        self, conn, *, force: bool = False
+    ) -> int:
+        """Session CJK metadata variant of ``_seed_fts_rebuild_markers``
+        (issue #26).
+
+        An empty DB is complete by construction (the triggers cover every
+        future row) and must not carry a spurious claim that would make
+        ``fts_optimize_available`` advertise pending work forever. Gated on
+        tokenizer capability by the caller.
+        """
+        n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        if n == 0 and not force:
+            return 0
+        return self._seed_fts_rebuild_markers(
+            conn, _FTS_SESSION_CJK_SPEC, force=force
         )
 
     def _repair_missing_progress(self, conn, spec: Dict[str, Any]) -> None:
