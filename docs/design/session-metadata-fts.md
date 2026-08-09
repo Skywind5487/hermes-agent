@@ -64,6 +64,14 @@ Reuses the accepted message-FTS seam (upstream #76832):
   construction, and an `H=0/P=0` pair would never enter the rebuild (status
   total ≤ 0) yet would leave `optimize_fts_storage` permanently pending as
   `backfill_incomplete`;
+- after the new external table + gated triggers are ensured, a **transition
+  catch-up** runs in its own `BEGIN IMMEDIATE` (a `>H OR <=P` insert with a
+  docsize anti-join): a concurrent writer can commit a `>H` row in the window
+  between the stage transaction's COMMIT and the trigger install, and that
+  row is neither trigger-indexed nor in the `(P,H]` gap supplement — the
+  catch-up closes the window (idempotent; rows committing after it are
+  trigger-indexed). Applies to both the internal→external conversion and the
+  fresh-create-over-populated path;
 - `H` present / `P` missing never replays from zero over a maybe-partial index:
   either a proven boundary is recovered or the index is reset known-empty
   (`'delete-all'`) first;
@@ -91,9 +99,14 @@ decompose + drop combining marks + casefold) instead of SQLite's ASCII-only
 (`_fts_query_positive_terms` — multi-token implicit AND, `OR`, quoted phrases,
 prefix `*`), so `MATCH 'ecole'` finds `École` in the gap and `MATCH 'Alpha
 Project'` finds a gap row titled `Alpha middle Project` exactly as the indexed
-lane would. Terms split on unicode61's token-character set — Unicode letters,
-digits, and Private-Use codepoints (categories `L*`, `N*`, `Co`) — so the
-sanitizer-quoted `[._-]` punctuation is a separator
+lane would. Terms split on an ASCII-only separator boundary (unicode61 always
+treats ASCII non-alphanumerics — whitespace, punctuation, notably `_` — as
+separators); every non-ASCII character is kept inside terms, because Python's
+`unicodedata` cannot mirror SQLite's unicode61 (Unicode 6.1) — e.g. U+1018C
+is a token char in unicode61 but category `So` in Python, so excluding by
+category would risk a miss. Non-ASCII runs also emit each ASCII sub-run and
+each non-ASCII codepoint, so a query unicode61 tokenizes more finely cannot
+miss either. The sanitizer-quoted `[._-]` punctuation is a separator
 too: `foo_bar` / `foo-bar` / `foo.bar` all yield the terms (`foo`, `bar`)
 exactly as the index tokenizes a `foo bar` document — a term that kept `_` as
 a literal would MISS a session the FTS lane finds. Boolean operator words
@@ -139,11 +152,15 @@ lane instead of trusting a partial result.
   pending in offline recovery.
 - `tests/test_session_metadata_fts.py` — rowid-hole migration (incl. legacy
   duplicate-title upgrade), raw Unicode external-content, H/P ownership
-  regions, crash/restart, bounded-gap search (conservative Unicode-fold
-  supplement + its explicit non-parity edge, multi-token implicit-AND and OR
-  no-hide regressions, sanitizer-quoted `[._-]` punctuation no-hide
-  regression, cross-lane ordering), finish, delete probes that read the index
-  directly and a `rank=1` consistency check on completed indexes, two real
-  concurrent runners (thread + barrier), shared throttle, and a
-  legacy-message × old-session-FTS cross-layout upgrade path (one optimize
-  settles both) plus the empty-legacy-DB no-zombie-marker path.
+  regions, crash/restart (incl. the partial-index H-without-P orphan
+  reset/replay regression), the trigger-install window race (two-connection
+  catch-up regressions for both the internal→external and fresh-create paths),
+  bounded-gap search (conservative Unicode-fold supplement + its explicit
+  non-parity edge, multi-token implicit-AND and OR no-hide regressions,
+  sanitizer-quoted `[._-]` punctuation + quoted-boolean + PUA/U+1018C
+  no-hide regressions, cross-lane ordering), finish, delete probes that read
+  the index directly plus an ordinary internal integrity-check mid-migration
+  and a `rank=1` consistency check on completed indexes, two real concurrent
+  runners (thread + barrier), shared throttle, and a legacy-message ×
+  old-session-FTS cross-layout upgrade path (one optimize settles both) plus
+  the empty-legacy-DB no-zombie-marker path.

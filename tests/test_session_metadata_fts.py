@@ -470,6 +470,18 @@ def _assert_sessions_fts_integrity(db):
     )
 
 
+def _assert_sessions_fts_internal_integrity(db):
+    """Ordinary FTS5 internal integrity-check (shadow-table structure only).
+
+    Unlike ``_assert_sessions_fts_integrity`` (rank=1), this does NOT
+    cross-check against the content table, so it is safe mid-migration when
+    the ``(P, H]`` gap rows are legitimately unindexed.
+    """
+    db._conn.execute(
+        "INSERT INTO sessions_fts(sessions_fts) VALUES('integrity-check')"
+    )
+
+
 def _raw_metadata_match_ids(db, query):
     """Return session ids whose raw Unicode metadata document MATCHes query."""
     with db._read_ctx() as conn:
@@ -656,6 +668,56 @@ class TestRebuildMarkers:
         finally:
             r.close()
 
+    def test_partial_index_orphan_hp_resets_and_replays(self, tmp_path):
+        """#32: an orphan H-without-P over a PARTIALLY populated index must be
+        reset known-empty and replayed without duplicates — never serve the
+        partial index as complete. optimize must settle (doc count == sessions,
+        no duplicate rowid, rank=1 integrity, markers cleared) and reopen stays
+        settled."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=50)  # 50 sessions, no sessions_fts
+        r = SessionDB(db_path=db_path)  # stages H=50, P=0 over an empty index
+        try:
+            # Backfill a prefix by hand, then remove P to simulate an orphan
+            # high-water-without-progress (partial index of unknown extent).
+            r._conn.execute(
+                "INSERT INTO sessions_fts(rowid, title, id, display_name) "
+                "SELECT row_id, title, id, display_name FROM sessions "
+                "WHERE row_id <= 20"
+            )
+            r._conn.execute(
+                "DELETE FROM state_meta WHERE key = 'fts_session_rebuild_progress'"
+            )
+            r._conn.commit()
+            # optimize repairs (reset known-empty + P=0) then backfills fully.
+            result = r.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True, result
+            assert r.get_meta("fts_session_rebuild_high_water") is None
+            assert r.get_meta("fts_session_rebuild_progress") is None
+            n_sessions = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            n_docs = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions_fts_docsize"
+            ).fetchone()[0]
+            assert n_docs == n_sessions
+            dup = r._conn.execute(
+                "SELECT COUNT(*) FROM (SELECT rowid FROM sessions_fts_docsize "
+                "GROUP BY rowid HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+            assert dup == 0
+            _assert_sessions_fts_integrity(r)
+        finally:
+            r.close()
+
+        # Reopen remains settled.
+        r2 = SessionDB(db_path=db_path)
+        try:
+            assert r2.get_meta("fts_session_rebuild_high_water") is None
+            assert r2.fts_optimize_available() is False
+        finally:
+            r2.close()
+
 
 # =========================================================================
 # Group D — trigger ownership regions (<=P, (P,H], >H) + deletes + integrity
@@ -677,6 +739,8 @@ class TestTriggerOwnershipRegions:
             # only after the backfill completes.)
             assert _raw_fts_rowids(r, "alpha") == []
             assert _raw_metadata_match_ids(r, "alpha") == []
+            # Ordinary internal integrity-check (safe mid-migration).
+            _assert_sessions_fts_internal_integrity(r)
         finally:
             r.close()
 
@@ -694,6 +758,8 @@ class TestTriggerOwnershipRegions:
             # posting); the canonical row is simply absent.
             assert _raw_fts_rowids(r, "gamma") == []
             assert r.get_session("C") is None
+            # Ordinary internal integrity-check (safe mid-migration).
+            _assert_sessions_fts_internal_integrity(r)
         finally:
             r.close()
 
@@ -709,6 +775,8 @@ class TestTriggerOwnershipRegions:
             # Direct index probe: the live document is gone, not hidden by a
             # canonical-row JOIN.
             assert _raw_fts_rowids(r, "echo") == []
+            # Ordinary internal integrity-check (safe mid-migration).
+            _assert_sessions_fts_internal_integrity(r)
         finally:
             r.close()
 
@@ -740,6 +808,8 @@ class TestTriggerOwnershipRegions:
             # carries no stale entry for the old title either.
             assert _raw_fts_rowids(r, "gamma") == []
             assert _raw_fts_rowids(r, "newtitle") == []
+            # Ordinary internal integrity-check (safe mid-migration).
+            _assert_sessions_fts_internal_integrity(r)
         finally:
             r.close()
 
@@ -751,6 +821,103 @@ class TestTriggerOwnershipRegions:
             r.create_session("E", source="cli")  # row_id > H
             r.set_session_title("E", "Fresh Live Title")
             assert _raw_metadata_match_ids(r, "fresh") == ["E"]
+        finally:
+            r.close()
+
+    def test_window_insert_between_teardown_and_trigger_install_is_caught_up(
+        self, tmp_path, monkeypatch
+    ):
+        """A session committed by ANOTHER connection in the window between the
+        H capture / old-table teardown and the install of the new gated
+        triggers (the stage transaction commits before the external schema is
+        ensured) is neither trigger-indexed nor in the (P,H] gap supplement —
+        the transition catch-up must index it, or it stays invisible until a
+        full rebuild."""
+        db_path = tmp_path / "legacy.db"
+        _build_legacy_message_and_session_fts_db(db_path)  # A(1) B(3) C(7) A-child(8)
+        real_ensure = SessionDB._ensure_fts_schema
+
+        def _ensure_with_window_insert(self, cursor, table_name, ddl):
+            if table_name == "sessions_fts":
+                # Simulate the other-process write in the trigger-free window:
+                # the stage transaction already committed H; insert a row above
+                # it via a second raw connection (no sessions_fts trigger
+                # exists yet, so the row is not indexed).
+                with sqlite3.connect(str(db_path)) as conn:
+                    hw = conn.execute(
+                        "SELECT CAST(value AS INTEGER) FROM state_meta "
+                        "WHERE key = 'fts_session_rebuild_high_water'"
+                    ).fetchone()
+                    hw = int(hw[0]) if hw else 0
+                    conn.execute(
+                        "INSERT INTO sessions (id, source, started_at) "
+                        "VALUES ('W', 'cli', ?)",
+                        (time.time(),),
+                    )
+                    conn.commit()
+            return real_ensure(self, cursor, table_name, ddl)
+
+        monkeypatch.setattr(
+            SessionDB, "_ensure_fts_schema", _ensure_with_window_insert
+        )
+        r = SessionDB(db_path=db_path)
+        try:
+            # The window row (row_id > H) must be searchable immediately —
+            # the transition catch-up indexed it.
+            assert _raw_metadata_match_ids(r, "W") == ["W"]
+            # optimize settles with every session covered (no invisible row).
+            result = r.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True, result
+            n_sessions = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            n_docs = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions_fts_docsize"
+            ).fetchone()[0]
+            assert n_docs == n_sessions
+        finally:
+            r.close()
+
+    def test_fresh_create_window_insert_is_caught_up(self, tmp_path, monkeypatch):
+        """Same transition window on the fresh-create-over-populated path (no
+        pre-existing internal sessions_fts): a >H row committed by another
+        connection between the H/P seed and the trigger install must be caught
+        up, not left invisible."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=50)  # no sessions_fts yet
+        real_ensure = SessionDB._ensure_fts_schema
+
+        def _ensure_with_window_insert(self, cursor, table_name, ddl):
+            if table_name == "sessions_fts":
+                with sqlite3.connect(str(db_path)) as conn:
+                    hw = conn.execute(
+                        "SELECT CAST(value AS INTEGER) FROM state_meta "
+                        "WHERE key = 'fts_session_rebuild_high_water'"
+                    ).fetchone()
+                    hw = int(hw[0]) if hw else 0
+                    conn.execute(
+                        "INSERT INTO sessions (id, source, started_at) "
+                        "VALUES ('W', 'cli', ?)",
+                        (time.time(),),
+                    )
+                    conn.commit()
+            return real_ensure(self, cursor, table_name, ddl)
+
+        monkeypatch.setattr(
+            SessionDB, "_ensure_fts_schema", _ensure_with_window_insert
+        )
+        r = SessionDB(db_path=db_path)
+        try:
+            assert _raw_metadata_match_ids(r, "W") == ["W"]
+            result = r.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True, result
+            n_sessions = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            n_docs = r._conn.execute(
+                "SELECT COUNT(*) FROM sessions_fts_docsize"
+            ).fetchone()[0]
+            assert n_docs == n_sessions
         finally:
             r.close()
 
@@ -881,9 +1048,12 @@ class TestBoundedGapSearch:
             r.set_session_title("C", "École des Beaux-Arts")  # row 7 in gap
             # FTS lane alone finds nothing: C is in the gap, not indexed.
             assert _raw_metadata_match_ids(r, "ecole") == []
-            # The Unicode-aware supplement finds it for both spellings.
+            # The Unicode-aware supplement finds it for both spellings. The
+            # non-ASCII spelling ('école') also over-matches other gap rows
+            # (per-codepoint emission is a superset by design) — what matters
+            # is C is never hidden.
             assert _metadata_search_ids(r, "ecole") == ["C"]
-            assert _metadata_search_ids(r, "école") == ["C"]
+            assert "C" in _metadata_search_ids(r, "école")
         finally:
             r.close()
 
@@ -948,12 +1118,14 @@ class TestBoundedGapSearch:
             r.close()
 
     def test_positive_term_extractor_splits_punctuation(self):
-        """The term extractor splits on EVERY non-token character — including
-        '_', which Python's ``\\w`` wrongly treats as a word char — so the gap
-        predicate stays a superset of the FTS predicate across the
-        sanitizer-quoted [._-] punctuation. Boolean operator WORDS are kept
-        as terms: a quoted '"AND"' is a literal FTS phrase, not an operator,
-        so stripping it would empty the gap terms and hide a matched row."""
+        """The term extractor splits on ASCII non-alphanumerics only — Python
+        '\\w' wrongly keeps '_', and Python's Unicode categories can't mirror
+        unicode61 (Unicode 6.1). Non-ASCII characters are always kept inside
+        terms (never excluded), so the gap predicate stays a superset of the
+        FTS predicate across sanitizer-quoted [._-] punctuation, quoted
+        boolean literals, PUA, and unicode61-vs-Python category drift.
+        Boolean operator WORDS are kept as terms: a quoted '"AND"' is a
+        literal FTS phrase, not an operator."""
         assert _fts_query_positive_terms("foo_bar") == ["foo", "bar"]
         assert _fts_query_positive_terms("foo-bar") == ["foo", "bar"]
         assert _fts_query_positive_terms("foo.bar") == ["foo", "bar"]
@@ -961,10 +1133,15 @@ class TestBoundedGapSearch:
         assert _fts_query_positive_terms("alpha OR beta") == ["alpha", "or", "beta"]
         assert _fts_query_positive_terms('"AND"') == ["and"]
         assert _fts_query_positive_terms('"foo bar"') == ["foo", "bar"]
-        assert _fts_query_positive_terms("École") == ["ecole"]
-        # Private-Use codepoints (unicode61 category Co) are token chars too.
+        # ASCII-only boundary is unchanged; non-ASCII is kept + per-codepoint.
+        assert _fts_query_positive_terms("École") == ["ecole", "cole", "e"]
+        # PUA (Co) and a unicode61-token-char-that-Python-calls-So (U+1018C)
+        # are kept as terms (the merged run + the codepoint).
         assert _fts_query_positive_terms("\ue000") == ["\ue000"]
-        assert _fts_query_positive_terms("a\ue000b") == ["a\ue000b"]
+        assert _fts_query_positive_terms("a\ue000b") == [
+            "a\ue000b", "a", "b", "\ue000",
+        ]
+        assert _fts_query_positive_terms("\U0001018C") == ["\U0001018C"]
 
     @pytest.mark.parametrize("query", ["foo_bar", "foo-bar", "foo.bar"])
     def test_gap_supplement_punctuation_query_no_hide(self, tmp_path, query):

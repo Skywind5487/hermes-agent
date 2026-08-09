@@ -166,17 +166,6 @@ def _fts_unicode61_fold(text: Optional[str]) -> str:
     return stripped.casefold()
 
 
-def _is_unicode61_token_char(ch: str) -> bool:
-    """True when unicode61 treats *ch* as a token character.
-
-    unicode61's default token categories are L* (letters), N* (numbers) and
-    Co (Private Use). ``str.isalnum()`` covers L*/N* but MISSES Co, so it is
-    not a faithful boundary: a PUA codepoint such as U+E000 is indexable and
-    MATCH-able, yet isalnum() would drop it and cause a gap miss.
-    """
-    return ch.isalnum() or unicodedata.category(ch) == "Co"
-
-
 def _fts_query_positive_terms(raw_query: str) -> List[str]:
     """Conservative lexical terms for the #25 gap supplement's FTS-superset test.
 
@@ -189,19 +178,23 @@ def _fts_query_positive_terms(raw_query: str) -> List[str]:
     not: a session that MATCHes once backfilled must never be hidden while
     it sits in the ``(P, H]`` gap.
 
-    Tokenization follows unicode61's token-character set, splitting MORE
-    aggressively rather than less: unicode61's token characters are Unicode
-    letters, digits, and Private-Use codepoints (categories L*, N*, Co — see
-    ``_is_unicode61_token_char``), and EVERYTHING else — whitespace,
-    punctuation, and notably ``_`` (which Python's ``\\w`` wrongly keeps) —
-    is a separator.
-    The query sanitizer quotes ``[._-]`` terms as FTS phrases, but the index
-    still tokenizes them the same way (``"foo_bar"`` → phrase ``foo bar``
-    against a ``foo bar`` document), so the gap must too: ``foo_bar`` /
-    ``foo-bar`` / ``foo.bar`` all yield the terms (``foo``, ``bar``). A term
-    that kept the separator literal (``"foo_bar"``) would MISS a session the
-    indexed lane finds. (CJK runs are deliberately left as whole terms here;
-    per-codepoint CJK tokenization belongs to the #26 CJK lane.)
+    Tokenization deliberately does NOT mirror unicode61 exactly: SQLite's
+    unicode61 classifies characters per Unicode 6.1, while Python's
+    ``unicodedata`` reflects a different (newer) Unicode database — so
+    classifying non-ASCII by category here would risk a gap miss (e.g.
+    U+1018C is a token character in unicode61 but category ``So`` in Python).
+    The safe boundary is ASCII-only: unicode61 always treats ASCII
+    non-alphanumerics (whitespace, punctuation, and notably ``_``, which
+    Python's ``\\w`` wrongly keeps) as separators, and every non-ASCII
+    character is kept inside terms. The query sanitizer quotes ``[._-]``
+    terms as FTS phrases, but the index still tokenizes them the same way
+    (``"foo_bar"`` → phrase ``foo bar`` against a ``foo bar`` document), so
+    the gap must too: ``foo_bar`` / ``foo-bar`` / ``foo.bar`` all yield the
+    terms (``foo``, ``bar``). For a run containing non-ASCII, each ASCII
+    sub-run and each non-ASCII codepoint is additionally emitted, so a query
+    that unicode61 tokenizes more finely (a non-ASCII separator, CJK
+    per-codepoint) can never miss either. This can only over-match, never
+    miss.
 
     Boolean operator WORDS are deliberately kept as terms. A quoted
     ``"AND"`` is a literal FTS phrase — the sanitizer protects balanced
@@ -210,18 +203,34 @@ def _fts_query_positive_terms(raw_query: str) -> List[str]:
     is ANY-term, keeping them can only add false positives, never a false
     negative.
     """
-    # Map every non-token character — anything that is not a unicode61 token
-    # character (letters, digits, Private-Use; see _is_unicode61_token_char),
-    # including '_' — to a space (mirrors unicode61's token-character set
-    # exactly).
+    # Safe separator boundary across Unicode versions: ASCII non-alphanumeric.
+    # Every non-ASCII character is kept — never excluded by Python's Unicode
+    # categories (SQLite's unicode61 uses Unicode 6.1, which differs).
     cleaned = "".join(
-        ch if _is_unicode61_token_char(ch) else " " for ch in raw_query
+        " " if (ch.isascii() and not ch.isalnum()) else ch for ch in raw_query
     )
     terms: List[str] = []
+    seen: set = set()
     for token in cleaned.split():
         folded = _fts_unicode61_fold(token.rstrip("*"))
-        if folded:
+        if folded and folded not in seen:
+            seen.add(folded)
             terms.append(folded)
+        if any(ord(ch) >= 0x80 for ch in token):
+            # unicode61 may tokenize this run more finely (per-codepoint CJK,
+            # a non-ASCII separator, ...): emit the ASCII sub-runs and each
+            # non-ASCII codepoint so a finer tokenization can never miss.
+            for piece in re.split(r"[^\x00-\x7F]+", token):
+                f = _fts_unicode61_fold(piece)
+                if f and f not in seen:
+                    seen.add(f)
+                    terms.append(f)
+            for ch in token:
+                if ord(ch) >= 0x80:
+                    f = _fts_unicode61_fold(ch)
+                    if f and f not in seen:
+                        seen.add(f)
+                        terms.append(f)
     return terms
 
 
@@ -2588,7 +2597,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not ok:
             self._sessions_fts_available = False
             return False
+        # ── Transition catch-up (#25) ──────────────────────────────
+        # The durable H capture + old-table teardown commit in one write
+        # transaction, but the new external table + gated triggers are ensured
+        # afterwards (executescript issues its own COMMIT). A concurrent
+        # writer can therefore commit a session with row_id > H in the window
+        # where NO trigger exists yet — it is neither trigger-indexed nor in
+        # the (P,H] gap supplement, so it would be invisible until a full
+        # rebuild. Catch it up in a fresh BEGIN IMMEDIATE now that the
+        # triggers exist: the NOT EXISTS docsize anti-join makes it
+        # idempotent, and any row committing after this transaction is
+        # trigger-indexed. Covers both the internal→external conversion and
+        # the fresh-create-over-populated path (existing == False either way).
+        if not existing:
+            self._fts_session_transition_catchup(cursor)
         return True
+
+    def _fts_session_transition_catchup(self, cursor) -> None:
+        """Backfill rows that slipped into the trigger-owned region while the
+        #25 external schema was being created (see ``_ensure_sessions_fts_schema``).
+
+        Rows in the trigger's ownership (``row_id > H OR row_id <= P``) that
+        are not yet in the index are inserted directly; the docsize anti-join
+        dedupes any already-indexed row. Runs in its own write transaction
+        AFTER the triggers exist, so the window is closed: anything committing
+        after this transaction is indexed by the live trigger. A DB with no
+        markers (empty / complete index) has nothing to catch up, so no write
+        is issued. The write is schema-init bookkeeping and must NOT advance
+        the routine-write merge cadence, so ``_write_count`` is restored.
+        """
+        def _do(conn):
+            hw_row = conn.execute(
+                "SELECT CAST(value AS INTEGER) FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water'"
+            ).fetchone()
+            if hw_row is None:
+                return
+            hw = int(hw_row[0])
+            p_row = conn.execute(
+                "SELECT CAST(value AS INTEGER) FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_progress'"
+            ).fetchone()
+            progress = int(p_row[0]) if p_row is not None else 0
+            conn.execute(
+                "INSERT INTO sessions_fts(rowid, title, id, display_name) "
+                "SELECT s.row_id, s.title, s.id, s.display_name "
+                "FROM sessions s "
+                "WHERE (s.row_id > ? OR s.row_id <= ?) "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM sessions_fts_docsize d WHERE d.id = s.row_id"
+                "  )",
+                (hw, progress),
+            )
+        before = self._write_count
+        try:
+            self._execute_write(_do)
+        finally:
+            self._write_count = before
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
@@ -5800,8 +5865,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Conservative FTS-superset terms for the gap supplement: the gap
         # cannot parse FTS5's query syntax, so it matches ANY positive term
         # in ANY field (over-match is accepted; a miss is not — a session
-        # the indexed lane matches must never hide while in (P, H]).
-        terms = _fts_query_positive_terms(raw_query)
+        # the indexed lane matches must never hide while in (P, H]). Terms
+        # derive from the SANITIZED query (capped at MAX_FTS5_QUERY_CHARS, the
+        # same string the FTS lane MATCHes) so both lanes process the same
+        # bounded input and a huge query cannot blow up gap-row × terms.
+        terms = _fts_query_positive_terms(sanitized)
         fts_ok = True
         by_row_id: Dict[int, Dict[str, Any]] = {}
 
