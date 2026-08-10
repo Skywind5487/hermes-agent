@@ -297,3 +297,26 @@ TABLE → not demoted, no H/P, table survives) — both RED before this fix (the
 legacy one failed with `no such table: sessions_fts_trigram_src` as the
 demotion dragged the source into trash), GREEN after.
 
+### Round-8 fix — root classifier sees the table/view namespace (P2, 2026-08-10)
+
+Round-8 review (P2): the root classifier's lookup only matched
+`type = 'table'`, so a same-name VIEW (`CREATE VIEW sessions_fts_trigram AS
+SELECT 1 AS x`) was misclassified `absent` — violating #34's "unknown
+same-name object → untouched, capability off". Worse, on the open path that
+made `CREATE VIRTUAL TABLE IF NOT EXISTS` silently no-op over the VIEW, seed
+H/P, enter the schema transition, and run a catch-up INSERT against a
+non-updatable VIEW → `cannot modify sessions_fts_trigram because it is a
+view` (open error). The regression reproduced exactly that on the buggy code.
+
+`_classify_sessions_fts_trigram` now looks up the root in the shared
+table/view namespace first (`type IN ('table', 'view')`):
+- no table or view → `absent`;
+- VIEW → `unknown_same_name` (fail closed — the ensure path never seeds H/P
+  or runs a transition against it);
+- TABLE → the existing exact FTS5 DDL identity checks.
+
+Pinned by `test_classifier_root_same_name_view_unknown` (same-name root VIEW
+→ `unknown_same_name`, no H/P seed, the VIEW preserved, and `SessionDB`
+open must not raise — RED with the exact `cannot modify ... because it is a
+view` error before the fix, GREEN after).
+

@@ -429,6 +429,27 @@ def _build_legacy_simple_with_source_table_db(db_path):
     conn.close()
 
 
+def _build_same_name_root_view_db(db_path):
+    """DB whose ``sessions_fts_trigram`` NAME is occupied by a plain VIEW
+    (not an FTS5 vtable). #34: an unknown same-name object must classify
+    ``unknown_same_name`` — NEVER ``absent``, which would let the ensure path
+    ``CREATE VIRTUAL TABLE IF NOT EXISTS`` silently no-op over the VIEW, seed
+    H/P, and run a catch-up INSERT against a non-updatable VIEW (open
+    error)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute("CREATE VIEW sessions_fts_trigram AS SELECT 1 AS x")
+    conn.commit()
+    conn.close()
+
+
 def _seed_an94_row(db):
     """Insert the canonical #30 sample metadata row (live, > H on a fresh
     DB with no markers) so search fixtures share one shape."""
@@ -698,6 +719,34 @@ class TestSchemaClassifier:
             ).fetchone()
             assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "table"
             assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+    def test_classifier_root_same_name_view_unknown(self, tmp_path):
+        """A same-name VIEW occupying the root name must classify
+        ``unknown_same_name`` — NEVER ``absent``. Classifying it ``absent``
+        would let the ensure path ``CREATE VIRTUAL TABLE IF NOT EXISTS``
+        silently no-op over the VIEW, seed H/P, and run a catch-up INSERT
+        against a non-updatable VIEW → open error. The open path must fail
+        closed: no H/P seed, no schema transition, the VIEW preserved, and
+        open must not raise."""
+        db_path = tmp_path / "root_view.db"
+        _build_same_name_root_view_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)  # must not raise
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            # No durable trigram claim was staged.
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+            # The same-name VIEW survives untouched (no modern FTS table).
+            obj = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'sessions_fts_trigram'"
+            ).fetchone()
+            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "view"
         finally:
             r.close()
 

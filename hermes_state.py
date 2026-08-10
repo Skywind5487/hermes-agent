@@ -2851,7 +2851,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns one of:
 
-        - ``"absent"`` — no such object (fresh install / never created).
+        - ``"absent"`` — no table OR view occupies the root name (fresh
+          install / never created).
         - ``"legacy_simple"`` — the recognized historical Hermes shape
           (FTS5 ``tokenize='simple'``, INTERNAL content, and EXACTLY the
           title-only logical column set). This is the fork's pre-#30
@@ -2865,20 +2866,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           tokenizer capability is separate from schema identity: a host
           without built-in trigram may still carry a modern schema —
           unavailable there, not legacy.
-        - ``"unknown_same_name"`` — an unrecognized same-name object (any
-          near-match that differs in column shape, VIEW projection, or is not
-          an FTS5 vtable at all). Fail closed / diagnostic; never blindly
-          delete or demote it.
+        - ``"unknown_same_name"`` — an unrecognized same-name object: a VIEW
+          occupying the root name (classifying it ``absent`` would let
+          ``CREATE VIRTUAL TABLE IF NOT EXISTS`` no-op and seed H/P against
+          nothing), a non-FTS5 table, or any near-match that differs in
+          column shape / VIEW projection. Fail closed / diagnostic; never
+          blindly delete or demote it.
 
         ``cursor`` may be a Cursor or a Connection.
         """
         row = cursor.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'sessions_fts_trigram'"
+            "SELECT type, sql FROM sqlite_master "
+            "WHERE name = 'sessions_fts_trigram' AND type IN ('table', 'view')"
         ).fetchone()
         if row is None:
             return "absent"
-        sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+        obj_type = row["type"] if isinstance(row, sqlite3.Row) else row[0]
+        if obj_type != "table":
+            # A same-name VIEW occupies the root name — never a recognized
+            # Hermes shape. Classifying it ``absent`` would let the ensure
+            # path ``CREATE VIRTUAL TABLE IF NOT EXISTS`` silently no-op over
+            # the VIEW and then seed H/P + run a catch-up INSERT against a
+            # non-updatable VIEW (open error). #34: unknown same-name object
+            # → untouched, capability off.
+            return "unknown_same_name"
+        sql = (row[1] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
         # FTS5 itself is part of #34's identity: the same-name object must be
         # a ``CREATE VIRTUAL TABLE ... USING fts5`` declaration.
         if "CREATE VIRTUAL TABLE" not in sql or "USING fts5" not in sql:
