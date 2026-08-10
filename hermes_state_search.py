@@ -34,6 +34,104 @@ from hermes_state_common import (
 logger = logging.getLogger("hermes_state")
 
 
+# ── Compression-lineage resolver (#68) ────────────────────────────────────
+#
+# One logical session-search query resolves each ranked owner candidate to
+# its positive compression-continuation root with a query-local
+# memo/path-compression pass.  Generic parentage is NOT lineage: only a
+# child whose parent exists, whose parent ended by ``'compression'``, that is
+# not a ``tool`` session, and whose branch/delegate markers do not explicitly
+# point at that parent forms a compression edge.  Foreign markers pointing
+# elsewhere do not disqualify the edge.
+#
+# Safety is orthogonal to lineage identity: a traversal-local seen-set proves
+# cycles, and a global per-query work budget bounds indexed row fetches.  A
+# budget-exhausted partial path is operational uncertainty, never semantic
+# evidence, so it is not memoized as unresolved.
+_LINEAGE_WORK_BUDGET = 2000
+_UNRESOLVED = object()
+_BUDGET_EXHAUSTED = object()
+
+_LINEAGE_NODE_SQL = """
+SELECT
+    child.id,
+    child.parent_session_id,
+    child.source,
+    child.model_config,
+    parent.id AS parent_exists,
+    parent.end_reason AS parent_end_reason
+FROM sessions child
+LEFT JOIN sessions parent ON parent.id = child.parent_session_id
+WHERE child.id = ?
+"""
+
+
+def _lineage_markers(
+    model_config: Any,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Return ``(config_valid, branched_from, delegate_from)`` for a session.
+
+    Malformed / non-object ``model_config`` is treated as "no proven positive
+    edge" (the conservative direction): the current node becomes its own root
+    rather than traversing an unproven parent.
+    """
+    if model_config in (None, ""):
+        return True, None, None
+    value = model_config
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return False, None, None
+    if not isinstance(value, dict):
+        return False, None, None
+    markers: List[Optional[str]] = []
+    for key in ("_branched_from", "_delegate_from"):
+        marker = value.get(key)
+        if marker is None:
+            markers.append(None)
+        elif isinstance(marker, str) and marker:
+            markers.append(marker)
+        else:
+            return False, None, None
+    return True, markers[0], markers[1]
+
+
+class _LineageResolutionState:
+    """Per-logical-query resolver state for one winner search.
+
+    ``work`` counts exactly one successful uncached lineage-node row fetch;
+    memo hits, absent-row fetches, and local cycle checks consume nothing.
+    ``memo`` maps a lineage node to a resolved root string or ``_UNRESOLVED``.
+    A budget-exhausted partial path is never written to the memo.
+    """
+
+    __slots__ = (
+        "budget",
+        "work",
+        "memo",
+        "memo_hits",
+        "bound_hit",
+        "candidates_inspected",
+        "accepted_roots",
+    )
+
+    def __init__(self, budget: int = _LINEAGE_WORK_BUDGET) -> None:
+        self.budget = max(1, int(budget))
+        self.work = 0
+        self.memo: Dict[str, Any] = {}
+        self.memo_hits = 0
+        self.bound_hit = False
+        self.candidates_inspected = 0
+        self.accepted_roots = 0
+
+    def _memoize_unresolved(self, path: List[str], node: str) -> None:
+        """Mark *path* plus *node* as proven unresolved (zero later lookups)."""
+        for visited in path:
+            self.memo.setdefault(visited, _UNRESOLVED)
+        self.memo.setdefault(node, _UNRESOLVED)
+
+
 # Deferred-rebuild specs shared by the message and session metadata FTS
 # engines. Each spec describes one external-content index family so the
 # crash-safe claim / chunk / finish rules (accepted through #76832 for
@@ -1718,6 +1816,148 @@ class SessionSearchMixin:
                 return None
             return [dict(row) for row in tri_cursor.fetchall()]
 
+    def _resolve_compression_lineage_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: _LineageResolutionState,
+    ) -> Any:
+        """Resolve *session_id* to its compression root on *conn*.
+
+        Returns the resolved root string, ``_UNRESOLVED`` for a proven
+        semantic unresolved outcome (missing row / dangling parent / positive
+        cycle), or ``_BUDGET_EXHAUSTED`` when the global work budget would be
+        exceeded by the next uncached lookup.
+
+        The loop ordering is correctness-significant at the B boundary:
+        memo lookup first, then traversal-local cycle proof, then the budget
+        check (only because another uncached lookup is now required), then the
+        one-node point lookup.
+        """
+        if not session_id:
+            return _UNRESOLVED
+        node = str(session_id)
+        path: List[str] = []
+        seen: set[str] = set()
+
+        while True:
+            cached = state.memo.get(node)
+            if cached is _UNRESOLVED:
+                state.memo_hits += 1
+                for visited in path:
+                    state.memo.setdefault(visited, _UNRESOLVED)
+                return _UNRESOLVED
+            if cached is not None:
+                # Memo hit: path-compress the visited prefix to the known root.
+                state.memo_hits += 1
+                for visited in path:
+                    state.memo.setdefault(visited, cached)
+                return cached
+
+            if node in seen:
+                # Positive cycle proven from the traversal-local seen-set
+                # with no further DB lookup (valid even at work == B).
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+            seen.add(node)
+
+            if state.work >= state.budget:
+                # Another uncached lookup is required and the budget is gone.
+                # This is operational uncertainty, NOT semantic unresolved, so
+                # the partial path is left out of the memo.
+                state.bound_hit = True
+                return _BUDGET_EXHAUSTED
+
+            row = conn.execute(_LINEAGE_NODE_SQL, (node,)).fetchone()
+            if row is None:
+                # The node row itself is missing: zero successful-fetch work
+                # for that absent row; the traversed path is semantically
+                # unresolved.
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+            state.work += 1
+
+            current = str(row["id"])
+            path.append(current)
+            parent_id = row["parent_session_id"]
+            if parent_id is None:
+                root = current
+                break
+            parent_id = str(parent_id)
+
+            if row["parent_exists"] is None:
+                # Dangling parent: malformed lineage, fail closed.
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+
+            config_valid, branched_from, delegate_from = _lineage_markers(
+                row["model_config"]
+            )
+            positive_edge = (
+                config_valid
+                and row["parent_end_reason"] == "compression"
+                and row["source"] != "tool"
+                and branched_from != parent_id
+                and delegate_from != parent_id
+            )
+            if not positive_edge:
+                root = current
+                break
+
+            node = parent_id
+
+        for visited in path:
+            state.memo.setdefault(visited, root)
+        return root
+
+    def resolve_compression_lineage(
+        self,
+        session_id: str,
+        *,
+        work_budget: int = _LINEAGE_WORK_BUDGET,
+    ) -> Optional[str]:
+        """Resolve *session_id* to its positive compression-continuation root.
+
+        Returns the root id, or ``None`` when the outcome is a proven semantic
+        unresolved (missing row / dangling parent / positive cycle) or the work
+        budget is exhausted.  Never falls back to generic parent ancestry; an
+        unresolved session is kept separate instead of broadening exclusion to
+        an unproven ancestor.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            started_tx = not conn.in_transaction
+            if started_tx:
+                conn.execute("BEGIN")
+            try:
+                state = _LineageResolutionState(work_budget)
+                outcome = self._resolve_compression_lineage_on_conn(
+                    conn, str(session_id), state
+                )
+            finally:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+        if outcome is _UNRESOLVED or outcome is _BUDGET_EXHAUSTED:
+            return None
+        return outcome
+
+    def get_first_message_id(self, session_id: str) -> Optional[int]:
+        """Return the first active message id for *session_id*, or None.
+
+        Lightweight bounded anchor lookup used by session-search title
+        discovery; avoids loading the whole transcript just to find one id.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                "ORDER BY id LIMIT 1",
+                (str(session_id),),
+            ).fetchone()
+        return row["id"] if row is not None else None
+
     def search_session_winners(
         self,
         query: str,
@@ -1732,20 +1972,36 @@ class SessionSearchMixin:
         current_lineage_root: Optional[str] = None,
         lineage_depth_cap: int = 64,
         request_id: str = None,
+        current_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Select discovery winners in SQLite without candidate hydration.
 
-        The candidate scan deliberately remains wider than the requested result
-        limit. SQLite first ranks up to ``candidate_limit`` lightweight FTS/LIKE
-        rows, resolves their parent chains with a recursive CTE, keeps one hit
-        per lineage, and only then applies ``result_limit``. The returned rows
-        contain no full message content and no candidate context.
+        The candidate scan deliberately remains wider than the requested
+        result limit.  SQLite first ranks up to ``candidate_limit``
+        lightweight FTS/LIKE rows and projects one ranked owner candidate per
+        distinct owning session (preserving the best-ranked message anchor).
+        A query-local Python resolver then walks each owner to its positive
+        compression-continuation root under one coherent logical read
+        snapshot, dedupes by root, and stops as soon as ``result_limit``
+        distinct roots survive (early-K).  The returned rows contain no full
+        message content and no candidate context; FTS snippets are computed
+        only for the final winners.
+
+        ``lineage_depth_cap`` is retained only for caller compatibility; #68
+        replaced depth as an identity/safety boundary with a traversal-local
+        cycle seen-set plus a global successful-row work budget.
         """
+        del lineage_depth_cap
         empty = {"winners": [], "stats": {
             "candidate_count": 0,
             "candidate_unique_sessions": 0,
             "lineage_count": 0,
             "winner_count": 0,
+            "lineage_work": 0,
+            "lineage_memo_hits": 0,
+            "lineage_memo_entries": 0,
+            "lineage_candidates_inspected": 0,
+            "lineage_bound_hit": False,
             "route": "none",
         }}
         if not self._fts_enabled or not query or not query.strip():
@@ -1756,7 +2012,6 @@ class SessionSearchMixin:
             return empty
         candidate_limit = max(1, min(int(candidate_limit), 1000))
         result_limit = max(0, min(int(result_limit), 100))
-        lineage_depth_cap = max(1, min(int(lineage_depth_cap), 256))
         role_filter = list(role_filter or ("user", "assistant"))
         exclude_sources = list(exclude_sources or ())
         source_filter = list(source_filter or ())
@@ -1891,7 +2146,9 @@ class SessionSearchMixin:
                     s.model,
                     s.started_at AS session_started,
                     0.0 AS fts_rank,
-                    {source_priority} AS source_priority
+                    {source_priority} AS source_priority,
+                    s.end_reason AS session_end_reason,
+                    m.compacted AS message_compacted
                 FROM messages m
                 JOIN sessions s ON s.id = m.session_id
                 WHERE {candidate_where}
@@ -1908,7 +2165,9 @@ class SessionSearchMixin:
                     s.model,
                     s.started_at AS session_started,
                     rank AS fts_rank,
-                    {source_priority} AS source_priority
+                    {source_priority} AS source_priority,
+                    s.end_reason AS session_end_reason,
+                    m.compacted AS message_compacted
                 FROM {candidate_from}
                 JOIN messages m ON m.id = {candidate_from}.rowid
                 JOIN sessions s ON s.id = m.session_id
@@ -1939,34 +2198,10 @@ class SessionSearchMixin:
                 ranked_candidates = ""
                 candidate_base = fts_candidate
 
-        exclusion_parts = []
-        exclusion_params: list = []
-        if excluded_lineage_roots:
-            exclusion_parts.append(
-                "lineage_root_id NOT IN "
-                f"({','.join('?' for _ in excluded_lineage_roots)})"
-            )
-            exclusion_params.extend(excluded_lineage_roots)
-        if current_lineage_root:
-            exclusion_parts.append("lineage_root_id != ?")
-            exclusion_params.append(current_lineage_root)
-        exclusion_sql = " AND ".join(exclusion_parts) or "1 = 1"
-
-        if route == "like":
-            final_snippet_expr = "ranked.snippet"
-            final_snippet_join = ""
-        else:
-            # FTS5's snippet() needs the MATCH expression on the same table
-            # cursor.  Keep the exact tokenized query used for candidate
-            # selection and apply it only after lineage winners are selected.
-            final_snippet_expr = (
-                f"snippet({candidate_from}, 0, '>>>', '<<<', '...', 40)"
-            )
-            final_snippet_join = (
-                f"JOIN {candidate_from} ON {candidate_from}.rowid = ranked.message_id "
-                f"AND {candidate_from} MATCH ?"
-            )
-
+        # Ranked distinct owner candidates: keep each owner's best-ranked raw
+        # hit (first by candidate_order) as its anchor.  Lineage resolution
+        # supplies only a dedupe/exclusion key and must never rewrite the
+        # match anchor to the root session.
         sql = f"""
             WITH
             {ranked_candidates}
@@ -1987,158 +2222,210 @@ class SessionSearchMixin:
                     COUNT(DISTINCT owning_session_id) AS candidate_unique_sessions
                 FROM candidate_hits
             ),
-            lineage_seeds AS (
-                SELECT DISTINCT owning_session_id AS seed_session_id
-                FROM candidate_hits
-            ),
-            lineage_walk(seed_session_id, session_id, parent_session_id, depth, path) AS (
-                SELECT
-                    seeds.seed_session_id,
-                    s.id,
-                    s.parent_session_id,
-                    0,
-                    printf('|%s|', s.id)
-                FROM lineage_seeds seeds
-                JOIN sessions s ON s.id = seeds.seed_session_id
-                UNION ALL
-                SELECT
-                    walk.seed_session_id,
-                    parent.id,
-                    parent.parent_session_id,
-                    walk.depth + 1,
-                    walk.path || parent.id || '|'
-                FROM lineage_walk walk
-                JOIN sessions parent ON parent.id = walk.parent_session_id
-                WHERE walk.depth < {lineage_depth_cap}
-                  AND instr(walk.path, printf('|%s|', parent.id)) = 0
-            ),
-            lineage_resolution AS (
-                SELECT
-                    seeds.seed_session_id,
-                    COALESCE(
-                        (
-                            SELECT walk.parent_session_id
-                            FROM lineage_walk walk
-                            WHERE walk.seed_session_id = seeds.seed_session_id
-                              AND walk.parent_session_id IS NOT NULL
-                              AND instr(
-                                  walk.path,
-                                  printf('|%s|', walk.parent_session_id)
-                              ) > 0
-                            ORDER BY walk.depth DESC
-                            LIMIT 1
-                        ),
-                        (
-                            SELECT walk.session_id
-                            FROM lineage_walk walk
-                            WHERE walk.seed_session_id = seeds.seed_session_id
-                            ORDER BY walk.depth DESC
-                            LIMIT 1
-                        ),
-                        seeds.seed_session_id
-                    ) AS lineage_root_id
-                FROM lineage_seeds seeds
-            ),
-            lineage_ranked AS (
-                SELECT
-                    hits.*,
-                    resolution.lineage_root_id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY resolution.lineage_root_id
-                        ORDER BY hits.source_priority, hits.candidate_order
-                    ) AS lineage_rank
-                FROM candidate_hits hits
-                JOIN lineage_resolution resolution
-                  ON resolution.seed_session_id = hits.owning_session_id
+            owner_candidates AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        candidate_hits.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY owning_session_id
+                            ORDER BY candidate_order
+                        ) AS owner_rank
+                    FROM candidate_hits
+                )
+                WHERE owner_rank = 1
             )
             SELECT
-                ranked.message_id AS id,
-                ranked.owning_session_id AS session_id,
-                ranked.role,
-                {final_snippet_expr} AS snippet,
-                ranked.timestamp,
-                ranked.source,
-                ranked.model,
-                ranked.session_started,
-                ranked.lineage_root_id,
-                ranked.candidate_order,
-                ranked.source_priority,
+                owner_candidates.*,
                 stats.candidate_count,
                 stats.candidate_unique_sessions
-            FROM lineage_ranked ranked
-            {final_snippet_join}
+            FROM owner_candidates
             CROSS JOIN candidate_stats stats
-            WHERE ranked.lineage_rank = 1
-              AND {exclusion_sql}
-            ORDER BY ranked.source_priority, ranked.candidate_order
-            LIMIT ?
+            ORDER BY owner_candidates.source_priority, owner_candidates.candidate_order
         """
-        # The LIKE candidate SELECT has an extra snippet parameter before the
-        # WHERE values; candidate_limit/offset were already appended above for
-        # that route and must not be duplicated.
-        if route == "like":
-            sql_params = params + exclusion_params + [result_limit]
-        else:
-            # params[0] is the tokenized FTS query; candidate_limit/offset are
-            # already at the tail of params.  The final MATCH cursor needs the
-            # same query before the result LIMIT parameter.
-            sql_params = params + [params[0]] + exclusion_params + [result_limit]
 
         request_value = request_id or "-"
         started = time.perf_counter()
-        try:
-            with self._lock:
-                execute_started = time.perf_counter()
-                cursor = self._conn.execute(sql, sql_params)
-                rows = [dict(row) for row in cursor.fetchall()]
-                execute_ms = int((time.perf_counter() - execute_started) * 1000)
-        except sqlite3.OperationalError as exc:
-            # Match search_messages() behavior: malformed FTS input is a
-            # no-result search, not a tool-level failure. This also preserves
-            # title-only discovery when the title contains FTS punctuation.
-            logger.warning(
-                "SESSION_WINNERS query failed request_id=%s route=%s error=%s",
-                request_value,
-                route,
-                type(exc).__name__,
-            )
-            return {
-                "winners": [],
-                "stats": {
-                    "candidate_count": 0,
-                    "candidate_unique_sessions": 0,
-                    "lineage_count": 0,
-                    "winner_count": 0,
-                    "route": route,
-                },
-            }
+        state = _LineageResolutionState(_LINEAGE_WORK_BUDGET)
+        winners: List[Dict[str, Any]] = []
+        seen_roots: set[str] = set()
 
-        if rows:
-            stats = {
-                "candidate_count": int(rows[0].pop("candidate_count", 0)),
-                "candidate_unique_sessions": int(
-                    rows[0].pop("candidate_unique_sessions", 0)
-                ),
-            }
-        else:
-            stats = {"candidate_count": 0, "candidate_unique_sessions": 0}
-        winners = rows
-        stats.update({
-            "lineage_count": len({row["lineage_root_id"] for row in winners}),
-            "winner_count": len(winners),
-            "route": route,
-        })
+        with self._read_ctx() as conn:
+            started_tx = not conn.in_transaction
+            if started_tx:
+                conn.execute("BEGIN")
+            try:
+                try:
+                    execute_started = time.perf_counter()
+                    candidates = [
+                        dict(row) for row in conn.execute(sql, params).fetchall()
+                    ]
+                    execute_ms = int(
+                        (time.perf_counter() - execute_started) * 1000
+                    )
+                except sqlite3.OperationalError as exc:
+                    # Match search_messages() behavior: malformed FTS input is
+                    # a no-result search, not a tool-level failure.  This also
+                    # preserves title-only discovery when the title contains
+                    # FTS punctuation.
+                    logger.warning(
+                        "SESSION_WINNERS query failed request_id=%s route=%s error=%s",
+                        request_value,
+                        route,
+                        type(exc).__name__,
+                    )
+                    return {
+                        "winners": [],
+                        "stats": {
+                            "candidate_count": 0,
+                            "candidate_unique_sessions": 0,
+                            "lineage_count": 0,
+                            "winner_count": 0,
+                            "lineage_work": 0,
+                            "lineage_memo_hits": 0,
+                            "lineage_memo_entries": 0,
+                            "lineage_candidates_inspected": 0,
+                            "lineage_bound_hit": False,
+                            "route": route,
+                        },
+                    }
+
+                candidate_count = 0
+                candidate_unique_sessions = 0
+                for candidate in candidates:
+                    candidate.pop("owner_rank", None)
+                if candidates:
+                    candidate_count = int(
+                        candidates[0].pop("candidate_count", 0)
+                    )
+                    candidate_unique_sessions = int(
+                        candidates[0].pop("candidate_unique_sessions", 0)
+                    )
+
+                excluded_roots = {str(root) for root in excluded_lineage_roots}
+                current_root: Optional[str] = None
+                if current_session_id:
+                    # Re-resolve the raw current identity inside this winner
+                    # snapshot with the SAME memo/state so current-session
+                    # exclusion and candidate dedupe share one root meaning.
+                    outcome = self._resolve_compression_lineage_on_conn(
+                        conn, str(current_session_id), state
+                    )
+                    if outcome is _BUDGET_EXHAUSTED:
+                        state.bound_hit = True
+                    elif outcome is _UNRESOLVED:
+                        # Conservative: an unresolved current session excludes
+                        # only its own id rather than broadening exclusion to
+                        # an unproven ancestor.
+                        current_root = str(current_session_id)
+                    else:
+                        current_root = outcome
+                elif current_lineage_root:
+                    current_root = str(current_lineage_root)
+
+                for candidate in candidates:
+                    if len(winners) >= result_limit:
+                        break
+                    state.candidates_inspected += 1
+                    outcome = self._resolve_compression_lineage_on_conn(
+                        conn, str(candidate["owning_session_id"]), state
+                    )
+                    if outcome is _BUDGET_EXHAUSTED:
+                        state.bound_hit = True
+                        # Stop the entire ranked scan: the bound candidate may
+                        # have produced a higher-ranked new root than every
+                        # later candidate, so skipping it would violate ranking.
+                        break
+                    if outcome is _UNRESOLVED:
+                        continue
+                    root = outcome
+                    if root in excluded_roots:
+                        continue
+                    if current_root is not None and root == current_root:
+                        # Current-lineage exclusion: live content is already in
+                        # context, but compression-archived history (an owner
+                        # that itself ended by compression, or a compacted
+                        # matched row) is no longer in live context and stays
+                        # discoverable.
+                        is_ended_session = (
+                            candidate["session_end_reason"] == "compression"
+                        )
+                        is_compacted_hit = (
+                            int(candidate["message_compacted"] or 0) == 1
+                        )
+                        if not (is_ended_session or is_compacted_hit):
+                            continue
+                    if root in seen_roots:
+                        continue
+                    seen_roots.add(root)
+                    state.accepted_roots = len(seen_roots)
+                    winners.append({
+                        "id": candidate["message_id"],
+                        "session_id": candidate["owning_session_id"],
+                        "role": candidate["role"],
+                        "snippet": candidate["snippet"],
+                        "timestamp": candidate["timestamp"],
+                        "source": candidate["source"],
+                        "model": candidate["model"],
+                        "session_started": candidate["session_started"],
+                        "lineage_root_id": root,
+                        "candidate_order": candidate["candidate_order"],
+                        "source_priority": candidate["source_priority"],
+                    })
+
+                if route != "like" and winners:
+                    # FTS5 snippet() needs the MATCH expression on the same
+                    # table cursor.  Keep the exact tokenized query used for
+                    # candidate selection and apply it only after winners are
+                    # known so the candidate scan stays narrow.
+                    match_query = params[0]
+                    snippet_sql = (
+                        f"SELECT snippet({candidate_from}, 0, '>>>', '<<<', "
+                        f"'...', 40) AS snippet FROM {candidate_from} "
+                        f"WHERE rowid = ? AND {candidate_from} MATCH ?"
+                    )
+                    for winner in winners:
+                        snippet_row = conn.execute(
+                            snippet_sql, (winner["id"], match_query)
+                        ).fetchone()
+                        winner["snippet"] = (
+                            snippet_row["snippet"]
+                            if snippet_row is not None else None
+                        )
+
+                stats = {
+                    "candidate_count": candidate_count,
+                    "candidate_unique_sessions": candidate_unique_sessions,
+                    "lineage_count": len(seen_roots),
+                    "winner_count": len(winners),
+                    "lineage_work": state.work,
+                    "lineage_memo_hits": state.memo_hits,
+                    "lineage_memo_entries": len(state.memo),
+                    "lineage_candidates_inspected": state.candidates_inspected,
+                    "lineage_bound_hit": state.bound_hit,
+                    "route": route,
+                }
+            finally:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+
         logger.info(
             "SESSION_WINNERS request_id=%s route=%s candidate_count=%d "
             "candidate_unique_sessions=%d lineage_count=%d winner_count=%d "
-            "query_ms=%d",
+            "lineage_work=%d lineage_memo_hits=%d lineage_candidates_inspected=%d "
+            "lineage_bound_hit=%s query_ms=%d execute_ms=%d",
             request_value,
             route,
             stats["candidate_count"],
             stats["candidate_unique_sessions"],
             stats["lineage_count"],
             stats["winner_count"],
+            stats["lineage_work"],
+            stats["lineage_memo_hits"],
+            stats["lineage_candidates_inspected"],
+            stats["lineage_bound_hit"],
             int((time.perf_counter() - started) * 1000),
+            execute_ms,
         )
         return {"winners": winners, "stats": stats}
 
