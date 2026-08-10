@@ -1958,6 +1958,41 @@ class SessionSearchMixin:
             ).fetchone()
         return row["id"] if row is not None else None
 
+    def _current_lineage_ancestors_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: _LineageResolutionState,
+    ) -> set:
+        """Collect the current session's generic parent chain ids.
+
+        Current-session exclusion must also hide live-context ancestors that
+        are NOT compression lineage: a delegation/branch child is still
+        visible to its parent agent, so the parent's content stays excluded
+        even though the child is a distinct compression root (#68).  Walks
+        ``parent_session_id`` links on the same connection, counts successful
+        row fetches toward the work budget, and stops on a missing row, a
+        cycle, or budget exhaustion.
+        """
+        ancestors: set = set()
+        seen: set = set()
+        node = str(session_id) if session_id else None
+        while node and node not in seen:
+            seen.add(node)
+            if state.work >= state.budget:
+                state.bound_hit = True
+                break
+            row = conn.execute(_LINEAGE_NODE_SQL, (node,)).fetchone()
+            if row is None:
+                break
+            state.work += 1
+            parent = row["parent_session_id"]
+            if parent is None:
+                break
+            node = str(parent)
+            ancestors.add(node)
+        return ancestors
+
     def search_session_winners(
         self,
         query: str,
@@ -1973,19 +2008,24 @@ class SessionSearchMixin:
         lineage_depth_cap: int = 64,
         request_id: str = None,
         current_session_id: Optional[str] = None,
+        title_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Select discovery winners in SQLite without candidate hydration.
 
         The candidate scan deliberately remains wider than the requested
-        result limit.  SQLite first ranks up to ``candidate_limit``
-        lightweight FTS/LIKE rows and projects one ranked owner candidate per
-        distinct owning session (preserving the best-ranked message anchor).
-        A query-local Python resolver then walks each owner to its positive
-        compression-continuation root under one coherent logical read
-        snapshot, dedupes by root, and stops as soon as ``result_limit``
-        distinct roots survive (early-K).  The returned rows contain no full
-        message content and no candidate context; FTS snippets are computed
-        only for the final winners.
+        result limit.  SQLite ranks up to ``candidate_limit`` lightweight
+        FTS/LIKE rows; a query-local Python resolver then walks each hit's
+        owning session to its positive compression-continuation root under
+        one coherent logical read snapshot, keeps the first eligible hit per
+        owner as its anchor, dedupes by root, and stops as soon as
+        ``result_limit`` distinct roots survive (early-K).  The returned rows
+        contain no full message content and no candidate context; FTS
+        snippets are computed only for the final winners.
+
+        ``current_session_id`` / ``title_session_id`` are raw session ids
+        re-resolved inside this snapshot with the SAME memo/state used for
+        candidate roots, so current-session / exact-title exclusion and
+        winner dedupe share one root meaning and one work budget.
 
         ``lineage_depth_cap`` is retained only for caller compatibility; #68
         replaced depth as an identity/safety boundary with a traversal-local
@@ -2198,10 +2238,13 @@ class SessionSearchMixin:
                 ranked_candidates = ""
                 candidate_base = fts_candidate
 
-        # Ranked distinct owner candidates: keep each owner's best-ranked raw
-        # hit (first by candidate_order) as its anchor.  Lineage resolution
-        # supplies only a dedupe/exclusion key and must never rewrite the
-        # match anchor to the root session.
+        # The bounded ranked raw-hit set stays the upstream source.  Owner
+        # dedupe happens in Python AFTER per-hit current-visibility: the first
+        # eligible hit of an owner becomes its anchor, so a compacted-history
+        # hit is never erased by an earlier live hit that current-session
+        # exclusion rejects (#68 review finding).  Lineage resolution supplies
+        # only a dedupe/exclusion key and must never rewrite the match anchor
+        # to the root session.
         sql = f"""
             WITH
             {ranked_candidates}
@@ -2221,27 +2264,14 @@ class SessionSearchMixin:
                     COUNT(*) AS candidate_count,
                     COUNT(DISTINCT owning_session_id) AS candidate_unique_sessions
                 FROM candidate_hits
-            ),
-            owner_candidates AS (
-                SELECT *
-                FROM (
-                    SELECT
-                        candidate_hits.*,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY owning_session_id
-                            ORDER BY candidate_order
-                        ) AS owner_rank
-                    FROM candidate_hits
-                )
-                WHERE owner_rank = 1
             )
             SELECT
-                owner_candidates.*,
+                candidate_hits.*,
                 stats.candidate_count,
                 stats.candidate_unique_sessions
-            FROM owner_candidates
+            FROM candidate_hits
             CROSS JOIN candidate_stats stats
-            ORDER BY owner_candidates.source_priority, owner_candidates.candidate_order
+            ORDER BY candidate_hits.source_priority, candidate_hits.candidate_order
         """
 
         request_value = request_id or "-"
@@ -2292,8 +2322,6 @@ class SessionSearchMixin:
 
                 candidate_count = 0
                 candidate_unique_sessions = 0
-                for candidate in candidates:
-                    candidate.pop("owner_rank", None)
                 if candidates:
                     candidate_count = int(
                         candidates[0].pop("candidate_count", 0)
@@ -2302,8 +2330,25 @@ class SessionSearchMixin:
                         candidates[0].pop("candidate_unique_sessions", 0)
                     )
 
+                # Exact-title exclusion re-resolves the raw title session id
+                # in-snapshot with the SAME memo/state/budget as candidates, so
+                # the title slot and the content lane share one root meaning
+                # (#68 review finding 1).  Full exclusion: the title already
+                # occupies its slot, its lineage members must not duplicate it.
                 excluded_roots = {str(root) for root in excluded_lineage_roots}
+                if title_session_id:
+                    outcome = self._resolve_compression_lineage_on_conn(
+                        conn, str(title_session_id), state
+                    )
+                    if outcome is _BUDGET_EXHAUSTED:
+                        state.bound_hit = True
+                    elif outcome is _UNRESOLVED:
+                        excluded_roots.add(str(title_session_id))
+                    else:
+                        excluded_roots.add(outcome)
+
                 current_root: Optional[str] = None
+                current_ancestors: set = set()
                 if current_session_id:
                     # Re-resolve the raw current identity inside this winner
                     # snapshot with the SAME memo/state so current-session
@@ -2320,15 +2365,28 @@ class SessionSearchMixin:
                         current_root = str(current_session_id)
                     else:
                         current_root = outcome
+                    current_ancestors = (
+                        self._current_lineage_ancestors_on_conn(
+                            conn, str(current_session_id), state
+                        )
+                    )
                 elif current_lineage_root:
                     current_root = str(current_lineage_root)
+
+                def _is_archived(candidate: Dict[str, Any]) -> bool:
+                    """True when a hit's content left the live context."""
+                    return (
+                        candidate["session_end_reason"] == "compression"
+                        or int(candidate["message_compacted"] or 0) == 1
+                    )
 
                 for candidate in candidates:
                     if len(winners) >= result_limit:
                         break
                     state.candidates_inspected += 1
+                    owner = str(candidate["owning_session_id"])
                     outcome = self._resolve_compression_lineage_on_conn(
-                        conn, str(candidate["owning_session_id"]), state
+                        conn, owner, state
                     )
                     if outcome is _BUDGET_EXHAUSTED:
                         state.bound_hit = True
@@ -2342,18 +2400,20 @@ class SessionSearchMixin:
                     if root in excluded_roots:
                         continue
                     if current_root is not None and root == current_root:
-                        # Current-lineage exclusion: live content is already in
-                        # context, but compression-archived history (an owner
-                        # that itself ended by compression, or a compacted
-                        # matched row) is no longer in live context and stays
-                        # discoverable.
-                        is_ended_session = (
-                            candidate["session_end_reason"] == "compression"
-                        )
-                        is_compacted_hit = (
-                            int(candidate["message_compacted"] or 0) == 1
-                        )
-                        if not (is_ended_session or is_compacted_hit):
+                        # Current compression-lineage exclusion: live content
+                        # is already in context, but compression-archived
+                        # history (a compression-ended owner or a compacted
+                        # matched row) is not in live context and stays
+                        # discoverable.  Per-hit: if THIS hit is rejected, a
+                        # later compacted hit of the same owner is still tried,
+                        # so compacted history is never erased by owner dedupe.
+                        if not _is_archived(candidate):
+                            continue
+                    if owner in current_ancestors:
+                        # A live-context generic ancestor of the current
+                        # session (delegation/branch parent) is still visible
+                        # to the agent; the same compression carve-out applies.
+                        if not _is_archived(candidate):
                             continue
                     if root in seen_roots:
                         continue
@@ -2361,7 +2421,7 @@ class SessionSearchMixin:
                     state.accepted_roots = len(seen_roots)
                     winners.append({
                         "id": candidate["message_id"],
-                        "session_id": candidate["owning_session_id"],
+                        "session_id": owner,
                         "role": candidate["role"],
                         "snippet": candidate["snippet"],
                         "timestamp": candidate["timestamp"],

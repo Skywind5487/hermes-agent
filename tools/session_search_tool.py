@@ -148,16 +148,15 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     return cur, has_compression
 
 
-def _resolve_lineage(db, session_id: str) -> str:
+def _resolve_lineage(db, session_id: str) -> Optional[str]:
     """Resolve the session-search compression lineage root.
 
     Production ``SessionDB`` exposes the same positive compression-continuation
-    resolver used by SQL winner selection, so current-session / exact-title
-    exclusion and DB winner dedupe share one root meaning (#68).  The old
-    generic-parent walk is kept only as a compatibility fallback for small
-    test doubles / older DB objects.  A failed production resolution is
-    conservative: the session stays its own root instead of broadening
-    exclusion to an unproven ancestor.
+    resolver used by SQL winner selection.  Returns ``None`` when the outcome
+    is unresolved / budget-exhausted — never a fabricated root (#68): a
+    resource limit is not evidence, so a B-limited resolution must not pretend
+    the session is its own root.  The old generic-parent walk is kept only as
+    a compatibility fallback for small test doubles / older DB objects.
     """
     if not session_id:
         return session_id
@@ -165,14 +164,14 @@ def _resolve_lineage(db, session_id: str) -> str:
     if resolver is None:
         return _resolve_to_parent(db, session_id)[0]
     try:
-        return resolver(session_id) or session_id
+        return resolver(session_id)
     except Exception:
         logging.debug(
             "compression lineage resolution failed for %s",
             session_id,
             exc_info=True,
         )
-        return session_id
+        return None
 
 
 def _is_compression_ended(db, session_id: str) -> bool:
@@ -742,10 +741,8 @@ def _discover(
 
     _title_t0 = time.perf_counter()
     title_result = _title_match_result(db, query, current_lineage_root)
-    title_lineage = title_result.get("_lineage_root") if title_result else None
     _title_ms = (time.perf_counter() - _title_t0) * 1000
 
-    excluded_lineages = (title_lineage,) if title_lineage else ()
     _search_t0 = time.perf_counter()
     if title_result and limit <= 1:
         winner_response = {
@@ -765,10 +762,12 @@ def _discover(
         }
     else:
         try:
-            # Pass the raw current-session id so the winner phase re-resolves
-            # it with the SAME memo/state/snapshot used for candidate roots
-            # (#68): current-session exclusion shares the DB compression-root
-            # semantics instead of trusting a stale precomputed root string.
+            # Pass the RAW current and title session ids so the winner phase
+            # re-resolves both inside its own snapshot with the SAME
+            # memo/state/budget used for candidate roots (#68): current and
+            # title exclusion share the DB compression-root semantics instead
+            # of trusting stale precomputed root strings, and a B-limited
+            # resolution is never rewritten into a fabricated root.
             winner_response = db.search_session_winners(
                 query=query,
                 role_filter=role_list,
@@ -776,8 +775,10 @@ def _discover(
                 candidate_limit=_DISCOVER_SCAN_LIMIT,
                 result_limit=max(0, limit - (1 if title_result else 0)),
                 sort=sort,
-                excluded_lineage_roots=excluded_lineages,
                 current_session_id=current_session_id or None,
+                title_session_id=(
+                    title_result["session_id"] if title_result else None
+                ),
                 request_id=_request_id,
             )
         except Exception as e:
