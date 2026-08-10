@@ -2963,11 +2963,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         a recognized legacy ``simple`` object is converged (demoted without
         requiring the tokenizer) BEFORE the modern same-name object is
         created; an unknown same-name object fails closed (never deleted,
-        capability off). On a fresh modern create over a populated DB the
-        durable H/P claim is committed BEFORE the empty index can look
-        complete (#76832 invariant), then the VIEW + external table + gated
-        triggers are ensured (crash-atomic with the trigger-owned-region
-        catch-up for the fresh-create path).
+        capability off). The derived source name is checked for a collision
+        FIRST — if ``sessions_fts_trigram_src`` is occupied by a same-name
+        TABLE or a non-canonical VIEW, the ensure fails closed before
+        creating the VIEW / seeding H/P / demoting legacy, because
+        ``CREATE VIEW IF NOT EXISTS`` would silently no-op and the rebuild
+        would read the wrong source. On a fresh modern create over a
+        populated DB the durable H/P claim is committed BEFORE the empty
+        index can look complete (#76832 invariant), then the VIEW + external
+        table + gated triggers are ensured (crash-atomic with the
+        trigger-owned-region catch-up for the fresh-create path).
 
         Returns True when the modern trigram index is available for search.
         """
@@ -2978,6 +2983,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "sessions_fts_trigram exists but is not a recognized Hermes "
                 "shape (issue #30) — leaving it untouched; normalized trigram "
                 "search unavailable for %s", self.db_path,
+            )
+            return False
+        # The derived source NAME must be free (or already the canonical
+        # VIEW) BEFORE we create the VIEW / seed H/P / demote legacy:
+        # ``CREATE VIEW IF NOT EXISTS`` silently no-ops over a same-name
+        # TABLE or non-canonical VIEW, so the rebuild H would be computed
+        # from the wrong source and a modern index would silently index
+        # nothing — and on the legacy path the demotion could even drag the
+        # same-name source TABLE into the trash namespace first. Fail closed
+        # on any source collision: an index over the wrong content is worse
+        # than no index at all.
+        if not self._sessions_trigram_src_compatible(cursor):
+            self._sessions_trigram_available = False
+            logger.warning(
+                "sessions_fts_trigram_src is occupied by a non-canonical "
+                "object (issue #30) — not creating the derived VIEW; "
+                "normalized trigram search unavailable for %s", self.db_path,
             )
             return False
         # The derived VIEW must exist BEFORE any claim seed reads

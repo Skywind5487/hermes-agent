@@ -268,3 +268,32 @@ by the classifier. Tests: `test_classifier_legacy_never_connects_vtable` and
 (simulating a host without the tokenizer) and assert classification still
 succeeds — RED before this fix, GREEN after.
 
+### Round-7 fix — source-collision guard in the ensure path (P2, 2026-08-10)
+
+Round-7 review (P2): `_ensure_sessions_trigram_fts_schema` created the
+derived VIEW (`CREATE VIEW IF NOT EXISTS sessions_fts_trigram_src`) BEFORE
+seeding H/P / demoting legacy — but `CREATE VIEW IF NOT EXISTS` silently
+no-ops when the source NAME is occupied by a same-name TABLE or a
+non-canonical VIEW. The rebuild H (`SELECT COALESCE(MAX(row_id), 0) FROM
+sessions_fts_trigram_src`) would then be computed from the WRONG source and a
+modern index would silently index nothing; the legacy path was worse — the
+demotion's shadow rename (`name LIKE 'sessions_fts_trigram\_%'`, type=table)
+would even drag the same-name source TABLE into the `fts_v22_trash_`
+namespace before the collision surfaced.
+
+`_ensure_sessions_trigram_fts_schema` now runs `_sessions_trigram_src_compatible`
+immediately after classification (before any `CREATE VIEW IF NOT EXISTS` /
+H/P seed / legacy demotion) and fails closed on a collision (absent → OK, the
+VIEW gets created; canonical VIEW → OK; TABLE / bad VIEW → fail closed, no
+modern build, no claim, legacy untouched). This also makes the legacy
+demotion's shadow-rename safe: it is only reachable with the source absent or
+the canonical VIEW (type='view', excluded by the `type='table'` filter).
+
+Pinned by `TestSourceCollisionGuard`:
+`test_root_absent_source_table_fail_closed` (root absent + source TABLE → no
+modern index, no H/P seed, table survives) and
+`test_legacy_simple_bad_source_does_not_demote` (exact legacy-simple + source
+TABLE → not demoted, no H/P, table survives) — both RED before this fix (the
+legacy one failed with `no such table: sessions_fts_trigram_src` as the
+demotion dragged the source into trash), GREEN after.
+

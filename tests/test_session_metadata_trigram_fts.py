@@ -393,6 +393,42 @@ def _build_modern_root_same_name_table_src_db(db_path):
     conn.close()
 
 
+def _build_root_absent_source_table_db(db_path):
+    """DB with NO ``sessions_fts_trigram`` root but a same-name TABLE
+    occupying the source name ``sessions_fts_trigram_src`` (with sessions
+    present). #30 must fail closed BEFORE creating the VIEW / seeding H/P:
+    ``CREATE VIEW IF NOT EXISTS`` silently no-ops over a table, so a modern
+    index built here would read the wrong (empty) source and index nothing."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.executemany(
+        "INSERT INTO sessions (row_id, id, source, started_at, title) "
+        "VALUES (?, ?, 'cli', ?, ?)",
+        [(1, "A", t0, "Alpha Project"), (2, "B", t0 + 1, "AN-94 Prestige")],
+    )
+    conn.execute(
+        "CREATE TABLE sessions_fts_trigram_src (row_id INTEGER, title TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_legacy_simple_with_source_table_db(db_path):
+    """Exact legacy ``tokenize='simple'`` same-name root PLUS a same-name
+    TABLE occupying the source name ``sessions_fts_trigram_src``. #30 must
+    NOT demote the legacy root before exposing the source collision — the
+    demoted path would build a modern index against the wrong source."""
+    _build_legacy_simple_sessions_trigram_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE sessions_fts_trigram_src (row_id INTEGER, title TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+
 def _seed_an94_row(db):
     """Insert the canonical #30 sample metadata row (live, > H on a fresh
     DB with no markers) so search fixtures share one shape."""
@@ -990,6 +1026,66 @@ class TestTokenizerAbsent:
             _assert_trigram_integrity(r2)
         finally:
             r2.close()
+
+
+class TestSourceCollisionGuard:
+    """The ensure path must gate the derived-source VIEW creation, the H/P
+    seed, and the legacy demotion on ``_sessions_trigram_src_compatible``.
+    ``CREATE VIEW IF NOT EXISTS`` silently no-ops when the source NAME is
+    occupied by a same-name TABLE or a non-canonical VIEW — the rebuild H
+    would then be computed from the wrong source and a modern index would
+    silently index nothing (or worse: the legacy root demoted first)."""
+
+    def test_root_absent_source_table_fail_closed(self, tmp_path):
+        """Root absent + same-name source TABLE: must NOT build the modern
+        index against the wrong source and must NOT seed a durable H/P claim
+        — the table survives untouched, capability off."""
+        db_path = tmp_path / "absent_src_table.db"
+        _build_root_absent_source_table_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            # No modern index was built against the wrong source.
+            assert _fts_sql(r._conn, "sessions_fts_trigram") == ""
+            # No durable trigram claim was staged.
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+            # The same-name source TABLE survives untouched.
+            obj = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'sessions_fts_trigram_src'"
+            ).fetchone()
+            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "table"
+        finally:
+            r.close()
+
+    def test_legacy_simple_bad_source_does_not_demote(self, tmp_path):
+        """exact legacy-simple root + source-name collision (same-name
+        TABLE): #30 must NOT demote the legacy root before exposing the
+        collision — the demoted path would build a modern index against the
+        wrong source. Fail closed: legacy survives, no modern build, no H/P
+        seed."""
+        db_path = tmp_path / "legacy_src_table.db"
+        _build_legacy_simple_with_source_table_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            # The legacy root was NOT demoted — still the historical shape.
+            assert r._classify_sessions_fts_trigram(r._conn) == "legacy_simple"
+            assert "tokenize='simple'" in _fts_sql(
+                r._conn, "sessions_fts_trigram"
+            )
+            # No durable trigram claim was staged.
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+            # The same-name source TABLE survives untouched.
+            obj = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'sessions_fts_trigram_src'"
+            ).fetchone()
+            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "table"
+        finally:
+            r.close()
 
 
 # =========================================================================
