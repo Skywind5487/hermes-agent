@@ -25,7 +25,6 @@ from hermes_state_common import (
     FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
-    SessionTrigramOwnershipLost,
     _FTS_CJK_TRIGGERS,
 )
 
@@ -81,8 +80,8 @@ _FTS_SESSION_SPEC = {
 # #30 normalized session trigram rebuild: its OWN marker pair and descriptor.
 # ``P`` means target-specific processed completeness, so the trigram lane must
 # NEVER share the Unicode lane's ``fts_session_rebuild_*`` claim — either
-# target can be created / demoted / repaired / reset independently, and a
-# shared P would let one target's completion falsely assert the other's.
+# target can be created / repaired / reset independently, and a shared P
+# would let one target's completion falsely assert the other's.
 # The source is the derived ``sessions_fts_trigram_src`` VIEW (compact title,
 # raw id, compact display_name) so the chunk worker and the finish sweep read
 # the same projection the live triggers do.
@@ -99,13 +98,6 @@ _FTS_SESSION_TRIGRAM_SPEC = {
     "trigram_columns": (),
     "trigram_where": None,
     "reset_tables": ("sessions_fts_trigram",),
-    # Round-11 P1 #3: every mutation (backfill chunk, boundary finish) must
-    # authorize the exact current modern root/source/trigger state inside the
-    # same BEGIN IMMEDIATE that mutates. A long-lived process must not
-    # advance/clear a target after durable ownership changed underneath it.
-    "write_guard": lambda self, conn: (
-        self._sessions_trigram_require_owned_modern_for_write(conn)
-    ),
     "available": lambda self: getattr(
         self, "_sessions_trigram_available", False
     ),
@@ -237,12 +229,6 @@ class SessionSearchMixin:
         src_cols = ", ".join(spec["source_columns"])
 
         def _do(conn):
-            # CAS write authorization (round-11 P1 #3): the boundary finish
-            # clears H/P, so revalidate exact modern ownership inside the same
-            # transaction — never clear markers for a target whose durable
-            # ownership changed.
-            if spec.get("write_guard"):
-                spec["write_guard"](self, conn)
             hw_row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = ?",
                 (spec["high_water_key"],),
@@ -279,14 +265,7 @@ class SessionSearchMixin:
                 "DELETE FROM state_meta WHERE key IN (?, ?)",
                 (spec["high_water_key"], spec["progress_key"]),
             )
-        try:
-            self._execute_write(_do)
-        except SessionTrigramOwnershipLost:
-            logger.debug(
-                "Refused to finish %s FTS rebuild (target ownership changed): %s",
-                spec["name"], self.db_path,
-            )
-            return
+        self._execute_write(_do)
         logger.info(
             "Deferred %s FTS rebuild complete — all rows indexed.", spec["name"]
         )
@@ -362,11 +341,6 @@ class SessionSearchMixin:
         )
 
         def _do(conn):
-            # CAS write authorization (round-11 P1 #3): the backfill chunk
-            # mutates the target, so revalidate exact modern ownership inside
-            # the same transaction.
-            if spec.get("write_guard"):
-                spec["write_guard"](self, conn)
             # Re-read progress inside the write transaction (BEGIN IMMEDIATE
             # is already held by _execute_write) — this is the claim: two
             # workers can't read the same progress value concurrently.
@@ -409,12 +383,6 @@ class SessionSearchMixin:
 
         try:
             more = self._execute_write(_do)
-        except SessionTrigramOwnershipLost:
-            logger.debug(
-                "%s FTS rebuild chunk refused (target ownership changed): %s",
-                spec["name"], self.db_path,
-            )
-            return False
         except sqlite3.OperationalError as exc:
             logger.debug(
                 "%s FTS rebuild chunk failed (will retry): %s", spec["name"], exc
@@ -909,14 +877,16 @@ class SessionSearchMixin:
         ``_repair_session_fts_bookkeeping`` (issue #30). Independent markers;
         shares the crash-safe implementation.
 
-        Ownership-gated (round-10 finding 4): only repairs an EXACT OWNED
-        modern target with no missing owned triggers and no durable stale
-        breadcrumb. An unknown same-name object must NEVER be mutated (no H/P
-        seed, no delete-all) even when it happens to look canonical; a stale
-        target is only repaired through the dedicated stale-recovery path.
+        Serving gate: only repairs a target this process serves (available at
+        open) and that is not durably stale. An unknown same-name object is
+        never available → never mutated (no H/P seed, no delete-all) even
+        when it happens to look canonical; a stale target is only repaired
+        through the dedicated stale-recovery path.
         """
         def _do(conn):
-            if not self._sessions_trigram_owned_servable(conn):
+            if not self._sessions_trigram_available:
+                return
+            if self._session_trigram_is_stale(conn):
                 return
             self._repair_session_fts_bookkeeping_inner(
                 conn, _FTS_SESSION_TRIGRAM_SPEC
@@ -1137,10 +1107,11 @@ class SessionSearchMixin:
         # can only be recovered from scratch — reset it now so the cjk
         # backfill phase below rebuilds it. No-op without the tokenizer.
         self._fts_cjk_reset_if_stale()
-        # A stale session-trigram target (missing owned trigger, or quarantined
-        # by a tokenizer-less process) can only be recovered from scratch —
-        # reset it now so the trigram backfill phase below rebuilds it. No-op
-        # without trigram capability / ownership (finding 1 point 4).
+        # A stale session-trigram target (quarantined by a tokenizer-less
+        # process: stale breadcrumb set + owned triggers dropped) can only be
+        # recovered from scratch — reset it now so the trigram backfill phase
+        # below rebuilds it. No-op without trigram capability (finding 1
+        # point 4).
         self._fts_session_trigram_recover_if_stale()
         # An optimized v23 DB gaining the cjk index for the first time (no
         # legacy work left, tokenizer newly installed): ensure the table +

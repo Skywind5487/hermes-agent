@@ -61,7 +61,6 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_CJK_STALE_KEY,
     FTS_SQL,
     FTS_SESSION_TRIGRAM_STALE_KEY,
-    SessionTrigramOwnershipLost,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
@@ -71,7 +70,6 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     SCHEMA_VERSION,
     SESSIONS_FTS_SQL,
     SESSIONS_FTS_TRIGRAM_SQL,
-    SESSIONS_TRIGRAM_MODERN_SHADOW_TABLES,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
@@ -2962,26 +2960,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return (not foreign), foreign, []
 
     @staticmethod
-    def _sessions_trigram_shadow_collision(cursor) -> Optional[str]:
-        """Return the first blocking occupant among the modern reserved FTS5
-        shadow names (``_data/_idx/_docsize/_config``), or None when the
-        whole reserved namespace is free. ``CREATE VIRTUAL TABLE`` for the
-        modern external-content root fails if any of these is a pre-existing
-        TABLE/VIEW/INDEX (round-10 finding 8). ``_content`` is deliberately
-        NOT reserved for external content; a same-name TRIGGER does not block
-        shadow TABLE creation.
-        """
-        for name in SESSIONS_TRIGRAM_MODERN_SHADOW_TABLES:
-            row = cursor.execute(
-                "SELECT type FROM sqlite_master WHERE name = ? "
-                "AND type IN ('table', 'view', 'index')",
-                (name,),
-            ).fetchone()
-            if row is not None:
-                return name
-        return None
-
-    @staticmethod
     def _classify_sessions_fts_trigram(cursor) -> str:
         """Classify the same-name ``sessions_fts_trigram`` object by schema
         identity (normalized stored ``sqlite_master.sql`` comparisons), NEVER
@@ -3053,19 +3031,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         an unknown same-name object fails closed (never deleted, capability
         off).
 
-        Ownership and lifecycle gates (round-10):
+        Ownership and lifecycle gates:
         - trigger namespace must be owned (every present target trigger is
           exactly a known Hermes declaration; foreign same-name triggers fail
           closed and are left untouched);
-        - the derived source name must be collision-free (round-7) and the
-          modern reserved shadow namespace must be free before any fresh
-          create / demotion mutation (finding 8);
-        - a modern root with a missing owned trigger OR a durable stale
-          breadcrumb is STALE: a capable host runs a full atomic recovery
-          (reset from canonical rows, re-seed, reinstall triggers, clear
-          stale last); an incapable host quarantines (persist stale, drop
-          only owned triggers so canonical writes survive) and never serves
-          (finding 1);
+        - the derived source name must be collision-free;
+        - a modern root with a durable stale breadcrumb is STALE: a capable
+          host runs a full atomic recovery (reset from canonical rows,
+          re-seed, reinstall triggers, clear stale last); an incapable host
+          quarantines (persist stale, drop only owned triggers so canonical
+          writes survive) and never serves;
+        - a healthy modern root (exact triggers, no stale) on a runtime
+          without the trigram tokenizer is QUARANTINED the same way — the
+          live triggers would otherwise break canonical `sessions` writes
+          with `no such tokenizer: trigram` (round-12 P1);
         - a modern empty index over a populated source with no claim is
           never served complete — the open path seeds the full claim
           atomically (finding 6).
@@ -3077,9 +3056,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns True when the modern trigram index is available for search.
         """
-        return self._ensure_sessions_trigram_fts_schema_depth(cursor, 0)
-
-    def _ensure_sessions_trigram_fts_schema_depth(self, cursor, depth: int) -> bool:
         classification = self._classify_sessions_fts_trigram(cursor)
         if classification == "unknown_same_name":
             self._sessions_trigram_available = False
@@ -3099,9 +3075,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         if classification == "modern_trigram":
             # For a modern root, FOREIGN triggers fail closed (never touch
-            # them); a MISSING owned trigger is an unknown coverage gap (rows
-            # may have landed unindexed) → stale lifecycle, never blind
-            # IF NOT EXISTS repair.
+            # them).
             if foreign:
                 self._sessions_trigram_available = False
                 logger.warning(
@@ -3131,37 +3105,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         if classification == "modern_trigram":
-            # A missing owned trigger is an unknown coverage gap (rows may
-            # have landed unindexed); a durable stale breadcrumb dominates
-            # any old H/P claim. Either → stale lifecycle, never blind
-            # IF NOT EXISTS repair.
-            if missing_modern or self._session_trigram_is_stale(cursor):
+            # A durable stale breadcrumb dominates any old H/P claim (a peer
+            # may have quarantined the target while this process still cached
+            # available=True) → stale lifecycle.
+            if self._session_trigram_is_stale(cursor):
                 return self._sessions_trigram_stale_recovery_or_quarantine(cursor)
-            ok = self._ensure_fts_schema(
-                cursor, "sessions_fts_trigram", SESSIONS_FTS_TRIGRAM_SQL
-            )
-            if not ok:
+            # Healthy state requires the exact modern trigger set. A missing
+            # owned trigger WITHOUT a stale breadcrumb is a state the final
+            # #30 lifecycle cannot create — fail closed, no repair machinery.
+            if missing_modern:
+                self._sessions_trigram_available = False
+                logger.warning(
+                    "sessions_fts_trigram trigger set is incomplete (missing "
+                    "%s, no stale breadcrumb, issue #30) — leaving untouched; "
+                    "normalized trigram search unavailable for %s",
+                    missing_modern, self.db_path,
+                )
+                return False
+            # Runtime capability: probe the exact modern root directly. An
+            # exact healthy modern target needs no IF NOT EXISTS re-install —
+            # identity + trigger checks already proved the schema exists; the
+            # only remaining question is whether this runtime can tokenize it.
+            probe = self._fts_table_probe(cursor, "sessions_fts_trigram")
+            if probe is None:
+                # No trigram tokenizer on this runtime: quarantine so
+                # canonical session writes keep working (round-12 P1).
+                return self._sessions_trigram_quarantine()
+            if probe is False:
+                # The table vanished while we looked — not servable.
                 self._sessions_trigram_available = False
                 return False
-            # Open-time orphan repair (finding 6): a modern empty index over
-            # a populated source with no claim must not be served complete.
+            # probe is True — tokenizer works. Orphan-empty repair, then
+            # serve (finding 6).
             self._sessions_trigram_open_orphan_repair(cursor)
             self._sessions_trigram_available = True
             return True
 
         # ── root absent → fresh-create path ──
-        # Reserved FTS5 shadow namespace must be free BEFORE any claim or
-        # migration mutation (finding 8): CREATE VIRTUAL TABLE fails if a
-        # pre-existing TABLE/VIEW/INDEX occupies _data/_idx/_docsize/_config.
-        collision = self._sessions_trigram_shadow_collision(cursor)
-        if collision is not None:
-            self._sessions_trigram_available = False
-            logger.warning(
-                "sessions_fts_trigram reserved shadow name %s is occupied "
-                "(issue #30) — not creating the modern target; normalized "
-                "trigram search unavailable for %s", collision, self.db_path,
-            )
-            return False
         # The derived VIEW must exist BEFORE any claim seed reads
         # ``MAX(row_id)`` through it (the generic ``_seed_fts_rebuild_markers``
         # uses the spec's ``source_table``). The VIEW is a non-persistent
@@ -3196,16 +3176,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 cursor, "sessions_fts_trigram", SESSIONS_FTS_TRIGRAM_SQL
             )
         if not ok:
-            # The trigram tokenizer / FTS5 module is unavailable on this host
-            # (or the ownership CAS refused inside the transition). The fresh
-            # H/P claim is CROSS-PROCESS recovery state — NEVER cleared here
-            # (round-11 P1 #2): an incapable process's failed schema attempt
-            # must not erase a capable peer's durable claim, or a partial
-            # index could be exposed as complete. This runtime already has
-            # ``_sessions_trigram_available=False``, and optimize/status gate
-            # trigram work on that flag, so the claim is not advertised as
-            # fulfillable by this process. A later capable opener consumes
-            # the same claim and its catch-up semantics safely.
+            # The trigram tokenizer / FTS5 module is unavailable on this host.
+            # The fresh H/P claim is CROSS-PROCESS recovery state — NEVER
+            # cleared here (round-11 P1 #2): an incapable process's failed
+            # schema attempt must not erase a capable peer's durable claim, or
+            # a partial index could be exposed as complete. This runtime
+            # already has ``_sessions_trigram_available=False``, and
+            # optimize/status gate trigram work on that flag, so the claim is
+            # not advertised as fulfillable by this process. A later capable
+            # opener consumes the same claim and its catch-up semantics
+            # safely.
             self._sessions_trigram_available = False
             return False
         self._sessions_trigram_available = True
@@ -3220,52 +3200,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             (FTS_SESSION_TRIGRAM_STALE_KEY,),
         ).fetchone()
         return row is not None
-
-    def _sessions_trigram_owned_servable(self, conn) -> bool:
-        """True when the target is an EXACT owned modern trigram target with
-        no missing owned triggers and no durable stale breadcrumb — the
-        round-10 finding 4 serving gate. Every mutating/serving surface
-        (candidate helper, rebuild/repair/optimize hooks) must consult this,
-        not only the process-local cached boolean, because another process can
-        quarantine the target or drop a trigger at any time."""
-        if self._classify_sessions_fts_trigram(conn) != "modern_trigram":
-            return False
-        owned, foreign, missing = self._sessions_trigram_namespace_owned(
-            conn, "modern_trigram"
-        )
-        if not owned or missing:
-            return False
-        if self._session_trigram_is_stale(conn):
-            return False
-        return True
-
-    def _sessions_trigram_require_owned_modern_for_write(
-        self, conn, *, allow_stale: bool = False, allow_missing: bool = False
-    ) -> None:
-        """CAS write authorization for a trigram mutation, invoked INSIDE the
-        same ``BEGIN IMMEDIATE`` that will mutate (round-11 P1 #3).
-
-        Raises ``SessionTrigramOwnershipLost`` (aborting the transaction)
-        unless the target is the exact modern root with a compatible source
-        and no foreign trigger occupants. ``allow_stale`` permits the durable
-        stale breadcrumb (stale recovery / quarantine); ``allow_missing``
-        permits missing owned modern triggers (they are reinstalled / dropped
-        by those paths). The default serving/backfill state requires exact
-        modern triggers AND not stale.
-        """
-        if self._classify_sessions_fts_trigram(conn) != "modern_trigram":
-            raise SessionTrigramOwnershipLost("root is not exact modern")
-        if not self._sessions_trigram_src_compatible(conn):
-            raise SessionTrigramOwnershipLost("source not compatible")
-        owned, foreign, missing = self._sessions_trigram_namespace_owned(
-            conn, "modern_trigram"
-        )
-        if foreign:
-            raise SessionTrigramOwnershipLost("foreign trigger occupants")
-        if not allow_missing and missing:
-            raise SessionTrigramOwnershipLost("missing owned modern triggers")
-        if not allow_stale and self._session_trigram_is_stale(conn):
-            raise SessionTrigramOwnershipLost("durably stale")
 
     def _sessions_trigram_stale_recovery_or_quarantine(self, cursor) -> bool:
         """Round-10 finding 1: a stale modern target (missing owned trigger
@@ -3286,7 +3220,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._sessions_trigram_available = False
                 return False
             self._fts_session_trigram_recover_stale()
-        except (sqlite3.OperationalError, SessionTrigramOwnershipLost):
+        except sqlite3.OperationalError:
             self._sessions_trigram_available = False
             logger.warning(
                 "session trigram stale recovery could not complete (issue "
@@ -3303,13 +3237,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         so canonical session writes survive; never serve (round-10 finding 1,
         CJK stale precedent)."""
         def _do(conn):
-            # CAS under the lock (round-11 P1 #3): only an exact owned modern
-            # root/source with no foreign trigger occupants may be quarantined
-            # — never drop triggers for a target whose durable ownership
-            # changed underneath us.
-            self._sessions_trigram_require_owned_modern_for_write(
-                conn, allow_stale=True, allow_missing=True
-            )
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -3353,12 +3280,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if not stale_now and not missing_now:
                 return
-            # CAS authorization (round-11 P1 #3): exact modern root/source,
-            # no foreign trigger occupants; stale/missing owned triggers are
-            # allowed (they are what this path resets/reinstalls).
-            self._sessions_trigram_require_owned_modern_for_write(
-                conn, allow_stale=True, allow_missing=True
-            )
             conn.execute(
                 f"INSERT INTO {fts_table}({fts_table}) VALUES('delete-all')"
             )
@@ -3397,7 +3318,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
         try:
             self._fts_session_trigram_recover_stale()
-        except (sqlite3.OperationalError, SessionTrigramOwnershipLost):
+        except sqlite3.OperationalError:
             self._sessions_trigram_available = False
             logger.warning(
                 "session trigram stale recovery could not complete from "
@@ -3417,10 +3338,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if row is not None:
                 return
-            # CAS authorization (round-11 P1 #3): never seed H/P for a target
-            # whose durable ownership changed since classification — an exact
-            # owned modern serving target only.
-            self._sessions_trigram_require_owned_modern_for_write(conn)
             has_src = conn.execute(
                 "SELECT EXISTS(SELECT 1 FROM sessions_fts_trigram_src)"
             ).fetchone()[0]
@@ -3429,12 +3346,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()[0]
             if has_src and docsize == 0:
                 self._seed_session_trigram_fts_rebuild_markers(conn, force=True)
-        try:
-            self._execute_write(_do)
-        except SessionTrigramOwnershipLost:
-            # Ownership changed under this transaction — do NOT seed H/P for a
-            # target we no longer own (fail closed, round-11 P1 #3).
-            return
+        self._execute_write(_do)
 
     def _fts_session_trigram_schema_transition(self, cursor) -> bool:
         """#30 normalized-trigram session-metadata lane of the shared
@@ -6798,10 +6710,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return True, []
         # Round-10 finding 4: serving gate — never serve the trigram lane
         # unless this process owns+serves it AND it is not durably stale
-        # (another process may have quarantined it / dropped a trigger after
-        # we opened). An unknown same-name object must never be served even
-        # when its columns happen to line up; a stale lane returns failure so
-        # the #14 router falls back to LIKE instead of serving stale hits.
+        # (another process may have quarantined it after we opened). An
+        # unknown same-name object is never served (available=False at open);
+        # a stale lane returns failure so the #14 router falls back to LIKE
+        # instead of serving stale hits.
         if not self._sessions_trigram_available:
             return False, []
         fts_ok = True
@@ -6828,7 +6740,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # connection, NOT via helpers that open fresh autocommit reads.
             conn.execute("BEGIN")
             try:
-                if not self._sessions_trigram_owned_servable(conn):
+                if self._session_trigram_is_stale(conn):
                     return False, []
                 gap = self._session_trigram_rebuild_gap(conn)
                 try:

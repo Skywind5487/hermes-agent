@@ -638,22 +638,13 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 
 # state_meta breadcrumb for the normalized session-trigram lane (#30): set
 # when a runtime without the trigram tokenizer had to drop the owned modern
-# triggers to keep canonical `sessions` writes alive (round-10 finding 1), or
-# when an owned modern trigger was found missing (an unknown coverage gap).
-# While set, the target must not serve reads / rebuild / optimize; a capable
-# host resets from canonical rows, reinstalls the owned triggers, and only
-# then clears the breadcrumb. Stale dominates any old H/P claim — the old
-# ownership partition is invalid once rows can land without triggers.
+# triggers to keep canonical `sessions` writes alive (round-12 P1, reusing
+# the round-10 quarantine). While set, the target must not serve reads /
+# rebuild / optimize; a capable host resets from canonical rows, reinstalls
+# the owned triggers, and only then clears the breadcrumb. Stale dominates
+# any old H/P claim — the old ownership partition is invalid once rows can
+# land without triggers.
 FTS_SESSION_TRIGRAM_STALE_KEY = "fts_session_trigram_stale"
-
-
-class SessionTrigramOwnershipLost(Exception):
-    """Raised by the trigram write-authorization CAS (round-11 P1 #3) when a
-    mutating operation finds the target no longer an exact owned modern
-    root/source/trigger state inside its own ``BEGIN IMMEDIATE``. Callers
-    abort the mutation (roll back) and fail closed — never delete-all, drop
-    triggers, seed/advance/clear H/P, or run a boundary finish against a
-    target whose durable ownership changed underneath them."""
 
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
@@ -862,20 +853,6 @@ BEGIN
     WHERE row_id = new.row_id;
 END;
 """
-
-
-# The EXACT FTS5 shadow tables FTS5 itself must create for a MODERN
-# external-content ``sessions_fts_trigram`` vtable. ``_content`` is NOT a
-# modern external-content shadow and must not be over-blocked. A
-# pre-existing TABLE/VIEW/INDEX at any of these names makes
-# ``CREATE VIRTUAL TABLE`` fail — the fresh-create path must fail closed on a
-# collision BEFORE any claim / migration mutation (round-10 finding 8).
-SESSIONS_TRIGRAM_MODERN_SHADOW_TABLES = (
-    "sessions_fts_trigram_data",
-    "sessions_fts_trigram_idx",
-    "sessions_fts_trigram_docsize",
-    "sessions_fts_trigram_config",
-)
 
 
 # CJK title search — cjk_unicode61 loadable tokenizer, mirroring

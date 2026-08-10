@@ -1202,10 +1202,9 @@ class SessionSchemaMixin:
 
             # ── Sessions normalized trigram FTS5 (#30) ──────────────
             # External-content trigram over the derived compact/raw VIEW,
-            # with its own resumable H/P lane and legacy same-name simple
-            # convergence. Runs independently of the Unicode sessions_fts
-            # above; a legacy ``tokenize='simple'`` same-name object is
-            # converged (never required to keep the simple tokenizer).
+            # with its own resumable H/P lane. Runs independently of the
+            # Unicode sessions_fts above; an unknown same-name object fails
+            # closed (never deleted).
             sessions_trigram_ok = self._ensure_sessions_trigram_fts_schema(
                 cursor
             )

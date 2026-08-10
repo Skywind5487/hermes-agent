@@ -1060,12 +1060,59 @@ class TestTokenizerAbsent:
         finally:
             r2.close()
 
+    def test_healthy_modern_quarantined_on_no_trigram_host(self, tmp_path, monkeypatch):
+        """Round-12 P1: a HEALTHY exact-modern target (no stale breadcrumb)
+        on a runtime without the trigram tokenizer must be QUARANTINED — the
+        stale breadcrumb is set and the owned modern triggers are dropped so
+        canonical `sessions` writes keep working; a capable reopen recovers
+        from canonical rows."""
+        db_path = tmp_path / "p1.db"
+        _build_healthy_complete_modern_db(db_path, n=2)
+        # No stale marker — this is the healthy-modern case that used to leave
+        # the live triggers behind (breaking later canonical writes).
+        with monkeypatch.context() as m:
+            m.setattr(
+                SessionDB,
+                "_fts_table_probe",
+                lambda self, cursor, table: None,
+            )
+            r = SessionDB(db_path=db_path)
+            try:
+                assert r._sessions_trigram_available is False
+                # Quarantine side effects: stale breadcrumb set, owned modern
+                # triggers dropped so canonical writes survive.
+                assert r.get_meta(FTS_SESSION_TRIGRAM_STALE_KEY) == "1"
+                for name in _MODERN_TRIGGER_NAMES:
+                    assert r._conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                        "AND name = ?",
+                        (name,),
+                    ).fetchone() is None, name
+                # Canonical session INSERT succeeds (no FTS trigger poisoning).
+                r.create_session("postq", source="cli")
+            finally:
+                r.close()
+        # Patch undone → capable reopen recovers from canonical rows and the
+        # rebuild eventually completes normally.
+        r2 = SessionDB(db_path=db_path)
+        try:
+            assert r2._sessions_trigram_available is True
+            assert r2.get_meta(FTS_SESSION_TRIGRAM_STALE_KEY) is None
+            while r2.fts_session_trigram_rebuild_step():
+                pass
+            assert r2.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert _trigram_docsize_count(r2) == 3  # 2 original + postq
+            _assert_trigram_integrity(r2)
+        finally:
+            r2.close()
+
     def test_failed_opener_cannot_erase_peer_claim(self, tmp_path, monkeypatch):
         """R11-C2-R3: a deterministic incapable→capable interleaving proving
         a failed opener cannot erase a capable peer's successful claim. A
-        tokenizer-incapable reopen of a modern target (probe fails) leaves the
-        peer's durable H/P and modern root untouched; a later capable open
-        still completes the rebuild."""
+        tokenizer-incapable reopen of a modern target (probe fails) now
+        QUARANTINES it (stale set + owned triggers dropped, round-12 P1) but
+        never touches the peer's durable H/P or modern root; a later capable
+        open still completes the rebuild."""
         db_path = tmp_path / "s.db"
         _build_populated_sessions_db(db_path, n=5)
         # Capable open first: creates the modern root + triggers over the
