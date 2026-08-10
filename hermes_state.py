@@ -2816,14 +2816,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``executescript``, whose implicit COMMIT would break the transaction).
         """
         def _do(conn):
+            # Round-11 P1 #1 (trigram lane): a root-absent DB may carry exact
+            # historical legacy orphan triggers whose bodies would otherwise
+            # survive ``CREATE TRIGGER IF NOT EXISTS`` and leave a modern root
+            # with legacy title-only/text-ID semantics. Drop ONLY exact legacy
+            # orphans under the lock; any foreign occupant fails closed with
+            # zero mutations (the transaction aborts before any DDL runs).
+            if spec.get("drop_legacy_orphan_triggers"):
+                status = self._sessions_trigram_trigger_status(conn)
+                if any(s == "foreign" for s in status.values()):
+                    return False
+                for name in _SESSIONS_TRIGRAM_LEGACY_TRIGGER_NAMES:
+                    if status.get(name) == "exact_legacy":
+                        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
             for stmt in statements:
                 conn.execute(stmt)
             conn.execute(_fts_session_trigram_catchup_sql(spec))
+            return True
         # Schema-init bookkeeping must not advance the routine-write merge
         # cadence (the write-path cadence test asserts exact boundaries).
         before = self._write_count
         try:
-            self._execute_write(_do)
+            result = self._execute_write(_do)
         except sqlite3.OperationalError as exc:
             if self._is_fts5_unavailable_error(exc):
                 self._warn_fts5_unavailable(exc)
@@ -2834,7 +2848,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise
         finally:
             self._write_count = before
-        return True
+        return bool(result)
 
     # ── #30 normalized external-content session trigram ─────────────────
     # Modern ``sessions_fts_trigram`` (FTS5 ``tokenize='trigram'``
@@ -3007,9 +3021,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         - legacy root — present legacy triggers must be ``exact_legacy`` or
           absent; modern-only ``_update_before`` / ``_update_after`` must be
           absent; any foreign → fail closed.
-        - root absent — any foreign trigger occupant → fail closed (exact
-          Hermes orphans are deliberately tolerated: the transition's
-          ``CREATE TRIGGER IF NOT EXISTS`` no-ops over them).
+        - root absent — any foreign trigger occupant → fail closed. Exact
+          historical legacy orphans are permitted here ONLY because the fresh
+          schema transition drops them under its own lock before installing
+          the modern triggers (round-11 P1 #1); they must never survive into
+          the modern root.
         """
         status = SessionDB._sessions_trigram_trigger_status(cursor)
         foreign = sorted(n for n, s in status.items() if s == "foreign")
@@ -3201,10 +3217,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # fresh modern root could not be created here.
                 return "refused"
             # ── Preflight trash destination collisions ──
+            # The RENAME target namespace is the shared table/view/index
+            # namespace — a same-name VIEW or INDEX would collide inside the
+            # destructive transaction and turn a fail-closed state into an
+            # exception (round-11 P2 #1).
             for sh in SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES:
                 existing = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                    "AND name = ?",
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type IN ('table', 'view', 'index') AND name = ?",
                     (f"fts_v22_trash_{sh}",),
                 ).fetchone()
                 if existing is not None:

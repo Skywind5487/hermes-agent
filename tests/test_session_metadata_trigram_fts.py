@@ -22,6 +22,7 @@ from hermes_state_common import (
     FTS_SESSION_TRIGRAM_STALE_KEY,
     MAX_FTS5_QUERY_CHARS,
     SESSIONS_FTS_TRIGRAM_SQL,
+    SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES,
     SESSION_METADATA_COMPACT_SEPARATORS,
     compact_session_metadata_text,
 )
@@ -2227,5 +2228,162 @@ class TestQueryCap:
             # The bounded prefix ("Titlezzz...") is not a trigram phrase in
             # any compacted title → zero hits, NOT a failure.
             assert hits2 == []
+        finally:
+            r.close()
+
+
+# =========================================================================
+# Round-11 commit 1 — transition namespace / trash-destination hardening
+# =========================================================================
+
+
+def _build_legacy_orphan_triggers_db(db_path):
+    """Root ABSENT but exact historical legacy orphan triggers survive on
+    ``sessions`` (the root was removed earlier; the triggers, attached to
+    ``sessions``, were not). The fresh transition must drop ONLY these exact
+    legacy orphans under its own lock before installing the modern root /
+    triggers (round-11 P1 #1)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at, title) "
+        "VALUES (1, 'A', 'cli', ?, 'Alpha')",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, tokenize='trigram')"
+    )
+    # The three exact historical legacy triggers (attached to sessions).
+    conn.executescript(
+        """
+        CREATE TRIGGER sessions_fts_trigram_insert AFTER INSERT ON sessions BEGIN
+            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+        END;
+        CREATE TRIGGER sessions_fts_trigram_delete AFTER DELETE ON sessions BEGIN
+            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER sessions_fts_trigram_update AFTER UPDATE ON sessions BEGIN
+            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+        END;
+        """
+    )
+    # Remove the root + its shadows, leaving ONLY the orphan triggers.
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute(
+        "DELETE FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'sessions_fts_trigram'"
+    )
+    conn.execute("PRAGMA writable_schema=RESET")
+    for sh in SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {sh}")
+    conn.commit()
+    conn.close()
+
+
+def _build_legacy_orphan_mixed_foreign_db(db_path):
+    """Root ABSENT with exact legacy orphans PLUS one foreign same-name
+    trigger — the mixed namespace must fail closed (no mutation)."""
+    _build_legacy_orphan_triggers_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DROP TRIGGER sessions_fts_trigram_insert")
+    conn.execute(
+        "CREATE TRIGGER sessions_fts_trigram_insert "
+        f"AFTER INSERT ON sessions BEGIN {_FOREIGN_TRIGGER_BODY}; END"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_legacy_simple_trash_view_db(db_path):
+    """Exact legacy simple root with a VIEW occupying one of the trash
+    destination names (``fts_v22_trash_sessions_fts_trigram_data``). The
+    demotion trash preflight must see the shared namespace (round-11 P2 #1)
+    and refuse instead of colliding inside the destructive transaction."""
+    _build_legacy_simple_sessions_trigram_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE VIEW fts_v22_trash_sessions_fts_trigram_data AS "
+        "SELECT 1 AS x"
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestTransitionNamespaces:
+    def test_root_absent_legacy_orphan_triggers_converge(self, tmp_path):
+        """R11-C1-R1: root absent + exact legacy insert/delete/update orphans
+        → open converges to modern, all four modern trigger identities exact,
+        legacy-only ``update`` absent, and a normal session INSERT/UPDATE
+        succeeds and is indexed."""
+        db_path = tmp_path / "orphan.db"
+        _build_legacy_orphan_triggers_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            # Modern root landed.
+            assert "tokenize='trigram'" in _fts_sql(
+                r._conn, "sessions_fts_trigram"
+            )
+            # All four modern triggers are exact; legacy-only update absent.
+            status = r._sessions_trigram_trigger_status(r._conn)
+            for name in _MODERN_TRIGGER_NAMES:
+                assert status[name] == "exact_modern", name
+            assert status.get("sessions_fts_trigram_update") == "absent"
+            # A normal INSERT + UPDATE succeeds and indexes.
+            r.create_session("post", source="cli")
+            r._conn.execute(
+                "UPDATE sessions SET title = 'Post Row' WHERE id = 'post'"
+            )
+            r._conn.commit()
+            ok, hits = r._fts_session_trigram_candidates("Post")
+            assert ok is True
+            assert any(h["id"] == "post" for h in hits)
+        finally:
+            r.close()
+
+    def test_root_absent_mixed_foreign_trigger_fail_closed(self, tmp_path):
+        """R11-C1-R2: root absent + mixed exact-legacy + one foreign
+        same-name trigger → no mutation / fail closed."""
+        db_path = tmp_path / "mixed.db"
+        _build_legacy_orphan_mixed_foreign_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            # No modern root was created; no claim staged.
+            assert _fts_sql(r._conn, "sessions_fts_trigram") == ""
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            # The foreign trigger survives untouched.
+            sql = r._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = 'sessions_fts_trigram_insert'"
+            ).fetchone()
+            assert sql is not None and _FOREIGN_TRIGGER_BODY.split()[0] in sql[0]
+        finally:
+            r.close()
+
+    def test_legacy_demotion_trash_view_refused(self, tmp_path):
+        """R11-C1-R3: exact legacy root + trash destination occupied by a
+        VIEW → demotion returns refused, legacy root/triggers/shadows
+        untouched, no H/P mutation, open does not raise."""
+        db_path = tmp_path / "tv.db"
+        _build_legacy_simple_trash_view_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            # Legacy root NOT demoted; foreign VIEW survives.
+            assert r._classify_sessions_fts_trigram(r._conn) == "legacy_simple"
+            assert "tokenize='simple'" in _fts_sql(
+                r._conn, "sessions_fts_trigram"
+            )
+            obj = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'fts_v22_trash_sessions_fts_trigram_data'"
+            ).fetchone()
+            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "view"
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
         finally:
             r.close()
