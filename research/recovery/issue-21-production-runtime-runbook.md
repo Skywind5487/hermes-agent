@@ -6,6 +6,16 @@ Research basis: `research/recovery/issue-41-production-gateway-runtime-attestati
 
 This is the execution artifact produced by #41. It is intentionally separate from the evidence note so the operational sequence can be reviewed as code-like material.
 
+> **Corrections (from execution review, 2026-08-10).** Two findings were confirmed
+> and fixed so the runbook runs to completion and proves the runtime that would
+> actually launch: (1) the Phase 4 instrumentation checksum check now compares
+> only the checksum column (a literal `diff` of the full `sha256sum` lines always
+> fails because the path columns differ); (2) Phase 0 now uses `tmux kill-server`
+> because tmux session environments come from the server's frozen global env, so a
+> surviving server could pin the OLD runtime selector — and Phase 6b adds a
+> non-Gateway E2E proof that the selector reaches the tmux pane. See
+> `research/recovery/issue-21-production-runtime-execution.md` (execution record).
+
 ## Goal
 
 Replace only the vulnerable SQLite-bearing **owner runtime** while preserving:
@@ -45,9 +55,14 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 RUN="$HERMES_HOME/runtime-repair-$STAMP"
 mkdir -p "$RUN"
 
-# Prevent watchdog recreation, then terminate any already-existing tmux Gateway.
+# Prevent watchdog recreation, then terminate the ENTIRE tmux server (all sessions).
+# kill-server (not just `kill-session`) is required: a surviving tmux server keeps
+# its global environment frozen from server start, and tmux only imports a fixed
+# update-environment list (DISPLAY, SSH_*, ...) from the client — NOT
+# HERMES_OWNER_RUNTIME_ROOT. A stale server would pin the OLD runtime selector at
+# a later Gateway start. Fresh server => next session captures the systemd env.
 printf '0\n' > "$HERMES_HOME/hermes-enabled"
-tmux kill-session -t hermes 2>/dev/null || true
+tmux kill-server 2>/dev/null || true
 
 # Stop and disable the system service. ExecStop can be non-zero if tmux is absent.
 sudo systemctl disable hermes-gateway.service
@@ -267,10 +282,18 @@ sha256sum \
   "$NEW/Modules/_sqlite/cursor.h" \
   | tee "$RUN/new-owner-sqlite-source.sha256"
 
-diff -u "$RUN/owner-sqlite-source.sha256" "$RUN/new-owner-sqlite-source.sha256"
+# Compare ONLY the checksum column: the path columns differ between OLD and NEW by
+# design, so a literal `diff` of the full lines always reports differences even
+# when every hash is identical (which, under `set -e`, would abort the run).
+diff -u \
+  <(cut -d' ' -f1 "$RUN/owner-sqlite-source.sha256") \
+  <(cut -d' ' -f1 "$RUN/new-owner-sqlite-source.sha256") \
+  && echo 'OWNER-INSTRUMENTATION: source checksums UNCHANGED between OLD and NEW (OK)'
 ```
 
-The file paths in the checksum output differ, so a textual `diff` may show path-only differences. Compare the checksum column; any content checksum change is a stop condition.
+The file paths in the checksum output differ, so a literal textual `diff` on the
+full lines ALWAYS differs (path-only); the command above compares only the
+checksum column. Any content checksum change is a stop condition.
 
 ---
 
@@ -431,6 +454,37 @@ fi
 
 Leave `~/.hermes/hermes-enabled` at `0` and the unit disabled. **#21 ends before Gateway start.**
 
+### Phase 6b — E2E tmux selector proof (without starting Gateway)
+
+Proves the selector reaches the tmux pane exactly as `hermes-tmux.sh` will create
+the `hermes` session (fresh server after Phase 0 `kill-server`, env from the
+systemd watchdog). Throwaway session; Gateway is not started.
+
+```bash
+export HERMES_OWNER_RUNTIME_ROOT="$NEW"
+
+echo '=== systemd env selector (source) ==='
+sudo systemctl show hermes-gateway.service -p Environment \
+  | tr ' ' '\n' | grep '^HERMES_OWNER_RUNTIME_ROOT=' || echo '(not set)'
+
+PROBE_SESSION=hermes-envprobe
+PROBE_OUT="$RUN/tmux-e2e-env.txt"
+rm -f "$PROBE_OUT"
+
+tmux new-session -d -s "$PROBE_SESSION" \
+  'printf "pane_hermes_owner_runtime_root=%s\n" "$HERMES_OWNER_RUNTIME_ROOT" > "$RUN/tmux-e2e-env.txt"'
+sleep 1
+cat "$PROBE_OUT"
+tmux kill-server 2>/dev/null || true
+
+if grep -q "pane_hermes_owner_runtime_root=$NEW" "$PROBE_OUT"; then
+  echo 'E2E-TMUX: fresh-server pane sees HERMES_OWNER_RUNTIME_ROOT == NEW (OK)'
+else
+  echo 'STOP: HERMES_OWNER_RUNTIME_ROOT did not reach the pane as NEW' >&2
+  exit 1
+fi
+```
+
 ---
 
 ## Phase 7 — final attestation
@@ -484,6 +538,7 @@ Repeat the Phase 0 `/proc/*/fd` scan. It must still show no state/recovery DB op
 [ ] service disabled/inactive; no tmux Gateway
 [ ] no state/recovery DB open
 [ ] systemd service selects NEW via HERMES_OWNER_RUNTIME_ROOT
+[ ] tmux pane E2E sees NEW selector (Phase 6b)
 [ ] OLD remains intact and available for rollback
 [ ] exact NEW Python path/hash recorded
 [ ] exact SQLite version and sqlite_source_id recorded
@@ -508,7 +563,7 @@ Rollback only changes the dormant service selector. It does not touch any DB.
 ```bash
 set -euo pipefail
 printf '0\n' > "$HERMES_HOME/hermes-enabled"
-tmux kill-session -t hermes 2>/dev/null || true
+tmux kill-server 2>/dev/null || true
 sudo systemctl stop hermes-gateway.service || true
 
 DROPIN=/etc/systemd/system/hermes-gateway.service.d/20-owner-runtime.conf
