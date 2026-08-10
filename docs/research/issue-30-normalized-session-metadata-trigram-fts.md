@@ -1,6 +1,6 @@
 # #30 implementation — normalized external-content session trigram FTS
 
-Status: **implemented (2026-08-09); scope-corrected (2026-08-11)**  
+Status: **implemented (2026-08-09); scope-corrected (2026-08-11); re-reviewed (2026-08-10→12)**  
 Code base: **`e94f2630a50d7585f78cfc06365753c033113cb9`** (#25 / PR #59 merge, per the #34 handoff)  
 Branch: `fts/session-trigram-external-content`
 
@@ -14,6 +14,50 @@ Branch: `fts/session-trigram-external-content`
 > `allow_legacy_shadows`, `drop_legacy_orphan_triggers`) was therefore
 > removed in `c7163001f` (tests in `2142e2fa1`). Only the modern trigram lane
 > remains.
+
+> **Round-12 re-review (2026-08-10, comment `5240949473` supersedes
+> `5240412376`; implemented in `10e3419d1` + `69591fe65`).** The reviewer re-applied
+> the corrected #30 source of truth with the rule "only defend states the
+> final modern lane can actually create" and asked for **one real capability
+> fix plus a large subtraction of review-driven hardening** — not more
+> hardening. Net base→HEAD is now strongly subtractive (+134 / -502).
+>
+> - **P1 (fixed): healthy exact-modern target on a no-trigram runtime was
+>   left with live triggers.** A healthy modern reopen (no stale breadcrumb,
+>   exact triggers) probed via the generic `_ensure_fts_schema` which returns
+>   unavailable without quarantining — a later canonical `sessions` write
+>   could fail inside the live triggers with `no such tokenizer: trigram`.
+>   The `modern_trigram` branch now probes the exact modern root directly
+>   (`_fts_table_probe`); `None` → reuse `_sessions_trigram_quarantine()`
+>   (stale set + owned triggers dropped, canonical writes survive); `True` →
+>   orphan-empty check → serve. No new marker / state. The previous
+>   fresh-create foreign-DDL TOCTOU P1 was **withdrawn** — no CAS added for a
+>   hypothetical concurrent manual schema rewrite.
+> - **P2 (merge-blocking, deleted): Round-10/11 defended unsupported post-open
+>   schema damage.** Deleted: `SessionTrigramOwnershipLost`, the
+>   `write_guard` spec key + branches in the shared `_fts_rebuild_finish` /
+>   `fts_rebuild_step`, `_sessions_trigram_owned_servable()`,
+>   `_sessions_trigram_require_owned_modern_for_write()`,
+>   `SESSIONS_TRIGRAM_MODERN_SHADOW_TABLES` + `_sessions_trigram_shadow_collision()`
+>   (a transaction rollback cannot leave the fresh FTS shadows), and the
+>   "modern trigger missing **without** stale → full stale rebuild" path
+>   (final #30 never creates it — fail closed instead).
+>   `_ensure_sessions_trigram_fts_schema_depth(cursor, depth)` collapsed back
+>   into `_ensure_sessions_trigram_fts_schema(cursor)`. Corresponding tests
+>   (`TestWriteAuthorizationCAS`, `TestShadowNamespacePreflight`,
+>   `test_modern_missing_trigger_stale_rebuild`) and their fixtures were
+>   removed; one new P1 regression
+>   (`test_healthy_modern_quarantined_on_no_trigram_host`) was added. The
+>   open state machine is now: unknown root/source/foreign trigger →
+>   unavailable; root absent → ensure VIEW → seed/reuse H/P → atomic modern
+>   create; root modern → stale ? capable-recover/incapable-quarantine :
+>   (trigger set not exact → unavailable) : (tokenizer missing → quarantine) :
+>   (orphan-empty → available).
+> - Kept untouched (direct acceptance-criterion owners): exact stored
+>   DDL/source/trigger identity, literal-safe identity comparison,
+>   independent H/P, shared #25 chunk/finish primitives, missing-P +
+>   orphan-empty repair, stale breadcrumb, capability recovery, one-snapshot
+>   candidate/gap lane.
 
 ## What was built
 
