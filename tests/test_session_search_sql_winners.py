@@ -981,3 +981,51 @@ def test_sql_winners_candidates_inspected_counts_distinct_owners(db):
     assert result["stats"]["candidate_unique_sessions"] == 2  # distinct owners
     assert result["stats"]["lineage_candidates_inspected"] == 2  # not 3
     assert len(result["winners"]) == 2
+
+
+def test_sql_winners_displayable_anchor_ordering_not_live_rank(db):
+    # Winner ordering follows the rank of each owner's FIRST DISPLAYABLE
+    # anchor.  With K=1 and 'cur-live(#1) -> other(#2) -> cur-compacted(#3)',
+    # the higher-ranked displayable 'other' must win — cur's live #1 hit is
+    # current-excluded and must NOT let cur's later compacted anchor jump
+    # ahead of a genuinely higher-ranked winner.
+    db.create_session("cur", source="cli")
+    compacted_id = _message(db, "cur", "old compacted needle")
+    db.archive_and_compact("cur", [{"role": "assistant", "content": "summary"}])
+    live_id = _message(db, "cur", "new live needle")
+    _create(db, "other-s", source="cli")
+    other_id = _message(db, "other-s", "needle other")
+    now = time.time()
+    # newest-first: cur-live(#1) -> other(#2) -> cur-compacted(#3)
+    db._conn.execute("UPDATE messages SET timestamp = ? WHERE id = ?", (now - 100, live_id))
+    db._conn.execute("UPDATE messages SET timestamp = ? WHERE id = ?", (now - 200, other_id))
+    db._conn.execute("UPDATE messages SET timestamp = ? WHERE id = ?", (now - 300, compacted_id))
+    db._conn.commit()
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=1, sort="newest",
+        current_session_id="cur",
+    )
+    winners = result["winners"]
+    assert len(winners) == 1
+    assert winners[0]["session_id"] == "other-s"
+    assert winners[0]["id"] == other_id
+
+
+def test_sql_winners_title_is_current_session_unproven_contract(db, monkeypatch):
+    # When the exact-title session IS the current session on a >B chain, the
+    # snapshot cannot prove it is a distinct lineage: stats report no
+    # title/current root, bound-hit is set, and no fabricated winner survives.
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 4)
+    ids = _chain_sessions(db, "self", 6)
+    _message(db, ids[0], "needle title content")
+    _link_positive_chain(db, ids)
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5,
+        current_session_id=ids[0], title_session_id=ids[0],
+    )
+    assert result["winners"] == []
+    assert result["stats"]["lineage_bound_hit"] is True
+    assert result["stats"]["lineage_title_root"] is None
+    assert result["stats"]["lineage_current_root"] is None

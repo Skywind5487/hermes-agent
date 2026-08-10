@@ -945,8 +945,9 @@ class TestCompressionRootToolParity:
     def test_title_only_limit_one_surfaces_bound_exhaustion(self, db, monkeypatch):
         """A title-only K=1 search must still run the winner phase with the raw
         current/title ids.  If the snapshot cannot prove the title is a
-        distinct lineage (current chain deeper than B), the answer is
-        truncated, not a complete 'title matched' (#68 review round-2)."""
+        distinct lineage (current chain deeper than B), the title is NOT a
+        safe winner and must be dropped — the answer is truncated, never a
+        complete 'title matched' (#68 review round-2/3)."""
         import hermes_state_search
         monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 4)
         # current session is the tip of a compression chain deeper than B
@@ -977,9 +978,54 @@ class TestCompressionRootToolParity:
         ))
 
         assert result["success"] is True
-        # the title is still returned, but B exhaustion is surfaced: this is
-        # an incomplete answer, never a complete top-K / no-match
-        assert result["count"] == 1
+        # B exhaustion is surfaced and the unproven title is dropped: this is
+        # an incomplete answer (safe prefix only), never a complete top-K.
+        assert result["count"] == 0
+        assert result["results"] == []
+        assert result.get("truncated") is True
+        assert "warning" in result
+
+    def test_title_equal_to_current_session_dropped_when_unproven(self, db, monkeypatch):
+        """When the exact-title session IS the current session (on a >B chain)
+        and the tool-side resolver cannot prove lineage, the winner snapshot
+        also cannot — the title is NOT a proven-safe winner and must be
+        dropped, not returned as the current session (#68 review round-3)."""
+        import hermes_state_search
+        monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 4)
+        # simulate tool-side B exhaustion (production: a >2000 chain makes the
+        # public resolver return None)
+        monkeypatch.setattr(
+            SessionDB, "resolve_compression_lineage",
+            lambda self, session_id, **kwargs: None,
+        )
+        for i in range(6):
+            db.create_session(f"cur-{i}", source="cli")
+        for i in range(5):
+            child, parent = f"cur-{i}", f"cur-{i + 1}"
+            db._conn.execute("PRAGMA foreign_keys = OFF")
+            db._conn.execute(
+                "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+                (parent, child),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+                (parent,),
+            )
+            db._conn.commit()
+            db._conn.execute("PRAGMA foreign_keys = ON")
+        db.set_session_title("cur-0", "needle-title")
+        db.append_message("cur-0", role="user",
+                          content="needle-title content")
+
+        result = json.loads(session_search(
+            query="needle-title", db=db, limit=3,
+            current_session_id="cur-0",
+        ))
+
+        assert result["success"] is True
+        # the current session is never a safe result; B exhaustion surfaces
+        assert result["count"] == 0
+        assert result["results"] == []
         assert result.get("truncated") is True
         assert "warning" in result
 

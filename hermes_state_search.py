@@ -2042,6 +2042,8 @@ class SessionSearchMixin:
             "lineage_memo_entries": 0,
             "lineage_candidates_inspected": 0,
             "lineage_bound_hit": False,
+            "lineage_title_root": None,
+            "lineage_current_root": None,
             "route": "none",
         }}
         if not self._fts_enabled or not query or not query.strip():
@@ -2316,6 +2318,8 @@ class SessionSearchMixin:
                             "lineage_memo_entries": 0,
                             "lineage_candidates_inspected": 0,
                             "lineage_bound_hit": False,
+                            "lineage_title_root": None,
+                            "lineage_current_root": None,
                             "route": route,
                         },
                     }
@@ -2335,7 +2339,11 @@ class SessionSearchMixin:
                 # the title slot and the content lane share one root meaning
                 # (#68 review finding 1).  Full exclusion: the title already
                 # occupies its slot, its lineage members must not duplicate it.
+                # resolved_title_root is reported so the tool can decide whether
+                # the title result itself is a PROVEN safe winner (distinct
+                # from the current lineage) or must be dropped on B exhaustion.
                 excluded_roots = {str(root) for root in excluded_lineage_roots}
+                resolved_title_root: Optional[str] = None
                 if title_session_id:
                     outcome = self._resolve_compression_lineage_on_conn(
                         conn, str(title_session_id), state
@@ -2345,9 +2353,11 @@ class SessionSearchMixin:
                     elif outcome is _UNRESOLVED:
                         excluded_roots.add(str(title_session_id))
                     else:
+                        resolved_title_root = outcome
                         excluded_roots.add(outcome)
 
                 current_root: Optional[str] = None
+                resolved_current_root: Optional[str] = None
                 current_ancestors: set = set()
                 if current_session_id:
                     # Re-resolve the raw current identity inside this winner
@@ -2361,17 +2371,20 @@ class SessionSearchMixin:
                     elif outcome is _UNRESOLVED:
                         # Conservative: an unresolved current session excludes
                         # only its own id rather than broadening exclusion to
-                        # an unproven ancestor.
+                        # an unproven ancestor.  resolved_current_root stays
+                        # None — the snapshot cannot prove lineage distinctness.
                         current_root = str(current_session_id)
                     else:
+                        resolved_current_root = outcome
                         current_root = outcome
-                    current_ancestors = (
-                        self._current_lineage_ancestors_on_conn(
-                            conn, str(current_session_id), state
+                        current_ancestors = (
+                            self._current_lineage_ancestors_on_conn(
+                                conn, str(current_session_id), state
+                            )
                         )
-                    )
                 elif current_lineage_root:
                     current_root = str(current_lineage_root)
+                    resolved_current_root = current_root
 
                 def _is_archived(candidate: Dict[str, Any]) -> bool:
                     """True when a hit's content left the live context."""
@@ -2380,71 +2393,65 @@ class SessionSearchMixin:
                         or int(candidate["message_compacted"] or 0) == 1
                     )
 
-                # Ranked DISTINCT owner candidates (frozen #68 pipeline): group
-                # the bounded raw hits by owning session with each owner's hits
-                # in rank order, then resolve each owner exactly ONCE.  From the
-                # owner's ranked hits pick the first displayable anchor — under
-                # current exclusion a live hit is skipped so the next
-                # compacted-history hit of the same owner still surfaces
-                # (compacted history is never erased by owner dedupe).
-                owner_hits: Dict[str, List[Dict[str, Any]]] = {}
-                owner_order: List[str] = []
+                # Resolve each owner exactly ONCE (lazily, on first encounter)
+                # while iterating the bounded raw hits in rank order.  Winner
+                # ordering therefore follows the rank of each owner's FIRST
+                # DISPLAYABLE anchor — a live current-lineage hit is skipped so
+                # a later compacted-history hit of the same owner can still
+                # surface, but it must not let that owner jump ahead of a
+                # higher-ranked displayable winner from another session (#68
+                # review round-3: ranking/winner ordering unchanged).
+                owner_resolved: set = set()
+                owner_root: Dict[str, Optional[str]] = {}
                 for candidate in candidates:
-                    owner = str(candidate["owning_session_id"])
-                    if owner not in owner_hits:
-                        owner_hits[owner] = []
-                        owner_order.append(owner)
-                    owner_hits[owner].append(candidate)
-
-                for owner in owner_order:
                     if len(winners) >= result_limit:
                         break
-                    state.candidates_inspected += 1
-                    outcome = self._resolve_compression_lineage_on_conn(
-                        conn, owner, state
-                    )
-                    if outcome is _BUDGET_EXHAUSTED:
-                        state.bound_hit = True
-                        # Stop the entire ranked scan: the bound candidate may
-                        # have produced a higher-ranked new root than every
-                        # later candidate, so skipping it would violate ranking.
-                        break
-                    if outcome is _UNRESOLVED:
+                    owner = str(candidate["owning_session_id"])
+                    if owner not in owner_resolved:
+                        owner_resolved.add(owner)
+                        state.candidates_inspected += 1
+                        outcome = self._resolve_compression_lineage_on_conn(
+                            conn, owner, state
+                        )
+                        if outcome is _BUDGET_EXHAUSTED:
+                            state.bound_hit = True
+                            # Stop the entire ranked scan: the bound candidate
+                            # may have produced a higher-ranked new root than
+                            # every later candidate, so skipping it would
+                            # violate ranking.
+                            break
+                        owner_root[owner] = (
+                            outcome if outcome is not _UNRESOLVED else None
+                        )
+                    root = owner_root[owner]
+                    if root is None:
                         continue
-                    root = outcome
-                    if root in excluded_roots:
-                        continue
-                    if root in seen_roots:
+                    if root in excluded_roots or root in seen_roots:
                         continue
                     in_current_context = (
                         (current_root is not None and root == current_root)
                         or owner in current_ancestors
                     )
-                    anchor: Optional[Dict[str, Any]] = None
-                    for hit in owner_hits[owner]:
-                        if in_current_context and not _is_archived(hit):
-                            # live content of the current lineage stays hidden;
-                            # a later compacted-history hit of this owner is
-                            # still tried as the anchor.
-                            continue
-                        anchor = hit
-                        break
-                    if anchor is None:
+                    if in_current_context and not _is_archived(candidate):
+                        # live content of the current lineage stays hidden; the
+                        # owner's displayable anchor is a later compacted hit,
+                        # so this hit does not (yet) produce a winner.
                         continue
+                    # First displayable hit of this owner in rank order.
                     seen_roots.add(root)
                     state.accepted_roots = len(seen_roots)
                     winners.append({
-                        "id": anchor["message_id"],
+                        "id": candidate["message_id"],
                         "session_id": owner,
-                        "role": anchor["role"],
-                        "snippet": anchor["snippet"],
-                        "timestamp": anchor["timestamp"],
-                        "source": anchor["source"],
-                        "model": anchor["model"],
-                        "session_started": anchor["session_started"],
+                        "role": candidate["role"],
+                        "snippet": candidate["snippet"],
+                        "timestamp": candidate["timestamp"],
+                        "source": candidate["source"],
+                        "model": candidate["model"],
+                        "session_started": candidate["session_started"],
                         "lineage_root_id": root,
-                        "candidate_order": anchor["candidate_order"],
-                        "source_priority": anchor["source_priority"],
+                        "candidate_order": candidate["candidate_order"],
+                        "source_priority": candidate["source_priority"],
                     })
 
                 if route != "like" and winners:
@@ -2477,6 +2484,8 @@ class SessionSearchMixin:
                     "lineage_memo_entries": len(state.memo),
                     "lineage_candidates_inspected": state.candidates_inspected,
                     "lineage_bound_hit": state.bound_hit,
+                    "lineage_title_root": resolved_title_root,
+                    "lineage_current_root": resolved_current_root,
                     "route": route,
                 }
             finally:

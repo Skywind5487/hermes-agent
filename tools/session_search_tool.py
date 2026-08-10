@@ -779,6 +779,18 @@ def _discover(
     _raw_hits = int(winner_stats.get("candidate_count", 0))
     _unique_raw_sessions = int(winner_stats.get("candidate_unique_sessions", 0))
     _truncated = bool(winner_stats.get("lineage_bound_hit"))
+    # A title result is only a SAFE winner when the winner snapshot PROVED it
+    # is a distinct lineage from the current session.  When the snapshot could
+    # not resolve both identities (B exhaustion / unresolved), the title may
+    # actually BE the current session (e.g. it sits on a >B compression chain)
+    # — returning it would violate current-session exclusion and the #68
+    # bound-hit contract ("only already-proven safe winners").  Drop it so a
+    # B-limited answer is never packaged as a complete title match.
+    if title_result and current_session_id:
+        title_root = winner_stats.get("lineage_title_root")
+        current_root = winner_stats.get("lineage_current_root")
+        if not (title_root and current_root) or title_root == current_root:
+            title_result = None
     _order_ms = 0
 
     if not winner_rows and not title_result:
