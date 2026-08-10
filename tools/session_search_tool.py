@@ -741,17 +741,19 @@ def _discover(
 
     _title_t0 = time.perf_counter()
     title_result = _title_match_result(db, query, current_lineage_root)
+    title_lineage = title_result.get("_lineage_root") if title_result else None
     _title_ms = (time.perf_counter() - _title_t0) * 1000
 
+    excluded_lineages = (title_lineage,) if title_lineage else ()
     _search_t0 = time.perf_counter()
     try:
         # Always run the winner phase — even when an exact-title result already
-        # fills the only slot (result_limit becomes 0) — so the RAW current and
-        # title session ids are re-resolved inside one snapshot with the SAME
-        # memo/state/budget used for candidate roots (#68).  A title-only K=1
-        # search must still surface B exhaustion: if the snapshot cannot prove
-        # the title is a distinct lineage, the answer is truncated, not a
-        # complete "title matched".
+        # fills the only slot (result_limit becomes 0) — so the current session
+        # is still re-resolved inside the winner snapshot and a title-only K=1
+        # search surfaces B exhaustion instead of silently claiming a complete
+        # answer.  Exact-title exclusion uses the same compression-lineage
+        # implementation: the title lineage is resolved here with
+        # resolve_compression_lineage() and passed as excluded_lineage_roots.
         winner_response = db.search_session_winners(
             query=query,
             role_filter=role_list,
@@ -759,10 +761,8 @@ def _discover(
             candidate_limit=_DISCOVER_SCAN_LIMIT,
             result_limit=max(0, limit - (1 if title_result else 0)),
             sort=sort,
+            excluded_lineage_roots=excluded_lineages,
             current_session_id=current_session_id or None,
-            title_session_id=(
-                title_result["session_id"] if title_result else None
-            ),
             request_id=_request_id,
         )
     except Exception as e:
@@ -779,22 +779,6 @@ def _discover(
     _raw_hits = int(winner_stats.get("candidate_count", 0))
     _unique_raw_sessions = int(winner_stats.get("candidate_unique_sessions", 0))
     _truncated = bool(winner_stats.get("lineage_bound_hit"))
-    # A title result is only a SAFE winner when the winner snapshot PROVED it
-    # is a distinct lineage from the current session.  This gate applies ONLY
-    # when the winner phase actually ran the in-snapshot resolution
-    # (lineage_snapshot_ran): when the content FTS lane could not run at all
-    # (FTS unavailable / empty query / MATCH error), the DB early-returns with
-    # no root stats, and title-only discovery is the designed fallback — it
-    # must be preserved, not killed by a gate that never had a chance to prove
-    # anything (#68 review round-4).  When the snapshot DID run but could not
-    # prove the title distinct (B exhaustion / unresolved), or proved it equal,
-    # the title may actually BE the current session — drop it so a B-limited
-    # answer is never packaged as a complete title match.
-    if title_result and current_session_id and winner_stats.get("lineage_snapshot_ran"):
-        title_root = winner_stats.get("lineage_title_root")
-        current_root = winner_stats.get("lineage_current_root")
-        if not (title_root and current_root) or title_root == current_root:
-            title_result = None
     _order_ms = 0
 
     if not winner_rows and not title_result:

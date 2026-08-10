@@ -921,9 +921,11 @@ class TestCompressionRootToolParity:
         assert hit["match_message_id"] != live_id
 
     def test_title_and_content_share_compression_root_in_snapshot(self, db):
-        """Exact-title exclusion is re-resolved in the winner snapshot: a
-        content hit in the title's compression lineage is excluded even though
-        its own session id differs from the title session id."""
+        """Exact-title exclusion resolves the title's compression lineage
+        (same implementation as the winner phase) and excludes it from the
+        content lane: a content hit in the title's compression lineage is
+        excluded even though its own session id differs from the title session
+        id (#68 review round-5)."""
         db.create_session("t_parent", source="cli")
         db.set_session_title("t_parent", "needle-title")
         db.append_message("t_parent", role="user", content="parent filler")
@@ -943,11 +945,11 @@ class TestCompressionRootToolParity:
         assert result.get("truncated") is False
 
     def test_title_only_limit_one_surfaces_bound_exhaustion(self, db, monkeypatch):
-        """A title-only K=1 search must still run the winner phase with the raw
-        current/title ids.  If the snapshot cannot prove the title is a
-        distinct lineage (current chain deeper than B), the title is NOT a
-        safe winner and must be dropped — the answer is truncated, never a
-        complete 'title matched' (#68 review round-2/3)."""
+        """A title-only K=1 search must still run the winner phase with the
+        current session id.  When the current chain is deeper than B the
+        answer is honestly truncated, but the exact-title result is preserved
+        (no proof-gate drops it) — the title lane and the content lane are
+        independent (#68 review round-5)."""
         import hermes_state_search
         monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 4)
         # current session is the tip of a compression chain deeper than B
@@ -978,26 +980,21 @@ class TestCompressionRootToolParity:
         ))
 
         assert result["success"] is True
-        # B exhaustion is surfaced and the unproven title is dropped: this is
-        # an incomplete answer (safe prefix only), never a complete top-K.
-        assert result["count"] == 0
-        assert result["results"] == []
+        # the exact title is preserved; B exhaustion on the current chain is
+        # surfaced as truncation, not as a silently complete answer
+        assert result["count"] == 1
+        assert [r["session_id"] for r in result["results"]] == ["title-session"]
         assert result.get("truncated") is True
         assert "warning" in result
 
-    def test_title_equal_to_current_session_dropped_when_unproven(self, db, monkeypatch):
-        """When the exact-title session IS the current session (on a >B chain)
-        and the tool-side resolver cannot prove lineage, the winner snapshot
-        also cannot — the title is NOT a proven-safe winner and must be
-        dropped, not returned as the current session (#68 review round-3)."""
+    def test_title_equal_to_current_session_excluded_and_truncated(self, db, monkeypatch):
+        """When the exact-title session IS the current session, its title is
+        excluded by the current-lineage guard (a session never surfaces as its
+        own result) — NOT by any proof gate.  The winner phase still runs and
+        honestly surfaces B exhaustion on the >B current chain via truncation
+        (#68 review round-5)."""
         import hermes_state_search
         monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 4)
-        # simulate tool-side B exhaustion (production: a >2000 chain makes the
-        # public resolver return None)
-        monkeypatch.setattr(
-            SessionDB, "resolve_compression_lineage",
-            lambda self, session_id, **kwargs: None,
-        )
         for i in range(6):
             db.create_session(f"cur-{i}", source="cli")
         for i in range(5):
@@ -1023,7 +1020,8 @@ class TestCompressionRootToolParity:
         ))
 
         assert result["success"] is True
-        # the current session is never a safe result; B exhaustion surfaces
+        # current session is never its own result; the >B current chain is
+        # honestly truncated
         assert result["count"] == 0
         assert result["results"] == []
         assert result.get("truncated") is True

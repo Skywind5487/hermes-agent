@@ -2008,7 +2008,6 @@ class SessionSearchMixin:
         lineage_depth_cap: int = 64,
         request_id: str = None,
         current_session_id: Optional[str] = None,
-        title_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Select discovery winners in SQLite without candidate hydration.
 
@@ -2022,10 +2021,12 @@ class SessionSearchMixin:
         contain no full message content and no candidate context; FTS
         snippets are computed only for the final winners.
 
-        ``current_session_id`` / ``title_session_id`` are raw session ids
-        re-resolved inside this snapshot with the SAME memo/state used for
-        candidate roots, so current-session / exact-title exclusion and
-        winner dedupe share one root meaning and one work budget.
+        ``current_session_id`` is a raw session id re-resolved inside this
+        snapshot with the SAME memo/state used for candidate roots, so
+        current-session exclusion and winner dedupe share one root meaning and
+        one work budget.  Exact-title exclusion arrives via
+        ``excluded_lineage_roots`` (resolved by the caller with the same
+        compression-lineage implementation).
 
         ``lineage_depth_cap`` is retained only for caller compatibility; #68
         replaced depth as an identity/safety boundary with a traversal-local
@@ -2042,9 +2043,6 @@ class SessionSearchMixin:
             "lineage_memo_entries": 0,
             "lineage_candidates_inspected": 0,
             "lineage_bound_hit": False,
-            "lineage_snapshot_ran": False,
-            "lineage_title_root": None,
-            "lineage_current_root": None,
             "route": "none",
         }}
         if not self._fts_enabled or not query or not query.strip():
@@ -2282,11 +2280,6 @@ class SessionSearchMixin:
         state = _LineageResolutionState(_LINEAGE_WORK_BUDGET)
         winners: List[Dict[str, Any]] = []
         seen_roots: set[str] = set()
-        # True once the winner phase actually executes the in-snapshot
-        # current/title resolution; stays False for early returns (FTS
-        # unavailable / empty query / MATCH error) so the tool can tell
-        # "snapshot could not prove lineage" from "snapshot never ran".
-        lineage_snapshot_ran = False
 
         with self._read_ctx() as conn:
             started_tx = not conn.in_transaction
@@ -2324,9 +2317,6 @@ class SessionSearchMixin:
                             "lineage_memo_entries": 0,
                             "lineage_candidates_inspected": 0,
                             "lineage_bound_hit": False,
-                            "lineage_snapshot_ran": False,
-                            "lineage_title_root": None,
-                            "lineage_current_root": None,
                             "route": route,
                         },
                     }
@@ -2341,31 +2331,14 @@ class SessionSearchMixin:
                         candidates[0].pop("candidate_unique_sessions", 0)
                     )
 
-                # Exact-title exclusion re-resolves the raw title session id
-                # in-snapshot with the SAME memo/state/budget as candidates, so
-                # the title slot and the content lane share one root meaning
-                # (#68 review finding 1).  Full exclusion: the title already
-                # occupies its slot, its lineage members must not duplicate it.
-                # resolved_title_root is reported so the tool can decide whether
-                # the title result itself is a PROVEN safe winner (distinct
-                # from the current lineage) or must be dropped on B exhaustion.
-                lineage_snapshot_ran = True
+                # Exact-title exclusion arrives as pre-resolved roots in
+                # ``excluded_lineage_roots`` (the caller resolves them with the
+                # same compression-lineage implementation).  Full exclusion:
+                # the title already occupies its slot, so its lineage members
+                # must not duplicate it as content winners.
                 excluded_roots = {str(root) for root in excluded_lineage_roots}
-                resolved_title_root: Optional[str] = None
-                if title_session_id:
-                    outcome = self._resolve_compression_lineage_on_conn(
-                        conn, str(title_session_id), state
-                    )
-                    if outcome is _BUDGET_EXHAUSTED:
-                        state.bound_hit = True
-                    elif outcome is _UNRESOLVED:
-                        excluded_roots.add(str(title_session_id))
-                    else:
-                        resolved_title_root = outcome
-                        excluded_roots.add(outcome)
 
                 current_root: Optional[str] = None
-                resolved_current_root: Optional[str] = None
                 current_ancestors: set = set()
                 if current_session_id:
                     # Re-resolve the raw current identity inside this winner
@@ -2379,11 +2352,9 @@ class SessionSearchMixin:
                     elif outcome is _UNRESOLVED:
                         # Conservative: an unresolved current session excludes
                         # only its own id rather than broadening exclusion to
-                        # an unproven ancestor.  resolved_current_root stays
-                        # None — the snapshot cannot prove lineage distinctness.
+                        # an unproven ancestor.
                         current_root = str(current_session_id)
                     else:
-                        resolved_current_root = outcome
                         current_root = outcome
                         current_ancestors = (
                             self._current_lineage_ancestors_on_conn(
@@ -2392,7 +2363,6 @@ class SessionSearchMixin:
                         )
                 elif current_lineage_root:
                     current_root = str(current_lineage_root)
-                    resolved_current_root = current_root
 
                 def _is_archived(candidate: Dict[str, Any]) -> bool:
                     """True when a hit's content left the live context."""
@@ -2492,9 +2462,6 @@ class SessionSearchMixin:
                     "lineage_memo_entries": len(state.memo),
                     "lineage_candidates_inspected": state.candidates_inspected,
                     "lineage_bound_hit": state.bound_hit,
-                    "lineage_snapshot_ran": lineage_snapshot_ran,
-                    "lineage_title_root": resolved_title_root,
-                    "lineage_current_root": resolved_current_root,
                     "route": route,
                 }
             finally:

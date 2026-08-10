@@ -781,9 +781,11 @@ def _bulk_positive_chain(db, prefix, n, source="cli"):
     return [f"{base}-{i}" for i in range(n)]
 
 
-def test_sql_winners_title_session_excludes_lineage_in_snapshot(db):
-    # title_session_id is re-resolved inside the winner snapshot; its whole
-    # compression lineage is fully excluded from content winners.
+def test_sql_winners_title_root_excludes_compression_lineage(db):
+    # Exact-title exclusion arrives as the title's resolved root in
+    # excluded_lineage_roots (resolved by the caller with the same
+    # compression-lineage implementation): the whole compression lineage is
+    # fully excluded from content winners.
     _create(db, "troot", source="cli")
     _message(db, "troot", "needle title root")
     db.end_session("troot", "compression")
@@ -794,27 +796,11 @@ def test_sql_winners_title_session_excludes_lineage_in_snapshot(db):
 
     result = db.search_session_winners(
         "needle", role_filter=["user"], result_limit=5,
-        title_session_id="tchild",
+        excluded_lineage_roots=("troot",),
     )
+    # both the title root and its compression child are excluded
     assert [row["session_id"] for row in result["winners"]] == ["other"]
     assert result["stats"]["lineage_bound_hit"] is False
-
-
-def test_sql_winners_title_lineage_budget_shared_with_content(db, monkeypatch):
-    # title_session_id consumes the SAME budget as content candidates: a title
-    # lineage deeper than B honestly truncates instead of returning a duplicate
-    # lineage member with a stale/fabricated root.
-    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 4)
-    ids = _chain_sessions(db, "tl", 6)
-    _message(db, ids[0], "needle deep title")
-    _link_positive_chain(db, ids)
-
-    result = db.search_session_winners(
-        "needle", role_filter=["user"], result_limit=5,
-        title_session_id=ids[0],
-    )
-    assert result["stats"]["lineage_bound_hit"] is True
-    assert result["winners"] == []
 
 
 def test_sql_winners_current_lineage_compacted_history_anchor_fallback(db):
@@ -1010,22 +996,3 @@ def test_sql_winners_displayable_anchor_ordering_not_live_rank(db):
     assert len(winners) == 1
     assert winners[0]["session_id"] == "other-s"
     assert winners[0]["id"] == other_id
-
-
-def test_sql_winners_title_is_current_session_unproven_contract(db, monkeypatch):
-    # When the exact-title session IS the current session on a >B chain, the
-    # snapshot cannot prove it is a distinct lineage: stats report no
-    # title/current root, bound-hit is set, and no fabricated winner survives.
-    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 4)
-    ids = _chain_sessions(db, "self", 6)
-    _message(db, ids[0], "needle title content")
-    _link_positive_chain(db, ids)
-
-    result = db.search_session_winners(
-        "needle", role_filter=["user"], result_limit=5,
-        current_session_id=ids[0], title_session_id=ids[0],
-    )
-    assert result["winners"] == []
-    assert result["stats"]["lineage_bound_hit"] is True
-    assert result["stats"]["lineage_title_root"] is None
-    assert result["stats"]["lineage_current_root"] is None
