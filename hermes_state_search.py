@@ -106,12 +106,6 @@ _FTS_SESSION_TRIGRAM_SPEC = {
     "write_guard": lambda self, conn: (
         self._sessions_trigram_require_owned_modern_for_write(conn)
     ),
-    # Round-11 P1 #1: the fresh schema transition drops exact historical
-    # legacy orphan triggers under its own BEGIN IMMEDIATE before installing
-    # the modern triggers (a root-absent DB may carry legacy insert/delete/
-    # update orphans whose bodies would otherwise survive via CREATE TRIGGER
-    # IF NOT EXISTS and leave a modern root with legacy semantics).
-    "drop_legacy_orphan_triggers": True,
     "available": lambda self: getattr(
         self, "_sessions_trigram_available", False
     ),

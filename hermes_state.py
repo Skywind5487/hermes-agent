@@ -66,14 +66,11 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
-    LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION,
-    LEGACY_SESSIONS_TRIGRAM_TRIGGER_SQL,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
     SESSIONS_FTS_SQL,
     SESSIONS_FTS_TRIGRAM_SQL,
-    SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES,
     SESSIONS_TRIGRAM_MODERN_SHADOW_TABLES,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
@@ -359,26 +356,12 @@ _SESSIONS_FTS_TRIGRAM_STATEMENTS = _split_fts_sql_statements(
 # ``source_table`` (the VIEW), which must already exist.
 _SESSIONS_FTS_TRIGRAM_SRC_STATEMENT = _SESSIONS_FTS_TRIGRAM_STATEMENTS[0]
 
-# The historical legacy sessions trigram triggers split into statements (the
-# legacy demotion drops only triggers proven exact-historical).
-_SESSIONS_TRIGRAM_LEGACY_TRIGGER_STATEMENTS = _split_fts_sql_statements(
-    LEGACY_SESSIONS_TRIGRAM_TRIGGER_SQL
-)
-
-# Canonical modern trigger names (2..5 of the modern DDL) and legacy trigger
-# names. ``insert`` / ``delete`` are SHARED between modern and legacy (the
-# bodies differ); ``update`` is legacy-only, ``update_before``/``update_after``
-# are modern-only.
+# Canonical modern trigger names (2..5 of the modern DDL).
 _SESSIONS_TRIGRAM_MODERN_TRIGGER_NAMES = (
     "sessions_fts_trigram_insert",
     "sessions_fts_trigram_delete",
     "sessions_fts_trigram_update_before",
     "sessions_fts_trigram_update_after",
-)
-_SESSIONS_TRIGRAM_LEGACY_TRIGGER_NAMES = (
-    "sessions_fts_trigram_insert",
-    "sessions_fts_trigram_delete",
-    "sessions_fts_trigram_update",
 )
 
 # name -> canonical stored-DDL-normalized declaration, used by the trigger
@@ -389,12 +372,6 @@ _SESSIONS_TRIGRAM_MODERN_TRIGGER_DDL = dict(
     zip(
         _SESSIONS_TRIGRAM_MODERN_TRIGGER_NAMES,
         _SESSIONS_FTS_TRIGRAM_STATEMENTS[2:6],
-    )
-)
-_SESSIONS_TRIGRAM_LEGACY_TRIGGER_DDL = dict(
-    zip(
-        _SESSIONS_TRIGRAM_LEGACY_TRIGGER_NAMES,
-        _SESSIONS_TRIGRAM_LEGACY_TRIGGER_STATEMENTS,
     )
 )
 
@@ -2817,19 +2794,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``executescript``, whose implicit COMMIT would break the transaction).
         """
         def _do(conn):
-            # Round-11 P1 #1 (trigram lane): a root-absent DB may carry exact
-            # historical legacy orphan triggers whose bodies would otherwise
-            # survive ``CREATE TRIGGER IF NOT EXISTS`` and leave a modern root
-            # with legacy title-only/text-ID semantics. Drop ONLY exact legacy
-            # orphans under the lock; any foreign occupant fails closed with
-            # zero mutations (the transaction aborts before any DDL runs).
-            if spec.get("drop_legacy_orphan_triggers"):
-                status = self._sessions_trigram_trigger_status(conn)
-                if any(s == "foreign" for s in status.values()):
-                    return False
-                for name in _SESSIONS_TRIGRAM_LEGACY_TRIGGER_NAMES:
-                    if status.get(name) == "exact_legacy":
-                        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
             for stmt in statements:
                 conn.execute(stmt)
             conn.execute(_fts_session_trigram_catchup_sql(spec))
@@ -2861,43 +2825,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Unicode lane's P (target-specific processed completeness).
 
     @staticmethod
-    def _sessions_trigram_legacy_definition_matches(stored_sql: str) -> bool:
-        """True when the stored root declaration is the canonical historical
-        legacy ``sessions_fts_trigram`` (FTS5, title-only, INTERNAL content,
-        ``tokenize='simple'``) — compared as normalized DDL.
-
-        This is deliberately NOT a PRAGMA table_info check: PRAGMA must
-        CONNECT the FTS5 virtual table, which resolves the declared tokenizer
-        and raises ``no such tokenizer: simple`` on a host without the legacy
-        ``simple`` tokenizer — the exact host the #30 demotion exists to
-        support. The historical shape is unique, so a normalized DDL
-        comparison (stripping ``IF NOT EXISTS`` / trailing ``;`` / all
-        whitespace) is exact and reads the declared columns directly from the
-        stored declaration — it cannot be fooled by unrelated ``id`` /
-        ``display_name`` substrings elsewhere in the SQL.
-        """
-        canonical = LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION
-        return (
-            _normalize_ddl_for_identity(stored_sql)
-            == _normalize_ddl_for_identity(canonical)
-        )
-
-    @staticmethod
     def _sessions_trigram_modern_definition_matches(stored_sql: str) -> bool:
         """True when the stored root declaration is the canonical #30 modern
         trigram declaration — FTS5 ``(title, id, display_name)``,
         ``content='sessions_fts_trigram_src'``, ``content_rowid='row_id'``,
         ``tokenize='trigram'`` — compared as normalized DDL.
 
-        Like the legacy check, this is deliberately NOT a PRAGMA table_info
-        check: PRAGMA must CONNECT the FTS5 vtable and raises
-        ``no such tokenizer: trigram`` on a host without the built-in trigram
-        tokenizer — and #34 requires schema identity (modern) to be decidable
-        independently of runtime capability (modern-but-unavailable; capability
-        is left to the availability probe). The normalized DDL comparison
-        reads the declared columns / attributes directly from the stored
-        declaration, so it cannot be fooled by unrelated ``id`` /
-        ``display_name`` substrings and never connects the vtable.
+        This is deliberately NOT a PRAGMA table_info check: PRAGMA must
+        CONNECT the FTS5 vtable and raises ``no such tokenizer: trigram`` on
+        a host without the built-in trigram tokenizer — and #34 requires
+        schema identity (modern) to be decidable independently of runtime
+        capability (modern-but-unavailable; capability is left to the
+        availability probe). The normalized DDL comparison reads the declared
+        columns / attributes directly from the stored declaration, so it
+        cannot be fooled by unrelated ``id`` / ``display_name`` substrings
+        and never connects the vtable.
         """
         canonical = _SESSIONS_FTS_TRIGRAM_STATEMENTS[1]
         return (
@@ -2961,19 +2903,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Classify every relevant target trigger name by stored-DDL
         comparison (round-10 finding 2).
 
-        Returns ``name -> "absent" | "exact_modern" | "exact_legacy" |
-        "foreign"``. Identity evidence is the stored trigger DDL compared
-        (literal-safe normalized) against the canonical modern / historical
-        legacy declarations AND ``tbl_name == 'sessions'`` — a same-name
-        trigger on another table is foreign even if its text coincidentally
-        matched.
+        Returns ``name -> "absent" | "exact_modern" | "foreign"``. Identity
+        evidence is the stored trigger DDL compared (literal-safe normalized)
+        against the canonical modern declarations AND ``tbl_name ==
+        'sessions'`` — a same-name trigger on another table is foreign even
+        if its text coincidentally matched.
         """
         status: Dict[str, str] = {}
-        all_names = tuple(dict.fromkeys(
-            _SESSIONS_TRIGRAM_MODERN_TRIGGER_NAMES
-            + _SESSIONS_TRIGRAM_LEGACY_TRIGGER_NAMES
-        ))
-        for name in all_names:
+        for name in _SESSIONS_TRIGRAM_MODERN_TRIGGER_NAMES:
             row = cursor.execute(
                 "SELECT tbl_name, sql FROM sqlite_master "
                 "WHERE type = 'trigger' AND name = ?",
@@ -2994,13 +2931,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             ):
                 status[name] = "exact_modern"
-            elif name in _SESSIONS_TRIGRAM_LEGACY_TRIGGER_DDL and (
-                _normalize_ddl_for_identity(sql)
-                == _normalize_ddl_for_identity(
-                    _SESSIONS_TRIGRAM_LEGACY_TRIGGER_DDL[name]
-                )
-            ):
-                status[name] = "exact_legacy"
             else:
                 status[name] = "foreign"
         return status
@@ -3017,16 +2947,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Rules (round-10 finding 2):
         - modern root — every present modern trigger must be ``exact_modern``;
-          the legacy-only ``_update`` name must be absent; any foreign → fail
-          closed; any missing modern trigger → stale.
-        - legacy root — present legacy triggers must be ``exact_legacy`` or
-          absent; modern-only ``_update_before`` / ``_update_after`` must be
-          absent; any foreign → fail closed.
-        - root absent — any foreign trigger occupant → fail closed. Exact
-          historical legacy orphans are permitted here ONLY because the fresh
-          schema transition drops them under its own lock before installing
-          the modern triggers (round-11 P1 #1); they must never survive into
-          the modern root.
+          any foreign → fail closed; any missing modern trigger → stale.
+        - root absent — any foreign trigger occupant → fail closed.
         """
         status = SessionDB._sessions_trigram_trigger_status(cursor)
         foreign = sorted(n for n, s in status.items() if s == "foreign")
@@ -3035,26 +2957,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 n for n in _SESSIONS_TRIGRAM_MODERN_TRIGGER_NAMES
                 if status.get(n) == "absent"
             ]
-            # A legacy-only ``_update`` trigger next to a modern root is an
-            # anomaly (modern uses ``_update_before``/``_update_after``).
-            if status.get("sessions_fts_trigram_update") != "absent":
-                foreign.append("sessions_fts_trigram_update")
             return (not foreign and not missing), foreign, missing
-        if root_classification == "legacy_simple":
-            for n in (
-                "sessions_fts_trigram_update_before",
-                "sessions_fts_trigram_update_after",
-            ):
-                if status.get(n) != "absent":
-                    foreign.append(n)
-            return (not foreign), foreign, []
         # root absent
         return (not foreign), foreign, []
 
     @staticmethod
-    def _sessions_trigram_shadow_collision(
-        cursor, *, allow_legacy_shadows: bool = False
-    ) -> Optional[str]:
+    def _sessions_trigram_shadow_collision(cursor) -> Optional[str]:
         """Return the first blocking occupant among the modern reserved FTS5
         shadow names (``_data/_idx/_docsize/_config``), or None when the
         whole reserved namespace is free. ``CREATE VIRTUAL TABLE`` for the
@@ -3062,12 +2970,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         TABLE/VIEW/INDEX (round-10 finding 8). ``_content`` is deliberately
         NOT reserved for external content; a same-name TRIGGER does not block
         shadow TABLE creation.
-
-        ``allow_legacy_shadows=True`` (only on the legacy demotion path) lets
-        the EXACT legacy shadow tables pass: they legitimately occupy these
-        names and the demotion renames them to ``fts_v22_trash_`` before the
-        modern root is created. On the root-absent path they are genuine
-        collisions.
         """
         for name in SESSIONS_TRIGRAM_MODERN_SHADOW_TABLES:
             row = cursor.execute(
@@ -3075,9 +2977,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "AND type IN ('table', 'view', 'index')",
                 (name,),
             ).fetchone()
-            if row is not None and not (
-                allow_legacy_shadows and name in SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES
-            ):
+            if row is not None:
                 return name
         return None
 
@@ -3094,11 +2994,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         - ``"absent"`` — no table, view, OR index occupies the root name
           (fresh install / never created).
-        - ``"legacy_simple"`` — the recognized historical Hermes shape
-          (FTS5 ``tokenize='simple'``, INTERNAL content, and EXACTLY the
-          title-only logical column set). This is the fork's pre-#30
-          ``SESSIONS_FTS_TRIGRAM_SQL``. A same-name simple object with any
-          other column shape is NOT ours.
         - ``"modern_trigram"`` — the #30 identity: the stored root declaration
           matches the canonical modern trigram DDL (FTS5 ``(title, id,
           display_name)`` + ``content='sessions_fts_trigram_src'`` +
@@ -3138,15 +3033,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # a ``CREATE VIRTUAL TABLE ... USING fts5`` declaration.
         if "CREATE VIRTUAL TABLE" not in sql or "USING fts5" not in sql:
             return "unknown_same_name"
-        # Recognized historical Hermes shape (FTS5 title-only INTERNAL content
-        # ``tokenize='simple'``) — verified by a normalized DDL comparison of
-        # the stored declaration. Deliberately NOT PRAGMA table_info: PRAGMA
-        # must CONNECT the vtable and raises ``no such tokenizer: simple`` on
-        # a host without the legacy tokenizer — the exact host #30's demotion
-        # exists to support. A same-name simple object with any other column
-        # shape is NOT ours and must fail closed (never demote / delete it).
-        if SessionDB._sessions_trigram_legacy_definition_matches(sql):
-            return "legacy_simple"
         # Modern #30 identity — the stored root declaration must match the
         # canonical modern trigram declaration AND the source object must be
         # the canonical derived VIEW. Both are DDL comparisons: no PRAGMA
@@ -3160,126 +3046,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return "modern_trigram"
         return "unknown_same_name"
 
-    def _demote_legacy_sessions_trigram_fts(self) -> str:
-        """Converge a recognized legacy ``sessions_fts_trigram(simple)`` to a
-        durable modern-trigram claim WITHOUT requiring the ``simple`` tokenizer.
-
-        The historical vtable's stored declaration is ``tokenize='simple'``;
-        on a runtime without ``simple`` even ``DROP TABLE`` raises
-        ``no such tokenizer: simple`` (the #34 disposable repro). The
-        demotion therefore never SELECTs or DROPs the vtable — it drops only
-        triggers PROVEN exact-historical Hermes, removes ONLY the recognized
-        root vtable declaration from ``sqlite_master`` via ``writable_schema``,
-        renames the exact owned shadows into the shared ``fts_v22_trash_``
-        namespace, and seeds the trigram H/P claim — all in ONE
-        ``BEGIN IMMEDIATE`` so a crash anywhere before the commit leaves
-        legacy intact and re-runnable.
-
-        The destructive body is a compare-and-swap (round-10 finding 3): the
-        exact legacy identity used to authorize destruction is REVALIDATED
-        inside the same transaction that performs it. A second process that
-        classified ``legacy_simple`` before the winner converged will find the
-        root no longer exact-legacy and perform ZERO mutations.
-
-        Returns:
-          ``"demoted"``    — legacy root removed, exact shadows trash'd, H/P
-                             staged;
-          ``"superseded"`` — the root is no longer exact legacy inside the
-                             transaction (another process converged first);
-                             zero mutations;
-          ``"refused"``    — ownership / namespace / trash preflight failed;
-                             zero mutations.
-        """
-        def _stage(conn):
-            # ── CAS: revalidate exact legacy identity inside the lock ──
-            row = conn.execute(
-                "SELECT sql FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'sessions_fts_trigram'"
-            ).fetchone()
-            root_sql = (
-                (row["sql"] if isinstance(row, sqlite3.Row) else row[0])
-                if row is not None else None
-            )
-            if root_sql is None or not (
-                SessionDB._sessions_trigram_legacy_definition_matches(root_sql)
-            ):
-                return "superseded"
-            if not SessionDB._sessions_trigram_src_compatible(conn):
-                return "refused"
-            owned, foreign, _ = SessionDB._sessions_trigram_namespace_owned(
-                conn, "legacy_simple"
-            )
-            if not owned:
-                return "refused"
-            if SessionDB._sessions_trigram_shadow_collision(
-                conn, allow_legacy_shadows=True
-            ) is not None:
-                # A modern reserved shadow name is already occupied — the
-                # fresh modern root could not be created here.
-                return "refused"
-            # ── Preflight trash destination collisions ──
-            # The RENAME target namespace is the shared table/view/index
-            # namespace — a same-name VIEW or INDEX would collide inside the
-            # destructive transaction and turn a fail-closed state into an
-            # exception (round-11 P2 #1).
-            for sh in SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES:
-                existing = conn.execute(
-                    "SELECT 1 FROM sqlite_master "
-                    "WHERE type IN ('table', 'view', 'index') AND name = ?",
-                    (f"fts_v22_trash_{sh}",),
-                ).fetchone()
-                if existing is not None:
-                    return "refused"
-            # ── Drop ONLY exact-historical legacy triggers ──
-            status = SessionDB._sessions_trigram_trigger_status(conn)
-            for name in _SESSIONS_TRIGRAM_LEGACY_TRIGGER_NAMES:
-                if status.get(name) == "exact_legacy":
-                    conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-            conn.execute("PRAGMA writable_schema=ON")
-            conn.execute(
-                "DELETE FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'sessions_fts_trigram' "
-                "AND sql LIKE '%tokenize=''simple''%'"
-            )
-            conn.execute("PRAGMA writable_schema=RESET")
-            # Rename only the EXACT legacy FTS5 shadow tables — never a
-            # prefix sweep (round-9 P1 data-loss guard).
-            placeholders = ", ".join("?" for _ in SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES)
-            shadows = [
-                r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    f"AND name IN ({placeholders})",
-                    tuple(SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES),
-                ).fetchall()
-            ]
-            for sh in shadows:
-                conn.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
-            self._seed_session_trigram_fts_rebuild_markers(conn, force=True)
-            return "demoted"
-        result = self._execute_write(_stage)
-        if result == "demoted":
-            logger.warning(
-                "Demoted legacy sessions_fts_trigram(tokenize='simple') to the "
-                "modern external-content trigram representation (issue #30); "
-                "historical backfill staged with a durable high-water claim"
-            )
-        elif result == "refused":
-            logger.warning(
-                "Legacy sessions_fts_trigram demotion refused inside the "
-                "transaction (ownership/namespace changed since "
-                "classification, issue #30) — leaving it untouched for %s",
-                self.db_path,
-            )
-        return result
-
     def _ensure_sessions_trigram_fts_schema(self, cursor) -> bool:
         """Migrate / self-heal the session normalized trigram FTS surface (#30).
 
         Classifies the same-name ``sessions_fts_trigram`` by schema identity:
-        a recognized legacy ``simple`` object is converged (demoted without
-        requiring the tokenizer) BEFORE the modern same-name object is
-        created; an unknown same-name object fails closed (never deleted,
-        capability off).
+        an unknown same-name object fails closed (never deleted, capability
+        off).
 
         Ownership and lifecycle gates (round-10):
         - trigger namespace must be owned (every present target trigger is
@@ -3340,7 +3112,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 return False
         elif not owned:
-            # Legacy / absent: any foreign trigger occupant fails closed.
+            # Root absent: any foreign trigger occupant fails closed.
             self._sessions_trigram_available = False
             logger.warning(
                 "sessions_fts_trigram trigger namespace not owned (foreign: "
@@ -3377,16 +3149,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._sessions_trigram_available = True
             return True
 
-        # ── root absent / legacy_simple → fresh-create / demote path ──
+        # ── root absent → fresh-create path ──
         # Reserved FTS5 shadow namespace must be free BEFORE any claim or
         # migration mutation (finding 8): CREATE VIRTUAL TABLE fails if a
         # pre-existing TABLE/VIEW/INDEX occupies _data/_idx/_docsize/_config.
-        # On the legacy path the exact legacy shadows are allowed (the
-        # demotion renames them away); on the root-absent path they are real
-        # collisions.
-        collision = self._sessions_trigram_shadow_collision(
-            cursor, allow_legacy_shadows=(classification == "legacy_simple")
-        )
+        collision = self._sessions_trigram_shadow_collision(cursor)
         if collision is not None:
             self._sessions_trigram_available = False
             logger.warning(
@@ -3402,28 +3169,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # it is safe to ensure before the durable claim (the #76832 ordering
         # only forbids the empty *index* appearing before the claim).
         cursor.execute(_SESSIONS_FTS_TRIGRAM_SRC_STATEMENT)
-        if classification == "legacy_simple":
-            # CAS demotion (round-10 finding 3): revalidates the exact legacy
-            # identity inside its own BEGIN IMMEDIATE.
-            result = self._demote_legacy_sessions_trigram_fts()
-            if result == "superseded":
-                # Another process converged first — reclassify and converge on
-                # the winner's state (bounded recursion).
-                if depth >= 1:
-                    self._sessions_trigram_available = False
-                    return False
-                return self._ensure_sessions_trigram_fts_schema_depth(
-                    cursor, depth + 1
-                )
-            if result == "refused":
-                self._sessions_trigram_available = False
-                return False
-            existing = False
-        else:
-            existing = bool(cursor.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'sessions_fts_trigram'"
-            ).fetchone())
+        existing = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'sessions_fts_trigram'"
+        ).fetchone())
 
         # Fresh-create path: stage the durable claim BEFORE the empty external
         # table can exist. A crash between the claim commit and the schema
