@@ -20,10 +20,12 @@ from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
     FTS_CJK_STALE_KEY,
     FTS_SQL,
+    FTS_SESSION_TRIGRAM_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
+    SessionTrigramOwnershipLost,
     _FTS_CJK_TRIGGERS,
 )
 
@@ -97,6 +99,13 @@ _FTS_SESSION_TRIGRAM_SPEC = {
     "trigram_columns": (),
     "trigram_where": None,
     "reset_tables": ("sessions_fts_trigram",),
+    # Round-11 P1 #3: every mutation (backfill chunk, boundary finish) must
+    # authorize the exact current modern root/source/trigger state inside the
+    # same BEGIN IMMEDIATE that mutates. A long-lived process must not
+    # advance/clear a target after durable ownership changed underneath it.
+    "write_guard": lambda self, conn: (
+        self._sessions_trigram_require_owned_modern_for_write(conn)
+    ),
     # Round-11 P1 #1: the fresh schema transition drops exact historical
     # legacy orphan triggers under its own BEGIN IMMEDIATE before installing
     # the modern triggers (a root-absent DB may carry legacy insert/delete/
@@ -234,6 +243,12 @@ class SessionSearchMixin:
         src_cols = ", ".join(spec["source_columns"])
 
         def _do(conn):
+            # CAS write authorization (round-11 P1 #3): the boundary finish
+            # clears H/P, so revalidate exact modern ownership inside the same
+            # transaction — never clear markers for a target whose durable
+            # ownership changed.
+            if spec.get("write_guard"):
+                spec["write_guard"](self, conn)
             hw_row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = ?",
                 (spec["high_water_key"],),
@@ -270,7 +285,14 @@ class SessionSearchMixin:
                 "DELETE FROM state_meta WHERE key IN (?, ?)",
                 (spec["high_water_key"], spec["progress_key"]),
             )
-        self._execute_write(_do)
+        try:
+            self._execute_write(_do)
+        except SessionTrigramOwnershipLost:
+            logger.debug(
+                "Refused to finish %s FTS rebuild (target ownership changed): %s",
+                spec["name"], self.db_path,
+            )
+            return
         logger.info(
             "Deferred %s FTS rebuild complete — all rows indexed.", spec["name"]
         )
@@ -346,6 +368,11 @@ class SessionSearchMixin:
         )
 
         def _do(conn):
+            # CAS write authorization (round-11 P1 #3): the backfill chunk
+            # mutates the target, so revalidate exact modern ownership inside
+            # the same transaction.
+            if spec.get("write_guard"):
+                spec["write_guard"](self, conn)
             # Re-read progress inside the write transaction (BEGIN IMMEDIATE
             # is already held by _execute_write) — this is the claim: two
             # workers can't read the same progress value concurrently.
@@ -388,6 +415,12 @@ class SessionSearchMixin:
 
         try:
             more = self._execute_write(_do)
+        except SessionTrigramOwnershipLost:
+            logger.debug(
+                "%s FTS rebuild chunk refused (target ownership changed): %s",
+                spec["name"], self.db_path,
+            )
+            return False
         except sqlite3.OperationalError as exc:
             logger.debug(
                 "%s FTS rebuild chunk failed (will retry): %s", spec["name"], exc

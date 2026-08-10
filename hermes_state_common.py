@@ -647,6 +647,15 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 FTS_SESSION_TRIGRAM_STALE_KEY = "fts_session_trigram_stale"
 
 
+class SessionTrigramOwnershipLost(Exception):
+    """Raised by the trigram write-authorization CAS (round-11 P1 #3) when a
+    mutating operation finds the target no longer an exact owned modern
+    root/source/trigger state inside its own ``BEGIN IMMEDIATE``. Callers
+    abort the mutation (roll back) and fail closed — never delete-all, drop
+    triggers, seed/advance/clear H/P, or run a boundary finish against a
+    target whose durable ownership changed underneath them."""
+
+
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
 # Used ONLY to keep an existing pre-v23 install's search working and its
 # triggers repairable UNTIL the user opts into `hermes db optimize`. This is

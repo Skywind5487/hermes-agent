@@ -61,6 +61,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_CJK_STALE_KEY,
     FTS_SQL,
     FTS_SESSION_TRIGRAM_STALE_KEY,
+    SessionTrigramOwnershipLost,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
@@ -3489,6 +3490,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         return True
 
+    def _sessions_trigram_require_owned_modern_for_write(
+        self, conn, *, allow_stale: bool = False, allow_missing: bool = False
+    ) -> None:
+        """CAS write authorization for a trigram mutation, invoked INSIDE the
+        same ``BEGIN IMMEDIATE`` that will mutate (round-11 P1 #3).
+
+        Raises ``SessionTrigramOwnershipLost`` (aborting the transaction)
+        unless the target is the exact modern root with a compatible source
+        and no foreign trigger occupants. ``allow_stale`` permits the durable
+        stale breadcrumb (stale recovery / quarantine); ``allow_missing``
+        permits missing owned modern triggers (they are reinstalled / dropped
+        by those paths). The default serving/backfill state requires exact
+        modern triggers AND not stale.
+        """
+        if self._classify_sessions_fts_trigram(conn) != "modern_trigram":
+            raise SessionTrigramOwnershipLost("root is not exact modern")
+        if not self._sessions_trigram_src_compatible(conn):
+            raise SessionTrigramOwnershipLost("source not compatible")
+        owned, foreign, missing = self._sessions_trigram_namespace_owned(
+            conn, "modern_trigram"
+        )
+        if foreign:
+            raise SessionTrigramOwnershipLost("foreign trigger occupants")
+        if not allow_missing and missing:
+            raise SessionTrigramOwnershipLost("missing owned modern triggers")
+        if not allow_stale and self._session_trigram_is_stale(conn):
+            raise SessionTrigramOwnershipLost("durably stale")
+
     def _sessions_trigram_stale_recovery_or_quarantine(self, cursor) -> bool:
         """Round-10 finding 1: a stale modern target (missing owned trigger
         or durable stale breadcrumb).
@@ -3499,16 +3528,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         modern triggers so canonical writes survive); never serve.
         """
         probe = self._fts_table_probe(cursor, "sessions_fts_trigram")
-        if probe is None:
-            return self._sessions_trigram_quarantine()
-        if probe is False:
-            # The modern table vanished while we looked — treat as absent
-            # (fall through to a fresh ensure on the next pass).
-            self._sessions_trigram_available = False
-            return False
         try:
+            if probe is None:
+                return self._sessions_trigram_quarantine()
+            if probe is False:
+                # The modern table vanished while we looked — treat as absent
+                # (fall through to a fresh ensure on the next pass).
+                self._sessions_trigram_available = False
+                return False
             self._fts_session_trigram_recover_stale()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, SessionTrigramOwnershipLost):
             self._sessions_trigram_available = False
             logger.warning(
                 "session trigram stale recovery could not complete (issue "
@@ -3525,6 +3554,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         so canonical session writes survive; never serve (round-10 finding 1,
         CJK stale precedent)."""
         def _do(conn):
+            # CAS under the lock (round-11 P1 #3): only an exact owned modern
+            # root/source with no foreign trigger occupants may be quarantined
+            # — never drop triggers for a target whose durable ownership
+            # changed underneath us.
+            self._sessions_trigram_require_owned_modern_for_write(
+                conn, allow_stale=True, allow_missing=True
+            )
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -3563,17 +3599,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # capable process already recovered — no-op (never reset a
             # freshly recovered target again).
             stale_now = self._session_trigram_is_stale(conn)
-            _, foreign, missing_now = self._sessions_trigram_namespace_owned(
+            _, _, missing_now = self._sessions_trigram_namespace_owned(
                 conn, "modern_trigram"
             )
             if not stale_now and not missing_now:
                 return
-            # Only FOREIGN triggers block recovery (we must not touch them);
-            # MISSING owned triggers are exactly what this path reinstalls.
-            if foreign or not self._sessions_trigram_src_compatible(conn):
-                raise sqlite3.OperationalError(
-                    "ownership lost during stale recovery"
-                )
+            # CAS authorization (round-11 P1 #3): exact modern root/source,
+            # no foreign trigger occupants; stale/missing owned triggers are
+            # allowed (they are what this path resets/reinstalls).
+            self._sessions_trigram_require_owned_modern_for_write(
+                conn, allow_stale=True, allow_missing=True
+            )
             conn.execute(
                 f"INSERT INTO {fts_table}({fts_table}) VALUES('delete-all')"
             )
@@ -3612,7 +3648,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
         try:
             self._fts_session_trigram_recover_stale()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, SessionTrigramOwnershipLost):
             self._sessions_trigram_available = False
             logger.warning(
                 "session trigram stale recovery could not complete from "
@@ -3632,6 +3668,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if row is not None:
                 return
+            # CAS authorization (round-11 P1 #3): never seed H/P for a target
+            # whose durable ownership changed since classification — an exact
+            # owned modern serving target only.
+            self._sessions_trigram_require_owned_modern_for_write(conn)
             has_src = conn.execute(
                 "SELECT EXISTS(SELECT 1 FROM sessions_fts_trigram_src)"
             ).fetchone()[0]
@@ -3640,7 +3680,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()[0]
             if has_src and docsize == 0:
                 self._seed_session_trigram_fts_rebuild_markers(conn, force=True)
-        self._execute_write(_do)
+        try:
+            self._execute_write(_do)
+        except SessionTrigramOwnershipLost:
+            # Ownership changed under this transaction — do NOT seed H/P for a
+            # target we no longer own (fail closed, round-11 P1 #3).
+            return
 
     def _fts_session_trigram_schema_transition(self, cursor) -> bool:
         """#30 normalized-trigram session-metadata lane of the shared

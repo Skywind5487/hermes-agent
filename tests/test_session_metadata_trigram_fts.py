@@ -17,15 +17,21 @@ import time
 
 import pytest
 
-from hermes_state import SCHEMA_SQL, SessionDB, _SESSIONS_FTS_TRIGRAM_STATEMENTS
+from hermes_state import (
+    SCHEMA_SQL,
+    SessionDB,
+    _SESSIONS_FTS_TRIGRAM_STATEMENTS,
+)
 from hermes_state_common import (
     FTS_SESSION_TRIGRAM_STALE_KEY,
     MAX_FTS5_QUERY_CHARS,
     SESSIONS_FTS_TRIGRAM_SQL,
     SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES,
     SESSION_METADATA_COMPACT_SEPARATORS,
+    SessionTrigramOwnershipLost,
     compact_session_metadata_text,
 )
+from hermes_state_search import _FTS_SESSION_TRIGRAM_SPEC
 
 
 @pytest.fixture()
@@ -2433,6 +2439,154 @@ class TestTransitionNamespaces:
                 "WHERE name = 'fts_v22_trash_sessions_fts_trigram_data'"
             ).fetchone()
             assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "view"
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+
+# =========================================================================
+# Round-11 commit 3 — transactional write authorization CAS
+# =========================================================================
+
+
+def _build_unknown_root_with_modern_triggers_db(db_path):
+    """UNKNOWN internal-content trigram root (NOT the modern external-content
+    shape) + exact-looking modern trigger names + stale breadcrumb. Stale
+    recovery must refuse to mutate it (round-11 C3 R1)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at, title) "
+        "VALUES (1, 'A', 'cli', ?, 'Alpha')",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, id, display_name, tokenize='trigram')"
+    )
+    conn.execute(
+        "INSERT INTO sessions_fts_trigram(rowid, title, id, display_name) "
+        "VALUES (1, 'Alpha', 'A', '')"
+    )
+    for stmt in _SESSIONS_FTS_TRIGRAM_STATEMENTS[2:6]:
+        conn.execute(stmt)
+    conn.execute(
+        "INSERT INTO state_meta (key, value) VALUES (?, '1')",
+        (FTS_SESSION_TRIGRAM_STALE_KEY,),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestWriteAuthorizationCAS:
+    def test_stale_recovery_refuses_unknown_root(self, tmp_path):
+        """R11-C3-R1: unknown internal-content root + canonical-looking modern
+        trigger names + stale → stale recovery must refuse (raise the CAS
+        guard) and leave postings/H/P/triggers untouched."""
+        db_path = tmp_path / "ur.db"
+        _build_unknown_root_with_modern_triggers_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            with pytest.raises(SessionTrigramOwnershipLost):
+                r._fts_session_trigram_recover_stale()
+            # Untouched: unknown postings, no H/P seeded, triggers intact.
+            assert _trigram_docsize_count(r) == 1
+            assert r.get_meta(FTS_SESSION_TRIGRAM_STALE_KEY) == "1"
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            for name in _MODERN_TRIGGER_NAMES:
+                assert r._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = ?",
+                    (name,),
+                ).fetchone() is not None, name
+        finally:
+            r.close()
+
+    def test_rebuild_step_refuses_after_foreign_trigger(self, tmp_path):
+        """R11-C3-R2: a healthy long-lived process, then a peer replaces one
+        trigger with a foreign same-name trigger → the rebuild step must not
+        advance P or write rows."""
+        db_path = tmp_path / "rs.db"
+        _build_modern_empty_no_claim_db(db_path, n=2)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") == "2"
+            assert r.get_meta("fts_session_trigram_rebuild_progress") == "0"
+            # Peer replaces a canonical trigger with a foreign same-name one.
+            raw = sqlite3.connect(str(db_path))
+            raw.execute("DROP TRIGGER sessions_fts_trigram_delete")
+            raw.execute(
+                "CREATE TRIGGER sessions_fts_trigram_delete "
+                f"AFTER DELETE ON sessions BEGIN {_FOREIGN_TRIGGER_BODY}; END"
+            )
+            raw.commit()
+            raw.close()
+            assert r.fts_session_trigram_rebuild_step() is False
+            assert r.get_meta("fts_session_trigram_rebuild_progress") == "0"
+            assert _trigram_docsize_count(r) == 0
+        finally:
+            r.close()
+
+    def test_rebuild_finish_refuses_after_foreign_trigger(self, tmp_path):
+        """R11-C3-R3: ownership loss before the boundary finish → the finish
+        must NOT clear H/P."""
+        db_path = tmp_path / "rf.db"
+        _build_healthy_complete_modern_db(db_path, n=2)
+        r = SessionDB(db_path=db_path)
+        try:
+            with r._lock:
+                r._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '2') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("fts_session_trigram_rebuild_high_water",),
+                )
+                r._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '2') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("fts_session_trigram_rebuild_progress",),
+                )
+            raw = sqlite3.connect(str(db_path))
+            raw.execute("DROP TRIGGER sessions_fts_trigram_insert")
+            raw.execute(
+                "CREATE TRIGGER sessions_fts_trigram_insert "
+                f"AFTER INSERT ON sessions BEGIN {_FOREIGN_TRIGGER_BODY}; END"
+            )
+            raw.commit()
+            raw.close()
+            r._fts_rebuild_finish(_FTS_SESSION_TRIGRAM_SPEC)
+            # Markers NOT cleared.
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") == "2"
+            assert r.get_meta("fts_session_trigram_rebuild_progress") == "2"
+        finally:
+            r.close()
+
+    def test_orphan_repair_refuses_after_ownership_change(self, tmp_path):
+        """R11-C3-R4: orphan repair after root ownership changes → no H/P
+        seed (fail closed, no raise)."""
+        db_path = tmp_path / "or.db"
+        _build_modern_empty_no_claim_db(db_path, n=2)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            # Clear the claim seeded at open + break ownership.
+            raw = sqlite3.connect(str(db_path))
+            raw.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_session_trigram_rebuild_high_water', "
+                "'fts_session_trigram_rebuild_progress')"
+            )
+            raw.execute("DROP TRIGGER sessions_fts_trigram_delete")
+            raw.execute(
+                "CREATE TRIGGER sessions_fts_trigram_delete "
+                f"AFTER DELETE ON sessions BEGIN {_FOREIGN_TRIGGER_BODY}; END"
+            )
+            raw.commit()
+            raw.close()
+            r._sessions_trigram_open_orphan_repair(r._conn)
             assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
         finally:
             r.close()
