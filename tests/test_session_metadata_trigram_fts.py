@@ -4,8 +4,8 @@ Covers the modern ``sessions_fts_trigram`` (FTS5 ``tokenize='trigram'``
 external-content over the derived ``sessions_fts_trigram_src`` VIEW: compact
 title, raw id, compact display_name), its own independent resumable H/P
 rebuild lane, the canonical compact-separator policy, live narrow
-maintenance triggers, and the legacy same-name ``tokenize='simple'``
-convergence (detected by schema identity, never by table name alone).
+maintenance triggers, and schema-identity classification (never by table
+name alone).
 
 Scoped per #30: normalized trigram only. Raw Unicode (#25), CJK (#26), the
 unified lifecycle registry (#27), and storage-v2 settlement (#31) are out of
@@ -175,9 +175,8 @@ def _gap_trigram_db(tmp_path):
 
 def _build_unknown_same_name_trigram_db(db_path):
     """DB whose ``sessions_fts_trigram`` is an UNRECOGNIZED same-name object
-    (a unicode61 vtable with a different column shape — not the historical
-    simple shape, not the modern trigram shape). SessionDB must fail closed
-    and leave it untouched."""
+    (a unicode61 vtable with a different column shape — not the modern
+    trigram shape). SessionDB must fail closed and leave it untouched."""
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.executescript(SCHEMA_SQL)
@@ -539,7 +538,7 @@ class TestSchemaClassifier:
 
     def test_classifier_unknown_same_name(self, tmp_path):
         """An unrecognized same-name object fails closed — classified unknown,
-        never mistaken for legacy or modern, and never deleted."""
+        never mistaken for modern, and never deleted."""
         db_path = tmp_path / "unknown.db"
         _build_unknown_same_name_trigram_db(db_path)
         raw = sqlite3.connect(str(db_path))
@@ -1108,12 +1107,12 @@ class TestTokenizerAbsent:
 
 
 class TestSourceCollisionGuard:
-    """The ensure path must gate the derived-source VIEW creation, the H/P
-    seed, and the legacy demotion on ``_sessions_trigram_src_compatible``.
+    """The ensure path must gate the derived-source VIEW creation and the H/P
+    seed on ``_sessions_trigram_src_compatible``.
     ``CREATE VIEW IF NOT EXISTS`` silently no-ops when the source NAME is
     occupied by a same-name TABLE or a non-canonical VIEW — the rebuild H
     would then be computed from the wrong source and a modern index would
-    silently index nothing (or worse: the legacy root demoted first)."""
+    silently index nothing."""
 
     def test_root_absent_source_table_fail_closed(self, tmp_path):
         """Root absent + same-name source TABLE: must NOT build the modern

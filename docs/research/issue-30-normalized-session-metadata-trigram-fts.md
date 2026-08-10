@@ -1,8 +1,19 @@
 # #30 implementation — normalized external-content session trigram FTS
 
-Status: **implemented (2026-08-09)**  
+Status: **implemented (2026-08-09); scope-corrected (2026-08-11)**  
 Code base: **`e94f2630a50d7585f78cfc06365753c033113cb9`** (#25 / PR #59 merge, per the #34 handoff)  
 Branch: `fts/session-trigram-external-content`
+
+> **Scope correction (2026-08-11).** The fork's legacy `tokenize='simple'`
+> session trigram table never existed upstream (#25 base); it was a fork-only
+> artifact. #30's job is the modern external-content trigram lane, and the
+> upstreamable surface must not carry a fork-specific migration for a table
+> that cannot exist there. The entire legacy convergence surface
+> (`_demote_legacy_sessions_trigram_fts`, `LEGACY_SESSIONS_TRIGRAM_*`,
+> `_SESSIONS_TRIGRAM_LEGACY_*`, the classifier's `legacy_simple` branch,
+> `allow_legacy_shadows`, `drop_legacy_orphan_triggers`) was therefore
+> removed in `c7163001f` (tests in `2142e2fa1`). Only the modern trigram lane
+> remains.
 
 ## What was built
 
@@ -10,8 +21,7 @@ A first-class modern `sessions_fts_trigram` (FTS5 `tokenize='trigram'`
 external-content) for session-metadata search, keyed by stable
 `sessions.row_id`, reading through a derived VIEW that projects compact
 title, RAW id, and compact display_name — with its own resumable H/P rebuild
-lane and tokenizer-independent convergence of the legacy same-name
-`tokenize='simple'` object.
+lane.
 
 ```text
 sessions (canonical)
@@ -45,10 +55,9 @@ raw (the #16 contract: punctuation-bearing interior id substrings survive).
   `SESSIONS_FTS_TRIGRAM_SQL` (VIEW + vtable + 4 gated triggers),
   `_SESSIONS_FTS_TRIGRAM_TRIGGERS`.
 - `hermes_state.py` — `_classify_sessions_fts_trigram` (schema identity:
-  absent / legacy_simple / modern_trigram / unknown_same_name),
+  absent / modern_trigram / unknown_same_name),
   `_ensure_sessions_trigram_fts_schema`, `_fts_session_trigram_schema_transition`
   (crash-atomic VIEW/table/trigger install + trigger-owned catch-up),
-  `_demote_legacy_sessions_trigram_fts` (tokenizer-independent demotion),
   `_session_trigram_rebuild_gap`, `_fts_session_trigram_candidates` (the
   low-level #14 lane), `_SESSIONS_FTS_TRIGRAM_*` statement constants.
 - `hermes_state_search.py` — `_FTS_SESSION_TRIGRAM_SPEC` (its OWN marker
@@ -78,28 +87,46 @@ keeps the `(P, H]` historical gap worker-owned. UPDATE is narrow
 writes never rewrite the index. INSERT/DELETE/update + unrelated-update
 no-rewrite + same-value no-rewrite + gap no-double-write are all tested.
 
-## Legacy same-name `simple` convergence
+## Legacy `simple` convergence — removed (2026-08-11 scope correction)
 
-Classified by schema identity (`sqlite_master.sql`), never by name alone:
-recognized historical shape = FTS5 + `tokenize='simple'` + title-only
-INTERNAL content. The demotion never SELECTs/DROPs the vtable (a runtime
-without `simple` rejects even `DROP TABLE`) — it drops the known legacy
-triggers, removes only the recognized root vtable declaration via
-`writable_schema`, renames the orphaned shadows into the shared
-`fts_v22_trash_` namespace, and seeds the durable trigram H/P — one
-`BEGIN IMMEDIATE`. Unknown same-name shapes fail closed (never deleted).
+Early rounds built a tokenizer-independent demotion for a recognized legacy
+same-name `tokenize='simple'` `sessions_fts_trigram` (drop exact-historical
+triggers, `writable_schema` root removal, exact-shadow rename to
+`fts_v22_trash_`, H/P seed in one `BEGIN IMMEDIATE`, CAS-guarded). The
+classifier had a `legacy_simple` branch verified by normalized DDL against
+`LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION` (never PRAGMA — connecting the
+vtable raises `no such tokenizer: simple`), and the fresh schema transition
+dropped exact legacy orphan triggers under the lock
+(`drop_legacy_orphan_triggers`).
 
-Crash matrix (mirrors #34): before demotion commit → legacy reruns; after
-demotion/claim before modern create → re-ensure preserves P; during
-schema+catch-up → rollback + rerun; during backfill → resume own P; H
-without P → `_repair_missing_progress` resets only trigram; empty modern +
-populated source + no claim → orphan repair seeds full claim; completed
-reopen → no marker recreation.
+Review on the #25 base showed this whole surface was fork-only: upstream's
+`SESSIONS_FTS_TRIGRAM_SQL` (modern trigram) was the only sessions trigram
+table that ever shipped, so a migration for a `simple` table that cannot
+exist upstream is dead weight and an upstreamability liability. Per the
+acceptance gate ("if `simple` never existed, it is not needed → delete"),
+all of it was removed:
+
+- `_demote_legacy_sessions_trigram_fts` and its CAS/trash/writable_schema
+  body;
+- `LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION` / `SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES` /
+  `LEGACY_SESSIONS_TRIGRAM_TRIGGER_SQL` and the `_SESSIONS_TRIGRAM_LEGACY_*`
+  derived constants;
+- the classifier's `legacy_simple` branch, trigger_status `exact_legacy`,
+  namespace_owned / shadow_collision legacy branches,
+  `allow_legacy_shadows`, and the spec's `drop_legacy_orphan_triggers` key.
+
+The classifier now distinguishes only absent / modern_trigram /
+unknown_same_name; unknown same-name shapes still fail closed (never
+deleted). The historical round-by-round entries below (Round-3 … Round-11)
+record the work as it happened and are kept for provenance, but the legacy
+code they describe is gone from the branch.
 
 ## Ownership boundaries (kept)
 
-- #30 owns the same-name legacy convergence only; global `simple`
-  retirement stays #19 (`load_simple_extension` untouched).
+- #30 owns the modern external-content trigram lane only; the global
+  `simple` retirement stays #19 (`load_simple_extension` untouched) and
+  legacy `simple` session-trigram convergence was removed outright (see
+  above).
 - The unified six-index lifecycle stays #27; no second scheduler/registry
   was built.
 - `fts_storage_version = 2` is NOT stamped (that's #31).
@@ -110,9 +137,9 @@ reopen → no marker recreation.
 
 ## Validation
 
-- `tests/test_session_metadata_trigram_fts.py` — 33 passed (schema identity,
-  compact/raw search representation, narrow live maintenance, independent
-  H/P + restart/orphan/boundary, legacy convergence, e2e).
+- `tests/test_session_metadata_trigram_fts.py` — 58 passed after the legacy
+  removal (schema identity, compact/raw search representation, narrow live
+  maintenance, independent H/P + restart/orphan/boundary, e2e).
 - `tests/test_session_metadata_fts.py` — 48 passed (no #25 regression).
 - `tests/test_hermes_state.py` — 178 passed; `test_state_db_malformed_repair.py`
   — 9 passed; `tests/hermes_cli/test_session_listing.py` — 6 passed.
