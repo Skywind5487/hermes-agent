@@ -3446,14 +3446,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 cursor, "sessions_fts_trigram", SESSIONS_FTS_TRIGRAM_SQL
             )
         if not ok:
-            if not existing:
-                # The trigram tokenizer / FTS5 module is unavailable on this
-                # host, so the fresh claim seeded above can never be
-                # fulfilled. Clear it — otherwise optimize would advertise
-                # permanently-unfulfillable pending trigram work forever
-                # (criterion 10's reverse invariant; the #26 CJK stale
-                # precedent). A later capable reopen re-seeds and heals.
-                self._clear_session_trigram_rebuild_claim(cursor)
+            # The trigram tokenizer / FTS5 module is unavailable on this host
+            # (or the ownership CAS refused inside the transition). The fresh
+            # H/P claim is CROSS-PROCESS recovery state — NEVER cleared here
+            # (round-11 P1 #2): an incapable process's failed schema attempt
+            # must not erase a capable peer's durable claim, or a partial
+            # index could be exposed as complete. This runtime already has
+            # ``_sessions_trigram_available=False``, and optimize/status gate
+            # trigram work on that flag, so the claim is not advertised as
+            # fulfillable by this process. A later capable opener consumes
+            # the same claim and its catch-up semantics safely.
             self._sessions_trigram_available = False
             return False
         self._sessions_trigram_available = True
@@ -3639,20 +3641,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if has_src and docsize == 0:
                 self._seed_session_trigram_fts_rebuild_markers(conn, force=True)
         self._execute_write(_do)
-
-    def _clear_session_trigram_rebuild_claim(self, cursor) -> None:
-        """Drop the durable trigram H/P claim.
-
-        Used when the modern index cannot be built on this host (trigram
-        tokenizer / FTS5 module unavailable), so the claim seeded for the
-        fresh-create path could never be fulfilled. ``cursor`` may be a Cursor
-        or a Connection (both expose ``execute``).
-        """
-        cursor.execute(
-            "DELETE FROM state_meta WHERE key IN "
-            "('fts_session_trigram_rebuild_high_water', "
-            "'fts_session_trigram_rebuild_progress')"
-        )
 
     def _fts_session_trigram_schema_transition(self, cursor) -> bool:
         """#30 normalized-trigram session-metadata lane of the shared

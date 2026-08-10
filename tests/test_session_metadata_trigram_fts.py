@@ -1212,13 +1212,14 @@ class TestIndependentHPRebuild:
 
 
 class TestTokenizerAbsent:
-    def test_trigram_tokenizer_missing_clears_fresh_claim(self, tmp_path, monkeypatch):
-        """A host without the trigram tokenizer must not leave a durable
-        trigram claim that can never be fulfilled (criterion 10 reverse
-        invariant — the #26 CJK stale precedent). The fresh-create claim is
-        cleared when the schema transition fails on an incapable host, so
-        optimize never advertises permanently-pending trigram work; a later
-        capable reopen heals by re-seeding and backfilling."""
+    def test_trigram_tokenizer_missing_preserves_fresh_claim(
+        self, tmp_path, monkeypatch
+    ):
+        """R11-C2-R1/R2: an incapable fresh open must NOT clear the durable
+        H/P claim (it is cross-process recovery state, not process-local UI
+        state). Root stays absent + H/P durable; canonical writes still work;
+        a later capable open reuses the SAME claim, lands the modern schema,
+        and the rebuild finishes with integrity."""
         db_path = tmp_path / "s.db"
         _build_populated_sessions_db(db_path, n=12)
         # Simulate the tokenizer-absent outcome: the real transition catches
@@ -1233,27 +1234,75 @@ class TestTokenizerAbsent:
             r = SessionDB(db_path=db_path)
             try:
                 assert r._sessions_trigram_available is False
-                # No stuck claim — the fresh claim seeded before the
-                # transition was rolled back because it can never be
-                # fulfilled here.
-                assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
-                assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+                # The claim seeded for the fresh create is PRESERVED — an
+                # incapable process must not erase a durable claim that a
+                # capable peer may be mid-way through consuming.
+                hw = r.get_meta("fts_session_trigram_rebuild_high_water")
+                assert hw is not None and int(hw) == 12
+                assert r.get_meta("fts_session_trigram_rebuild_progress") == "0"
+                # Root absent; canonical writes still work.
+                assert _fts_sql(r._conn, "sessions_fts_trigram") == ""
+                r.create_session("post", source="cli")
             finally:
                 r.close()
 
-        # Patch undone → a capable reopen heals: fresh-create re-seeds a real
-        # claim, and the chunk engine backfills to a complete index.
+        # Patch undone → a capable reopen consumes the SAME durable claim
+        # (not re-seeded), lands the modern schema, and backfills completely.
         r2 = SessionDB(db_path=db_path)
         try:
             assert r2._sessions_trigram_available is True
-            assert r2.get_meta("fts_session_trigram_rebuild_high_water") is not None
+            assert r2.get_meta("fts_session_trigram_rebuild_high_water") == "12"
             while r2.fts_session_trigram_rebuild_step():
                 pass
             assert r2.get_meta("fts_session_trigram_rebuild_high_water") is None
-            assert _trigram_docsize_count(r2) == 12
+            assert _trigram_docsize_count(r2) == 13
             _assert_trigram_integrity(r2)
         finally:
             r2.close()
+
+    def test_failed_opener_cannot_erase_peer_claim(self, tmp_path, monkeypatch):
+        """R11-C2-R3: a deterministic incapable→capable interleaving proving
+        a failed opener cannot erase a capable peer's successful claim. A
+        tokenizer-incapable reopen of a modern target (probe fails) leaves the
+        peer's durable H/P and modern root untouched; a later capable open
+        still completes the rebuild."""
+        db_path = tmp_path / "s.db"
+        _build_populated_sessions_db(db_path, n=5)
+        # Capable open first: creates the modern root + triggers over the
+        # durable H/P claim.
+        r1 = SessionDB(db_path=db_path)
+        try:
+            assert r1._sessions_trigram_available is True
+            assert r1.get_meta("fts_session_trigram_rebuild_high_water") == "5"
+        finally:
+            r1.close()
+        # Incapable reopen: the modern-path probe fails → available False,
+        # but the peer's claim and modern schema are NOT cleared / touched.
+        with monkeypatch.context() as m:
+            m.setattr(
+                SessionDB,
+                "_fts_table_probe",
+                lambda self, cursor, table: None,
+            )
+            r2 = SessionDB(db_path=db_path)
+            try:
+                assert r2._sessions_trigram_available is False
+            finally:
+                r2.close()
+        # Claim + modern root survived the incapable opener.
+        r3 = SessionDB(db_path=db_path)
+        try:
+            assert r3._sessions_trigram_available is True
+            assert r3.get_meta("fts_session_trigram_rebuild_high_water") == "5"
+            assert "tokenize='trigram'" in _fts_sql(
+                r3._conn, "sessions_fts_trigram"
+            )
+            while r3.fts_session_trigram_rebuild_step():
+                pass
+            assert r3.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert _trigram_docsize_count(r3) == 5
+        finally:
+            r3.close()
 
 
 class TestSourceCollisionGuard:
