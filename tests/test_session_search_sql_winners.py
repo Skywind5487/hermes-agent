@@ -7,7 +7,7 @@ import time
 import pytest
 
 from hermes_state import SessionDB
-from tools.session_search_tool import _order_for_recall, _resolve_to_parent, session_search
+from tools.session_search_tool import _order_for_recall, session_search
 
 
 @pytest.fixture
