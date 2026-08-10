@@ -57,6 +57,21 @@ def _view_sql(conn, view):
     return (row[0] if isinstance(row, sqlite3.Row) else row[0]) if row else ""
 
 
+class _FtsProbeBlockingCursor:
+    """Delegates to a real cursor but raises on ``PRAGMA table_info`` —
+    simulating a SQLite build where CONNECTING the FTS5 vtable fails because
+    the declared tokenizer is missing on this host. The classifier's identity
+    checks are pure ``sqlite_master`` DDL reads and must never trip it."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def execute(self, sql, *args, **kwargs):
+        if "PRAGMA table_info" in sql:
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return self._real.execute(sql, *args, **kwargs)
+
+
 def _set_trigram_rebuild_markers(db, high_water, progress):
     db.set_meta("fts_session_trigram_rebuild_high_water", str(high_water))
     db.set_meta("fts_session_trigram_rebuild_progress", str(progress))
@@ -504,22 +519,29 @@ class TestSchemaClassifier:
         finally:
             r.close()
 
-    def test_classifier_legacy_does_not_probe_vtable(self, tmp_path, monkeypatch):
-        """Legacy identity is decided from the stored DDL alone — it must NOT
-        call ``_fts_declared_columns`` (PRAGMA table_info), which connects the
-        FTS5 vtable and raises on a host without ``simple``."""
+    def test_classifier_legacy_never_connects_vtable(self, tmp_path):
+        """Legacy identity is decided from the stored DDL alone — it must
+        never issue a statement that CONNECTS the FTS5 vtable (e.g. PRAGMA
+        table_info), which raises ``no such tokenizer: simple`` on a host
+        without the legacy tokenizer (the #34 legacy→modern-must-not-require-
+        simple contract)."""
         db_path = tmp_path / "legacy.db"
         _build_legacy_simple_sessions_trigram_db(db_path)
         raw = sqlite3.connect(str(db_path))
         try:
-            # Simulate a SQLite build where probing the vtable cannot connect
-            # (the legacy table requires the missing `simple` tokenizer).
-            monkeypatch.setattr(
-                SessionDB, "_fts_declared_columns", lambda cursor, name: None
-            )
-            assert SessionDB._classify_sessions_fts_trigram(raw) == "legacy_simple"
+            cursor = _FtsProbeBlockingCursor(raw.cursor())
+            assert SessionDB._classify_sessions_fts_trigram(cursor) == "legacy_simple"
         finally:
             raw.close()
+
+    def test_classifier_modern_never_connects_vtable(self, db):
+        """Modern identity is decided from the stored DDL alone — it must
+        never CONNECT the FTS5 vtable (PRAGMA table_info), which raises
+        ``no such tokenizer: trigram`` on a host without the built-in trigram
+        tokenizer. #34: schema identity (modern) is decidable independently
+        of runtime capability (modern-but-unavailable)."""
+        cursor = _FtsProbeBlockingCursor(db._conn.cursor())
+        assert SessionDB._classify_sessions_fts_trigram(cursor) == "modern_trigram"
 
     def test_classifier_unknown_same_name(self, tmp_path):
         """An unrecognized same-name object fails closed — classified unknown,

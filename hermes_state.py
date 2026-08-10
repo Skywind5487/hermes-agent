@@ -2734,24 +2734,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Unicode lane's P (target-specific processed completeness).
 
     @staticmethod
-    def _fts_declared_columns(cursor, name: str) -> Optional[frozenset]:
-        """Logical column set of a table / VIEW via ``PRAGMA table_info``.
-
-        PRAGMA table_info reads the column list from the parsed DDL — it does
-        NOT instantiate an FTS5 virtual table, so it works even for a table
-        whose declared tokenizer (e.g. the legacy ``simple``) is unavailable
-        on this host. Returns None when the object is absent or the probe
-        fails; callers treat None as fail-closed (not ours).
-        """
-        try:
-            rows = cursor.execute(f"PRAGMA table_info({name})").fetchall()
-        except sqlite3.OperationalError:
-            return None
-        if not rows:
-            return None
-        return frozenset(r[1] if isinstance(r, sqlite3.Row) else r[1] for r in rows)
-
-    @staticmethod
     def _sessions_trigram_legacy_definition_matches(stored_sql: str) -> bool:
         """True when the stored root declaration is the canonical historical
         legacy ``sessions_fts_trigram`` (FTS5, title-only, INTERNAL content,
@@ -2768,6 +2750,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``display_name`` substrings elsewhere in the SQL.
         """
         canonical = LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION
+
+        def _norm(s: str) -> str:
+            t = s.replace("IF NOT EXISTS", "").strip()
+            if t.endswith(";"):
+                t = t[:-1]
+            return "".join(t.split())
+
+        return _norm(stored_sql) == _norm(canonical)
+
+    @staticmethod
+    def _sessions_trigram_modern_definition_matches(stored_sql: str) -> bool:
+        """True when the stored root declaration is the canonical #30 modern
+        trigram declaration — FTS5 ``(title, id, display_name)``,
+        ``content='sessions_fts_trigram_src'``, ``content_rowid='row_id'``,
+        ``tokenize='trigram'`` — compared as normalized DDL.
+
+        Like the legacy check, this is deliberately NOT a PRAGMA table_info
+        check: PRAGMA must CONNECT the FTS5 vtable and raises
+        ``no such tokenizer: trigram`` on a host without the built-in trigram
+        tokenizer — and #34 requires schema identity (modern) to be decidable
+        independently of runtime capability (modern-but-unavailable; capability
+        is left to the availability probe). The normalized DDL comparison
+        reads the declared columns / attributes directly from the stored
+        declaration, so it cannot be fooled by unrelated ``id`` /
+        ``display_name`` substrings and never connects the vtable.
+        """
+        canonical = _SESSIONS_FTS_TRIGRAM_STATEMENTS[1]
 
         def _norm(s: str) -> str:
             t = s.replace("IF NOT EXISTS", "").strip()
@@ -2834,8 +2843,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     @staticmethod
     def _classify_sessions_fts_trigram(cursor) -> str:
         """Classify the same-name ``sessions_fts_trigram`` object by schema
-        identity (stored ``sqlite_master.sql`` + actual logical columns), NEVER
-        by table name alone.
+        identity (normalized stored ``sqlite_master.sql`` comparisons), NEVER
+        by table name alone and NEVER via ``PRAGMA table_info`` — PRAGMA must
+        CONNECT the FTS5 vtable and resolves the declared tokenizer, raising
+        ``no such tokenizer: ...`` on a host without it, which would couple
+        schema identity to runtime tokenizer capability.
 
         Returns one of:
 
@@ -2845,13 +2857,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           title-only logical column set). This is the fork's pre-#30
           ``SESSIONS_FTS_TRIGRAM_SQL``. A same-name simple object with any
           other column shape is NOT ours.
-        - ``"modern_trigram"`` — the #30 identity: FTS5 ``tokenize='trigram'``
-          + ``content='sessions_fts_trigram_src'`` +
-          ``content_rowid='row_id'`` + EXACTLY the logical
-          ``(title, id, display_name)`` columns + the canonical derived source
-          VIEW (when one is present). Runtime tokenizer capability is separate
-          from schema identity: a host without built-in trigram may still
-          carry a modern schema — unavailable there, not legacy.
+        - ``"modern_trigram"`` — the #30 identity: the stored root declaration
+          matches the canonical modern trigram DDL (FTS5 ``(title, id,
+          display_name)`` + ``content='sessions_fts_trigram_src'`` +
+          ``content_rowid='row_id'`` + ``tokenize='trigram'``) AND the derived
+          source object (when present) is the canonical derived VIEW. Runtime
+          tokenizer capability is separate from schema identity: a host
+          without built-in trigram may still carry a modern schema —
+          unavailable there, not legacy.
         - ``"unknown_same_name"`` — an unrecognized same-name object (any
           near-match that differs in column shape, VIEW projection, or is not
           an FTS5 vtable at all). Fail closed / diagnostic; never blindly
@@ -2879,24 +2892,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # shape is NOT ours and must fail closed (never demote / delete it).
         if SessionDB._sessions_trigram_legacy_definition_matches(sql):
             return "legacy_simple"
-        # Modern #30 identity. The content/content_rowid/tokenizer attributes
-        # come from the stored DDL; the EXACT logical column set comes from
-        # PRAGMA table_info (a bare ``"id" in sql`` check is fooled by
-        # ``content_rowid='row_id'``), and the source object must be the
-        # canonical derived VIEW (not a table shadow, not a miswired VIEW) —
-        # otherwise the index reads the wrong content.
+        # Modern #30 identity — the stored root declaration must match the
+        # canonical modern trigram declaration AND the source object must be
+        # the canonical derived VIEW. Both are DDL comparisons: no PRAGMA
+        # (which would CONNECT the vtable and raise without the tokenizer), so
+        # schema identity stays decidable independent of runtime capability
+        # (a host without trigram still classifies modern-but-unavailable).
         if (
-            "tokenize='trigram'" in sql
-            and "content='sessions_fts_trigram_src'" in sql
-            and "content_rowid='row_id'" in sql
+            SessionDB._sessions_trigram_modern_definition_matches(sql)
+            and SessionDB._sessions_trigram_src_compatible(cursor)
         ):
-            cols = SessionDB._fts_declared_columns(cursor, "sessions_fts_trigram")
-            if (
-                cols == frozenset({"title", "id", "display_name"})
-                and SessionDB._sessions_trigram_src_compatible(cursor)
-            ):
-                return "modern_trigram"
-            return "unknown_same_name"
+            return "modern_trigram"
         return "unknown_same_name"
 
     def _demote_legacy_sessions_trigram_fts(self) -> None:

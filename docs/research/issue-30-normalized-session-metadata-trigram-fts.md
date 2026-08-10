@@ -235,3 +235,36 @@ table is never deleted). Pinned by
 `test_classifier_legacy_does_not_probe_vtable` (monkeypatched
 `_fts_declared_columns` → None; legacy still classifies, proving no PRAGMA
 dependency).
+
+### Round-6 fix — remove ALL PRAGMA from the classifier (P2, 2026-08-10)
+
+Round-6 review (P2): the MODERN branch still used `_fts_declared_columns`
+(`PRAGMA table_info`), which must CONNECT the FTS5 vtable and resolves the
+declared tokenizer — on a host without built-in trigram it raises
+`no such tokenizer: trigram` → columns None → `unknown_same_name`, even for a
+correct modern table. That re-coupled schema identity to runtime tokenizer
+capability, exactly the round-5 coupling #34 forbids (a correct modern schema
+on a no-trigram host must classify **modern-but-unavailable**, not unknown).
+
+The classifier now contains **zero PRAGMA**. All three identity checks are
+canonical stored-DDL comparisons against the exact statements the code itself
+creates:
+
+- `legacy_simple` → `_sessions_trigram_legacy_definition_matches` (canonical
+  `LEGACY_SESSIONS_TRIGRAM_FTS5_DECLARATION`);
+- `modern_trigram` → `_sessions_trigram_modern_definition_matches` (canonical
+  `_SESSIONS_FTS_TRIGRAM_STATEMENTS[1]` — the exact modern vtable DDL, which
+  also pins the `(title, id, display_name)` column set and the
+  content/content_rowid/tokenize attributes) AND
+  `_sessions_trigram_src_compatible` (canonical VIEW DDL);
+- everything else → `unknown_same_name` (fail closed).
+
+`_fts_declared_columns` is deleted (dead). Runtime tokenizer capability is
+decided solely by the availability probe
+(`_ensure_sessions_trigram_fts_schema` → `_sessions_trigram_available`), never
+by the classifier. Tests: `test_classifier_legacy_never_connects_vtable` and
+`test_classifier_modern_never_connects_vtable` run the classifier through a
+`_FtsProbeBlockingCursor` proxy that raises on any `PRAGMA table_info`
+(simulating a host without the tokenizer) and assert classification still
+succeeds — RED before this fix, GREEN after.
+
