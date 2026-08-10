@@ -410,7 +410,13 @@ class SessionSearchMixin:
 
     def fts_session_trigram_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """Session normalized trigram metadata index backfill progress, or
-        None when none is pending (issue #30)."""
+        None when none is pending (issue #30). None also when the lane is
+        durably stale/quarantined (round-10 finding 4): a stale lane must not
+        advertise a rebuild that would replay onto an unindexed window."""
+        with self._read_ctx() as conn:
+            stale = self._session_trigram_is_stale(conn)
+        if stale:
+            return None
         return self.fts_rebuild_status(spec=_FTS_SESSION_TRIGRAM_SPEC)
 
     def fts_session_trigram_rebuild_step(self) -> bool:
@@ -420,8 +426,13 @@ class SessionSearchMixin:
         progress / finish rules with the message + Unicode session rebuilds —
         only the source VIEW, row key, columns, and its OWN marker names
         differ. No second scheduler, pacing loop, missing-progress algorithm,
-        or finish algorithm is introduced.
-        """
+        or finish algorithm is introduced. False when the lane is durably
+        stale — only the dedicated stale-recovery path may reset a stale
+        target (round-10 finding 4)."""
+        with self._read_ctx() as conn:
+            stale = self._session_trigram_is_stale(conn)
+        if stale:
+            return False
         return self.fts_rebuild_step(spec=_FTS_SESSION_TRIGRAM_SPEC)
 
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
@@ -694,7 +705,17 @@ class SessionSearchMixin:
         table, row key) differs.
         """
         n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-        if n == 0 and not force:
+        if n == 0:
+            # Zero canonical sessions is complete by construction regardless
+            # of force intent (round-10 finding 7): never leave an H=0/P=0
+            # zombie claim — fts_rebuild_status returns None for total<=0, the
+            # worker never finishes/clears it, and fts_optimize_available
+            # would advertise permanently-pending trigram work forever. Clear
+            # this spec's markers so a later non-empty open re-seeds fresh.
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN (?, ?)",
+                (spec["high_water_key"], spec["progress_key"]),
+            )
             return 0
         return self._seed_fts_rebuild_markers(conn, spec, force=force)
 
@@ -716,7 +737,7 @@ class SessionSearchMixin:
             conn, _FTS_SESSION_TRIGRAM_SPEC, force=force
         )
 
-    def _repair_missing_progress(self, conn, spec: Dict[str, Any]) -> None:
+    def _repair_missing_progress(self, conn, spec: Dict[str, Any]) -> bool:
         """Repair an orphan high_water-without-progress for one rebuild spec.
 
         Re-seeds P=0 so the chunk loop is not a no-op, resetting a partially
@@ -724,14 +745,31 @@ class SessionSearchMixin:
         chunk replay cannot duplicate rows. This is THE crash-safe recovery
         rule, shared by the message and session metadata rebuilds (the #76832
         seam) — session repairs must never re-implement it.
+
+        Returns True when P was (re)published; False when the required primary
+        target could NOT be proven empty after the reset (round-10 finding 5)
+        — callers must then treat the repair as refused (H-without-P is
+        preserved for a later capable retry), NOT proceed as though the index
+        was reset. The message spec's optional trigram sidecar is separate:
+        its absence/unavailability is not a failure to reset the required base
+        table.
         """
         if not self._fts_index_known_empty(conn, spec["fts_table"]):
             self._reset_fts_index_to_empty(conn, spec["reset_tables"])
+            # Reset postcondition: never publish P=0 unless the required
+            # primary target is PROVEN empty after the reset. A failed
+            # delete-all (e.g. unavailable declared tokenizer) leaves docsize
+            # non-empty; publishing P=0 would make a later capable replay
+            # duplicate postings on top of surviving rows (external-content
+            # integrity check → malformed).
+            if not self._fts_index_known_empty(conn, spec["fts_table"]):
+                return False
         conn.execute(
             "INSERT INTO state_meta (key, value) VALUES (?, '0') "
             "ON CONFLICT(key) DO UPDATE SET value = '0'",
             (spec["progress_key"],),
         )
+        return True
 
     def _repair_optimize_bookkeeping(
         self, spec: Optional[Dict[str, Any]] = None
@@ -800,36 +838,57 @@ class SessionSearchMixin:
         lane is INDEPENDENT of the Unicode lane's markers).
         """
         spec = spec or _FTS_SESSION_SPEC
+        self._execute_write(
+            lambda conn: self._repair_session_fts_bookkeeping_inner(conn, spec)
+        )
 
-        def _do(conn):
-            existing_hw = conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?",
-                (spec["high_water_key"],),
+    def _repair_session_fts_bookkeeping_inner(
+        self, conn, spec: Dict[str, Any]
+    ) -> None:
+        """The bookkeeping repair body, given a held write transaction."""
+        existing_hw = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (spec["high_water_key"],),
+        ).fetchone()
+        if existing_hw is not None:
+            progress = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (spec["progress_key"],),
             ).fetchone()
-            if existing_hw is not None:
-                progress = conn.execute(
-                    "SELECT 1 FROM state_meta WHERE key = ?",
-                    (spec["progress_key"],),
-                ).fetchone()
-                if progress is None:
-                    self._repair_missing_progress(conn, spec)
-                return
-            # No claim: a freshly-created external index over a populated DB
-            # that lost its markers, or a crash window after schema ensure
-            # without a claim. Seed a full backfill (orphan recovery).
-            if self._fts_external_index_empty_with_source(
-                conn, spec["source_table"], spec["fts_table"]
-            ):
-                self._seed_session_metadata_fts_rebuild_markers(
-                    conn, spec, force=True
-                )
-        self._execute_write(_do)
+            if progress is None:
+                # Respect the reset postcondition (finding 5): if the required
+                # primary target could not be proven empty after reset, refuse
+                # and preserve H-without-P for a later capable retry.
+                self._repair_missing_progress(conn, spec)
+            return
+        # No claim: a freshly-created external index over a populated DB
+        # that lost its markers, or a crash window after schema ensure
+        # without a claim. Seed a full backfill (orphan recovery).
+        if self._fts_external_index_empty_with_source(
+            conn, spec["source_table"], spec["fts_table"]
+        ):
+            self._seed_session_metadata_fts_rebuild_markers(
+                conn, spec, force=True
+            )
 
     def _repair_session_trigram_fts_bookkeeping(self) -> None:
         """Session normalized trigram variant of
         ``_repair_session_fts_bookkeeping`` (issue #30). Independent markers;
-        shares the crash-safe implementation."""
-        self._repair_session_fts_bookkeeping(_FTS_SESSION_TRIGRAM_SPEC)
+        shares the crash-safe implementation.
+
+        Ownership-gated (round-10 finding 4): only repairs an EXACT OWNED
+        modern target with no missing owned triggers and no durable stale
+        breadcrumb. An unknown same-name object must NEVER be mutated (no H/P
+        seed, no delete-all) even when it happens to look canonical; a stale
+        target is only repaired through the dedicated stale-recovery path.
+        """
+        def _do(conn):
+            if not self._sessions_trigram_owned_servable(conn):
+                return
+            self._repair_session_fts_bookkeeping_inner(
+                conn, _FTS_SESSION_TRIGRAM_SPEC
+            )
+        self._execute_write(_do)
 
     def fts_optimize_available(self) -> bool:
         """True when `optimize_fts_storage()` has work to do: either this DB
@@ -866,8 +925,12 @@ class SessionSearchMixin:
             ).fetchone():
                 return True
             # Session normalized trigram rebuild pending (issue #30): its own
-            # durable H/P claim, independent of the Unicode lane.
-            if self._conn.execute(
+            # durable H/P claim, independent of the Unicode lane. Only
+            # advertised when THIS runtime owns+serves the lane — an
+            # incapable host must not advertise trigram work it can never
+            # complete (finding 1 point 4), and an unknown / quarantined
+            # target must not be advertised for mutation (finding 4).
+            if self._sessions_trigram_available and self._conn.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_session_trigram_rebuild_high_water' LIMIT 1"
             ).fetchone():
@@ -897,7 +960,12 @@ class SessionSearchMixin:
             # source populated and no trigram claim (crash window / lost
             # markers) — healable on re-run. The trigram source is a VIEW so
             # this probe also covers the not-yet-created table (absent → the
-            # ensure that follows creates it fresh over the claim).
+            # ensure that follows creates it fresh over the claim). Only
+            # advertised when THIS runtime owns+serves the lane (finding 4:
+            # an unknown/quarantined target must never trigger a delete-all /
+            # re-seed).
+            if not self._sessions_trigram_available:
+                return False
             return self._fts_external_index_empty_with_source(
                 self._conn, "sessions_fts_trigram_src", "sessions_fts_trigram"
             )
@@ -1036,6 +1104,11 @@ class SessionSearchMixin:
         # can only be recovered from scratch — reset it now so the cjk
         # backfill phase below rebuilds it. No-op without the tokenizer.
         self._fts_cjk_reset_if_stale()
+        # A stale session-trigram target (missing owned trigger, or quarantined
+        # by a tokenizer-less process) can only be recovered from scratch —
+        # reset it now so the trigram backfill phase below rebuilds it. No-op
+        # without trigram capability / ownership (finding 1 point 4).
+        self._fts_session_trigram_recover_if_stale()
         # An optimized v23 DB gaining the cjk index for the first time (no
         # legacy work left, tokenizer newly installed): ensure the table +
         # markers exist so the backfill phase has work to claim.
@@ -1119,23 +1192,35 @@ class SessionSearchMixin:
         # markers / empty session index (issue #25) count as remaining work,
         # as do the trigram lane's own markers / empty index (issue #30).
         with self._lock:
-            still_pending = self._conn.execute(
+            # The trigram lane's marker / empty-index only counts as remaining
+            # work when THIS runtime owns+serves it (finding 1 point 4): an
+            # incapable host must not report permanent backfill_incomplete for
+            # a lane it can never recover — the stale evidence stays, but the
+            # settle check ignores it here.
+            trigram_pending = self._conn.execute(
                 "SELECT 1 FROM state_meta "
-                "WHERE key IN ('fts_rebuild_high_water', "
-                "'fts_session_rebuild_high_water', "
-                "'fts_session_trigram_rebuild_high_water') LIMIT 1"
+                "WHERE key = 'fts_session_trigram_rebuild_high_water' LIMIT 1"
             ).fetchone() is not None
+            still_pending = (
+                self._conn.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key IN ('fts_rebuild_high_water', "
+                    "'fts_session_rebuild_high_water') LIMIT 1"
+                ).fetchone() is not None
+                or (self._sessions_trigram_available and trigram_pending)
+            )
             still_trash = self._has_fts_trash(self._conn)
+            trigram_empty = self._fts_external_index_empty_with_source(
+                self._conn,
+                "sessions_fts_trigram_src",
+                "sessions_fts_trigram",
+            )
             empty_index = (
                 self._fts_external_index_empty_with_messages(self._conn)
                 or self._fts_external_index_empty_with_source(
                     self._conn, "sessions", "sessions_fts"
                 )
-                or self._fts_external_index_empty_with_source(
-                    self._conn,
-                    "sessions_fts_trigram_src",
-                    "sessions_fts_trigram",
-                )
+                or (self._sessions_trigram_available and trigram_empty)
             )
         if still_pending or still_trash or empty_index:
             reason = (

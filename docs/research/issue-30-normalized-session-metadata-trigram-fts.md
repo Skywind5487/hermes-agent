@@ -346,3 +346,80 @@ exact FTS5 DDL identity, anything else is `unknown_same_name`. Pinned by
 raise — RED with the exact `there is already an index named ...` error before
 the fix, GREEN after).
 
+### Round-10 — full from-scratch audit hardening (6 P1 + 3 P2 + 1 P3, 2026-08-10)
+
+A full-state audit (base `e94f2630` → HEAD `3172c9f46`) found lifecycle /
+ownership gaps beyond the round-1..9 classifier fixes. Implemented as one
+coherent state-machine hardening pass in the review's prescribed order:
+
+1. **Literal-safe DDL normalizer (F6/P2).** New shared
+   `_normalize_ddl_for_identity()` — whitespace between SQL tokens is
+   formatting and dropped, whitespace INSIDE single-/double-quoted literals is
+   preserved byte-for-byte (incl. doubled-quote escapes), `IF NOT EXISTS` is
+   stripped only as a DDL token outside literals. Replaces the three drifting
+   `"".join(sql.split())` closures so `REPLACE(title,' ','')` can never be
+   confused with `REPLACE(title,'  ','')` or `content='...src '` with
+   `content='...src'`. (Pinned: `test_classifier_source_view_double_space_separator_unknown`,
+   `test_classifier_modern_root_literal_whitespace_unknown`.)
+
+2. **Trigger + namespace ownership (F2/P1, F8/P2).** New
+   `_sessions_trigram_trigger_status()` classifies each target trigger name
+   (`absent | exact_modern | exact_legacy | foreign`) by stored-DDL comparison
+   AND `tbl_name='sessions'`; `_sessions_trigram_namespace_owned()` gates
+   ownership per root state; `_sessions_trigram_shadow_collision()` preflights
+   the modern reserved shadows (`_data/_idx/_docsize/_config`; `_content` not
+   reserved; legacy shadows allowed only on the demotion path). Foreign
+   same-name triggers fail closed and are untouched; missing modern triggers
+   mean stale (never blind `IF NOT EXISTS`). `_sessions_trigram_src_compatible`
+   now queries the table/view/index namespace (a same-name trigger no longer
+   affects row order). (Pinned: `TestTriggerNamespaceOwnership`,
+   `TestShadowNamespacePreflight`.)
+
+3. **Legacy demotion compare-and-swap (F3/P1).** `_demote_legacy_sessions_trigram_fts`
+   now returns `demoted | superseded | refused` and REVALIDATES the exact
+   legacy identity, source/trigger ownership, and trash destinations INSIDE
+   its own `BEGIN IMMEDIATE`; drops only triggers proven exact-historical; a
+   stale second opener converges on the winner's modern state instead of
+   destructively re-running. (Pinned: `TestDemotionCAS`.)
+
+4. **Stale / quarantine lifecycle (F1/P1).** New `fts_session_trigram_stale`
+   breadcrumb (CJK precedent). A modern target with a missing owned trigger or
+   durable stale is STALE: a capable host runs `_fts_session_trigram_recover_stale`
+   (atomic: revalidate ownership, `delete-all`, verify docsize empty, re-seed
+   H/P, reinstall owned triggers, catch-up, clear stale LAST — idempotent under
+   two capable processes); an incapable host quarantines (persist stale before
+   dropping only exact owned triggers so canonical `sessions` writes survive)
+   and never serves. (Pinned: `TestStaleLifecycle`.)
+
+5. **Serving / repair gates + reset postcondition + open-time orphan repair
+   (F4/F5/F6, all P1).** `_sessions_trigram_owned_servable()` gates EVERY
+   mutating/serving surface: candidates return `(False, [])` for unowned /
+   stale lanes, `_repair_session_trigram_fts_bookkeeping()` is ownership-gated,
+   `fts_optimize_available` / optimize's settle only advertise trigram work a
+   capable owned runtime can complete. `_repair_missing_progress` verifies the
+   required primary target is proven empty after `delete-all` before
+   publishing `P=0`. Writable open runs the hardened empty-orphan repair
+   (modern empty + populated source + no claim → seed full claim atomically)
+   so reopen never serves a silent false-negative window. (Pinned:
+   `TestServingRepairGates`, `TestResetPostcondition`, `TestOpenTimeOrphanRepair`.)
+
+6. **Empty-session claim rule (F7/P2).** `_seed_session_metadata_fts_rebuild_markers`
+   clears this spec's H/P when `COUNT(sessions)==0` regardless of force — no
+   `H=0/P=0` zombie claim that `fts_optimize_available` would advertise
+   forever. (Pinned: `TestEmptySessionClaim`.)
+
+7. **Query cap (F9/P3).** `_fts_session_trigram_candidates` bounds the needle
+   to `MAX_FTS5_QUERY_CHARS` before compacting / building the MATCH
+   expression. (Pinned: `TestQueryCap`.)
+
+Also: the crash-atomic transition and stale recovery now share one
+`_fts_session_trigram_catchup_sql()` source of truth; the process-local
+`_sessions_trigram_available` flag is explicitly initialized in the
+constructor.
+
+Verification: `test_session_metadata_trigram_fts.py` 66 passed (17 new);
+related FTS/session suites 251 passed, 9 skipped. The two
+`test_session_search_sql_winners.py` failures are PRE-EXISTING on the pinned
+base (an unrelated `search_session_winners` projection shape) and are not
+introduced by this pass. ruff clean.
+

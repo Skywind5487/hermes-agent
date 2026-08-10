@@ -17,8 +17,11 @@ import time
 
 import pytest
 
-from hermes_state import SCHEMA_SQL, SessionDB
+from hermes_state import SCHEMA_SQL, SessionDB, _SESSIONS_FTS_TRIGRAM_STATEMENTS
 from hermes_state_common import (
+    FTS_SESSION_TRIGRAM_STALE_KEY,
+    MAX_FTS5_QUERY_CHARS,
+    SESSIONS_FTS_TRIGRAM_SQL,
     SESSION_METADATA_COMPACT_SEPARATORS,
     compact_session_metadata_text,
 )
@@ -489,6 +492,76 @@ def _build_legacy_simple_with_unrelated_shadow_db(db_path):
     conn.close()
 
 
+def _build_modern_root_double_space_src_view_db(db_path):
+    """DB whose modern root is exact but whose source VIEW uses a DOUBLE
+    ASCII-space separator literal (``REPLACE(title, '  ', '')``) instead of
+    the canonical single space. The old global whitespace normalizer
+    collapsed both to identical strings; the literal-safe normalizer must
+    keep them distinct → unknown / fail closed (round-10 finding 6)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIEW sessions_fts_trigram_src AS "
+        "SELECT row_id, "
+        "REPLACE(REPLACE(REPLACE(REPLACE(title, '-', ''), '_', ''), '.', ''), "
+        "        '  ', '') AS title, "
+        "id AS id, "
+        "REPLACE(REPLACE(REPLACE(REPLACE(display_name, '-', ''), '_', ''), '.', ''), "
+        "        '  ', '') AS display_name "
+        "FROM sessions"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, id, display_name, "
+        "content='sessions_fts_trigram_src', content_rowid='row_id', "
+        "tokenize='trigram')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_modern_root_content_literal_space_db(db_path):
+    """DB whose modern root declaration carries a trailing space INSIDE the
+    ``content='sessions_fts_trigram_src '`` literal — a different declaration
+    than the canonical ``content='sessions_fts_trigram_src'``. The
+    literal-safe normalizer must keep it distinct → unknown (the old global
+    whitespace collapse equalized them; round-10 finding 6)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIEW sessions_fts_trigram_src AS "
+        "SELECT row_id, "
+        "REPLACE(REPLACE(REPLACE(REPLACE(title, '-', ''), '_', ''), '.', ''), "
+        "        ' ', '') AS title, "
+        "id AS id, "
+        "REPLACE(REPLACE(REPLACE(REPLACE(display_name, '-', ''), '_', ''), '.', ''), "
+        "        ' ', '') AS display_name "
+        "FROM sessions"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, id, display_name, "
+        "content='sessions_fts_trigram_src ', content_rowid='row_id', "
+        "tokenize='trigram')"
+    )
+    conn.commit()
+    conn.close()
+
+
 def _seed_an94_row(db):
     """Insert the canonical #30 sample metadata row (live, > H on a fresh
     DB with no markers) so search fixtures share one shape."""
@@ -813,6 +886,45 @@ class TestSchemaClassifier:
                 "WHERE name = 'sessions_fts_trigram'"
             ).fetchone()
             assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "index"
+        finally:
+            r.close()
+
+    def test_classifier_source_view_double_space_separator_unknown(self, tmp_path):
+        """F6: the source VIEW comparison must be literal-safe — a DOUBLE
+        space separator (``REPLACE(title, '  ', '')``) is semantically
+        different from the canonical single space and must classify unknown
+        / fail closed, never the exact #30 projection."""
+        db_path = tmp_path / "double_space_view.db"
+        _build_modern_root_double_space_src_view_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            # Untouched: the double-space VIEW survives as built.
+            sql = _view_sql(r._conn, "sessions_fts_trigram_src")
+            assert "'  '" in sql
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+    def test_classifier_modern_root_literal_whitespace_unknown(self, tmp_path):
+        """F6: the root declaration comparison must be literal-safe — a
+        trailing space INSIDE ``content='sessions_fts_trigram_src '`` is a
+        different declaration from the canonical ``...src'`` and must
+        classify unknown, never exact-modern."""
+        db_path = tmp_path / "content_space.db"
+        _build_modern_root_content_literal_space_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            sql = _fts_sql(r._conn, "sessions_fts_trigram")
+            assert "content='sessions_fts_trigram_src '" in sql
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
         finally:
             r.close()
 
@@ -1431,3 +1543,689 @@ class TestEndToEnd:
             ).fetchall()
         ]
         assert ids == ["x", "y"]
+
+
+# =========================================================================
+# Round-10 hardening — ownership / lifecycle regressions
+# =========================================================================
+
+_MODERN_TRIGGER_NAMES = (
+    "sessions_fts_trigram_insert",
+    "sessions_fts_trigram_delete",
+    "sessions_fts_trigram_update_before",
+    "sessions_fts_trigram_update_after",
+)
+
+# A harmless foreign trigger body (valid DML, clearly not a Hermes trigger).
+_FOREIGN_TRIGGER_BODY = (
+    "DELETE FROM state_meta WHERE key = '__hermes_foreign__'"
+)
+
+
+def _build_healthy_complete_modern_db(db_path, n=2):
+    """A fully-rebuilt modern trigram DB: populated sessions + exact modern
+    root/source/4 triggers + a complete index (no H/P claim)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.executemany(
+        "INSERT INTO sessions (row_id, id, source, started_at, title) "
+        "VALUES (?, ?, 'cli', ?, ?)",
+        [(i, f"s{i}", t0 + i, f"Title {i}") for i in range(1, n + 1)],
+    )
+    conn.executescript(SESSIONS_FTS_TRIGRAM_SQL)
+    conn.execute(
+        "INSERT INTO sessions_fts_trigram(rowid, title, id, display_name) "
+        "SELECT row_id, title, id, display_name FROM sessions_fts_trigram_src"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_root_absent_foreign_insert_trigger_db(db_path):
+    """Root absent + a foreign trigger named ``sessions_fts_trigram_insert``
+    on ANOTHER table. #30 must fail closed before source/H/P mutation and
+    leave the foreign trigger untouched (finding 2 regression 1)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute("CREATE TABLE other (id INTEGER PRIMARY KEY, v TEXT)")
+    conn.execute(
+        "CREATE TRIGGER sessions_fts_trigram_insert AFTER INSERT ON other "
+        f"BEGIN {_FOREIGN_TRIGGER_BODY}; END"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_modern_root_foreign_trigger_db(db_path):
+    """Exact modern root/source with one same-name trigger REPLACED by a
+    foreign body (on ``sessions``, so tbl_name matches but the DDL differs).
+    Must fail closed, never serving, foreign untouched (finding 2 regression
+    2)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.executescript(SESSIONS_FTS_TRIGRAM_SQL)
+    conn.execute("DROP TRIGGER sessions_fts_trigram_update_after")
+    conn.execute(
+        "CREATE TRIGGER sessions_fts_trigram_update_after "
+        f"AFTER UPDATE ON sessions BEGIN {_FOREIGN_TRIGGER_BODY}; END"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_legacy_simple_foreign_insert_trigger_db(db_path):
+    """Exact legacy simple root with ``sessions_fts_trigram_insert`` replaced
+    by a foreign body. The demotion must not run (finding 2 regression 4) and
+    the foreign trigger must survive."""
+    _build_legacy_simple_sessions_trigram_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DROP TRIGGER sessions_fts_trigram_insert")
+    conn.execute(
+        "CREATE TRIGGER sessions_fts_trigram_insert "
+        f"AFTER INSERT ON sessions BEGIN {_FOREIGN_TRIGGER_BODY}; END"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_root_absent_data_shadow_table_db(db_path):
+    """Root absent + an unrelated TABLE named ``sessions_fts_trigram_data``
+    with a sentinel. The modern CREATE VIRTUAL TABLE would fail; #30 must
+    fail closed before any claim/mutation and leave the sentinel intact
+    (finding 8 regression 1)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE TABLE sessions_fts_trigram_data "
+        "(k INTEGER PRIMARY KEY, sentinel TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO sessions_fts_trigram_data VALUES (1, 'keep')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_src_trigger_db(db_path):
+    """Root absent + a harmless trigger named ``sessions_fts_trigram_src``
+    (on another table). A trigger and a view may legally share a name — the
+    source VIEW must still be created / recognized (finding 8 regression 3)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute("CREATE TABLE other (id INTEGER PRIMARY KEY, v TEXT)")
+    conn.execute(
+        "CREATE TRIGGER sessions_fts_trigram_src AFTER INSERT ON other "
+        f"BEGIN {_FOREIGN_TRIGGER_BODY}; END"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_unknown_internal_trigram_db(db_path):
+    """An UNKNOWN internal-content trigram FTS (title,id,display_name) whose
+    rowid matches a real session and which actually contains a matching doc.
+    Must classify unknown, never serve, never be repaired (finding 4)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at, title) "
+        "VALUES (1, 'A', 'cli', ?, 'Alpha')",
+        (t0,),
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
+        "title, id, display_name, tokenize='trigram')"
+    )
+    conn.execute(
+        "INSERT INTO sessions_fts_trigram(rowid, title, id, display_name) "
+        "VALUES (1, 'Alpha', 'A', '')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_modern_empty_no_claim_db(db_path, n=2):
+    """Exact modern root/source/triggers, EMPTY index, populated sessions,
+    NO H/P claim — the finding-6 open-time orphan shape."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.executemany(
+        "INSERT INTO sessions (row_id, id, source, started_at, title) "
+        "VALUES (?, ?, 'cli', ?, ?)",
+        [(i, f"s{i}", t0 + i, f"Title {i}") for i in range(1, n + 1)],
+    )
+    conn.execute(
+        "UPDATE sessions SET title = 'AN-94 Prestige.Barrel' WHERE row_id = 1"
+    )
+    conn.executescript(SESSIONS_FTS_TRIGRAM_SQL)
+    conn.commit()
+    conn.close()
+
+
+def _build_legacy_simple_empty_db(db_path):
+    """Exact legacy simple root with ZERO sessions (finding 7: no zombie
+    H=0/P=0 claim)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5(
+            title, tokenize='trigram'
+        );
+        CREATE TRIGGER sessions_fts_trigram_insert AFTER INSERT ON sessions BEGIN
+            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+        END;
+        CREATE TRIGGER sessions_fts_trigram_delete AFTER DELETE ON sessions BEGIN
+            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER sessions_fts_trigram_update AFTER UPDATE ON sessions BEGIN
+            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+        END;
+        """
+    )
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute(
+        "UPDATE sqlite_master "
+        "SET sql = replace(sql, \"tokenize='trigram'\", \"tokenize='simple'\") "
+        "WHERE name = 'sessions_fts_trigram' AND type = 'table'"
+    )
+    ver = conn.execute("PRAGMA schema_version").fetchone()[0]
+    conn.execute(f"PRAGMA schema_version={ver + 1}")
+    conn.execute("PRAGMA writable_schema=OFF")
+    conn.commit()
+    conn.close()
+
+
+class TestTriggerNamespaceOwnership:
+    def test_root_absent_foreign_trigger_fail_closed(self, tmp_path):
+        """F2-R1: root absent + foreign same-name trigger on another table →
+        open does not raise, no modern root / H/P, foreign trigger preserved,
+        serving false."""
+        db_path = tmp_path / "f.db"
+        _build_root_absent_foreign_insert_trigger_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            assert _fts_sql(r._conn, "sessions_fts_trigram") == ""
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            obj = r._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = 'sessions_fts_trigram_insert'"
+            ).fetchone()
+            assert obj is not None
+        finally:
+            r.close()
+
+    def test_modern_root_foreign_trigger_never_served(self, tmp_path):
+        """F2-R2: exact modern root + a foreign/miswired same-name trigger →
+        never marked serving and the foreign trigger untouched."""
+        db_path = tmp_path / "mf.db"
+        _build_modern_root_foreign_trigger_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            # The foreign trigger is untouched.
+            sql = r._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = 'sessions_fts_trigram_update_after'"
+            ).fetchone()
+            assert sql is not None and _FOREIGN_TRIGGER_BODY.split()[0] in sql[0]
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+    def test_modern_missing_trigger_stale_rebuild(self, tmp_path):
+        """F2-R3: healthy modern root, drop one canonical trigger, commit one
+        canonical write, reopen → target is rebuilt/claimed from canonical
+        state before serving; the missed row is immediately discoverable via
+        the (P, H] supplement."""
+        db_path = tmp_path / "mt.db"
+        _build_healthy_complete_modern_db(db_path, n=2)
+        raw = sqlite3.connect(str(db_path))
+        raw.execute("DROP TRIGGER sessions_fts_trigram_insert")
+        t0 = time.time()
+        raw.execute(
+            "INSERT INTO sessions (row_id, id, source, started_at, title) "
+            "VALUES (3, 's3', 'cli', ?, 'New Row')",
+            (t0,),
+        )
+        raw.commit()
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            # Stale recovery re-seeded a claim and reinstalled all triggers.
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is not None
+            for name in _MODERN_TRIGGER_NAMES:
+                assert r._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = ?",
+                    (name,),
+                ).fetchone() is not None, name
+            # Missed row immediately discoverable (via (P,H] supplement).
+            ok, hits = r._fts_session_trigram_candidates("New")
+            assert ok is True
+            assert any(h["id"] == "s3" for h in hits)
+            # Rebuild completes with full integrity.
+            while r.fts_session_trigram_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert _trigram_docsize_count(r) == 3
+            _assert_trigram_integrity(r)
+        finally:
+            r.close()
+
+    def test_legacy_foreign_trigger_no_demotion(self, tmp_path):
+        """F2-R4: exact legacy root + foreign same-name legacy trigger → no
+        demotion and no trigger deletion."""
+        db_path = tmp_path / "lf.db"
+        _build_legacy_simple_foreign_insert_trigger_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            # Legacy root NOT demoted; foreign trigger survives.
+            assert r._classify_sessions_fts_trigram(r._conn) == "legacy_simple"
+            sql = r._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = 'sessions_fts_trigram_insert'"
+            ).fetchone()
+            assert sql is not None and _FOREIGN_TRIGGER_BODY.split()[0] in sql[0]
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+        finally:
+            r.close()
+
+
+class TestShadowNamespacePreflight:
+    def test_root_absent_data_shadow_collision_fail_closed(self, tmp_path):
+        """F8-R1: root absent + unrelated sentinel TABLE named
+        ``sessions_fts_trigram_data`` → open does not raise, sentinel intact,
+        no modern root/H/P, target unavailable."""
+        db_path = tmp_path / "sd.db"
+        _build_root_absent_data_shadow_table_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            assert _fts_sql(r._conn, "sessions_fts_trigram") == ""
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            row = r._conn.execute(
+                "SELECT sentinel FROM sessions_fts_trigram_data WHERE k = 1"
+            ).fetchone()
+            assert (row["sentinel"] if isinstance(row, sqlite3.Row) else row[0]) == "keep"
+        finally:
+            r.close()
+
+    def test_src_trigger_does_not_block_view(self, tmp_path):
+        """F8-R3: a harmless trigger named ``sessions_fts_trigram_src`` does
+        not prevent creation/recognition of the canonical source VIEW (a
+        trigger and a view may legally share a name)."""
+        db_path = tmp_path / "st.db"
+        _build_src_trigger_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            obj = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'sessions_fts_trigram_src' AND type = 'view'"
+            ).fetchone()
+            assert obj is not None
+        finally:
+            r.close()
+
+
+class TestDemotionCAS:
+    def test_demotion_cas_superseded_after_convergence(self, tmp_path):
+        """F3: a stale second opener that classified legacy before another
+        process converged must no-op/refuse inside its demotion transaction —
+        the modern root/triggers/shadows stay intact and no new claim is
+        written."""
+        db_path = tmp_path / "cas.db"
+        _build_legacy_simple_sessions_trigram_db(db_path)
+        r = SessionDB(db_path=db_path)  # process 1 converges legacy -> modern
+        try:
+            # Drain the trash left by the first demotion (the stale second
+            # opener's demotion must not collide with a fresh trash namespace).
+            while r._fts_teardown_trash_step():
+                pass
+            hw_before = r.get_meta("fts_session_trigram_rebuild_high_water")
+            # Invoke the demotion as though a stale process still believed
+            # the root was legacy.
+            result = r._demote_legacy_sessions_trigram_fts()
+            assert result == "superseded"
+            # Modern root intact; no new claim written.
+            assert "tokenize='trigram'" in _fts_sql(
+                r._conn, "sessions_fts_trigram"
+            )
+            assert (
+                r.get_meta("fts_session_trigram_rebuild_high_water")
+                == hw_before
+            )
+        finally:
+            r.close()
+
+
+class TestStaleLifecycle:
+    def test_quarantine_on_incapable_host(self, tmp_path, monkeypatch):
+        """F1-R1: exact-modern target + simulated trigram probe failure →
+        stale persisted, owned modern triggers removed, capability/serving
+        false; a canonical session INSERT after quarantine still succeeds."""
+        db_path = tmp_path / "q.db"
+        _build_healthy_complete_modern_db(db_path, n=2)
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1')",
+            (FTS_SESSION_TRIGRAM_STALE_KEY,),
+        )
+        raw.commit()
+        raw.close()
+        with monkeypatch.context() as m:
+            m.setattr(
+                SessionDB,
+                "_fts_table_probe",
+                lambda self, cursor, table: None,
+            )
+            r = SessionDB(db_path=db_path)
+            try:
+                assert r._sessions_trigram_available is False
+                # Stale breadcrumb persisted.
+                assert r.get_meta(FTS_SESSION_TRIGRAM_STALE_KEY) == "1"
+                # Owned modern triggers removed (canonical writes survive).
+                for name in _MODERN_TRIGGER_NAMES:
+                    assert r._conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                        "AND name = ?",
+                        (name,),
+                    ).fetchone() is None, name
+                # Canonical session INSERT succeeds (no FTS trigger poisoning).
+                r.create_session("postq", source="cli")
+                assert r._conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = 'postq'"
+                ).fetchone() is not None
+            finally:
+                r.close()
+
+    def test_capable_recovery_from_stale(self, tmp_path):
+        """F1-R2: capable recovery resets from canonical rows, reclaims the
+        current H, restores all owned triggers, and only then clears stale."""
+        db_path = tmp_path / "r.db"
+        _build_healthy_complete_modern_db(db_path, n=2)
+        raw = sqlite3.connect(str(db_path))
+        raw.execute("DROP TRIGGER sessions_fts_trigram_insert")
+        raw.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1')",
+            (FTS_SESSION_TRIGRAM_STALE_KEY,),
+        )
+        raw.commit()
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            # Stale cleared and owned triggers restored.
+            assert r.get_meta(FTS_SESSION_TRIGRAM_STALE_KEY) is None
+            for name in _MODERN_TRIGGER_NAMES:
+                assert r._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = ?",
+                    (name,),
+                ).fetchone() is not None, name
+            # Claim re-seeded from canonical rows, then backfills complete.
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is not None
+            while r.fts_session_trigram_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert _trigram_docsize_count(r) == 2
+            _assert_trigram_integrity(r)
+        finally:
+            r.close()
+
+    def test_stale_stops_serving_after_open(self, tmp_path):
+        """F1-R3: a stale breadcrumb written by another connection after this
+        SessionDB was opened stops the candidate lane from serving."""
+        db_path = tmp_path / "s.db"
+        _build_healthy_complete_modern_db(db_path, n=2)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            ok, hits = r._fts_session_trigram_candidates("Title")
+            assert ok is True and hits, "expected the lane to serve before stale"
+            # Another process quarantines -> durable stale breadcrumb.
+            raw = sqlite3.connect(str(db_path))
+            raw.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1')",
+                (FTS_SESSION_TRIGRAM_STALE_KEY,),
+            )
+            raw.commit()
+            raw.close()
+            ok, hits = r._fts_session_trigram_candidates("Title")
+            assert ok is False
+            assert hits == []
+        finally:
+            r.close()
+
+    def test_recovery_idempotent_after_clear(self, tmp_path):
+        """F1-R4: stale recovery is idempotent — a second recovery invocation
+        after the first cleared stale no-ops and does not reset the target."""
+        db_path = tmp_path / "i.db"
+        _build_healthy_complete_modern_db(db_path, n=2)
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1')",
+            (FTS_SESSION_TRIGRAM_STALE_KEY,),
+        )
+        raw.commit()
+        raw.close()
+        r = SessionDB(db_path=db_path)  # recovery runs at open
+        try:
+            assert r._sessions_trigram_available is True
+            assert r.get_meta(FTS_SESSION_TRIGRAM_STALE_KEY) is None
+            docsize_before = _trigram_docsize_count(r)
+            # Second capable process invokes recovery again — must no-op
+            # (stale already cleared under the write transaction).
+            r._fts_session_trigram_recover_stale()
+            assert _trigram_docsize_count(r) == docsize_before
+            assert r.get_meta(FTS_SESSION_TRIGRAM_STALE_KEY) is None
+        finally:
+            r.close()
+
+
+class TestServingRepairGates:
+    def test_unknown_internal_trigram_never_served(self, tmp_path):
+        """F4-R1: an unknown internal-content trigram FTS with a real matching
+        document → classifier unavailable and candidate helper returns
+        (False, []), never a hit."""
+        db_path = tmp_path / "u.db"
+        _build_unknown_internal_trigram_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is False
+            ok, hits = r._fts_session_trigram_candidates("Alpha")
+            assert ok is False
+            assert hits == []
+        finally:
+            r.close()
+
+    def test_repair_never_mutates_unknown_target(self, tmp_path):
+        """F4-R2: unknown root + canonical source + H-without-P → optimize/
+        repair leaves the unknown FTS contents and the H/P untouched."""
+        db_path = tmp_path / "ur.db"
+        _build_unknown_internal_trigram_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "CREATE VIEW sessions_fts_trigram_src AS "
+            "SELECT row_id, title AS title, id AS id, "
+            "display_name AS display_name FROM sessions"
+        )
+        raw.execute(
+            "INSERT INTO state_meta (key, value) VALUES "
+            "('fts_session_trigram_rebuild_high_water', '5')"
+        )
+        raw.commit()
+        raw.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            sql_before = _fts_sql(r._conn, "sessions_fts_trigram")
+            r._repair_session_trigram_fts_bookkeeping()
+            assert _fts_sql(r._conn, "sessions_fts_trigram") == sql_before
+            # H-without-P preserved: no P published, no delete-all.
+            assert (
+                r.get_meta("fts_session_trigram_rebuild_high_water") == "5"
+            )
+            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+            assert _trigram_docsize_count(r) == 1
+        finally:
+            r.close()
+
+
+class TestResetPostcondition:
+    def test_repair_refuses_publish_when_reset_fails(self, tmp_path, monkeypatch):
+        """F5: partial trigram index + H present/P missing + failed reset → P
+        stays absent and docsize stays unchanged; a subsequent successful
+        reset publishes P=0 and the full replay completes with integrity."""
+        db_path = tmp_path / "rp.db"
+        _build_healthy_complete_modern_db(db_path, n=3)
+        r = SessionDB(db_path=db_path)
+        try:
+            # Stage H-without-P with a populated (partial) index.
+            with r._lock:
+                r._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '3') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("fts_session_trigram_rebuild_high_water",),
+                )
+                r._conn.execute(
+                    "DELETE FROM state_meta "
+                    "WHERE key = 'fts_session_trigram_rebuild_progress'"
+                )
+            docsize_before = _trigram_docsize_count(r)
+            with monkeypatch.context() as m:
+                # Simulate a reset failure (e.g. unavailable tokenizer makes
+                # delete-all raise and be swallowed).
+                m.setattr(
+                    r,
+                    "_reset_fts_index_to_empty",
+                    lambda conn, tables=None: None,
+                )
+                r._repair_session_trigram_fts_bookkeeping()
+            # P stays absent; docsize unchanged.
+            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+            assert _trigram_docsize_count(r) == docsize_before
+            # Subsequent successful reset publishes P=0.
+            r._repair_session_trigram_fts_bookkeeping()
+            assert r.get_meta("fts_session_trigram_rebuild_progress") == "0"
+            while r.fts_session_trigram_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert _trigram_docsize_count(r) == 3
+            _assert_trigram_integrity(r)
+        finally:
+            r.close()
+
+
+class TestOpenTimeOrphanRepair:
+    def test_open_time_orphan_seeds_claim(self, tmp_path):
+        """F6: populated canonical sessions + exact modern root/source/triggers
+        + zero docsize + no H/P → a plain reopen (no optimize) stages the full
+        claim atomically and candidates immediately returns the canonical row
+        via the (P, H] supplement."""
+        db_path = tmp_path / "oo.db"
+        _build_modern_empty_no_claim_db(db_path, n=2)
+        r = SessionDB(db_path=db_path)
+        try:
+            hw = r.get_meta("fts_session_trigram_rebuild_high_water")
+            assert hw is not None and int(hw) == 2
+            assert r.get_meta("fts_session_trigram_rebuild_progress") == "0"
+            ok, hits = r._fts_session_trigram_candidates("an94")
+            assert ok is True
+            assert any(h["id"] == "s1" for h in hits)
+            while r.fts_session_trigram_rebuild_step():
+                pass
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert _trigram_docsize_count(r) == 2
+            _assert_trigram_integrity(r)
+        finally:
+            r.close()
+
+
+class TestEmptySessionClaim:
+    def test_empty_legacy_no_zombie_claim(self, tmp_path):
+        """F7: exact legacy-simple root with zero canonical sessions →
+        converges to modern, H/P both absent, status None, and the first
+        post-convergence session insert is indexed normally."""
+        db_path = tmp_path / "e.db"
+        _build_legacy_simple_empty_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            assert "tokenize='trigram'" in _fts_sql(
+                r._conn, "sessions_fts_trigram"
+            )
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+            assert r.fts_session_trigram_rebuild_status() is None
+            r.create_session("first", source="cli")
+            r._conn.execute(
+                "UPDATE sessions SET title = 'First Row' WHERE id = 'first'"
+            )
+            r._conn.commit()
+            ok, hits = r._fts_session_trigram_candidates("First")
+            assert ok is True
+            assert any(h["id"] == "first" for h in hits)
+        finally:
+            r.close()
+
+
+class TestQueryCap:
+    def test_trigram_query_cap_bounded(self, tmp_path):
+        """F9: a query far beyond MAX_FTS5_QUERY_CHARS is bounded before the
+        MATCH/gap lane runs — no exception, clean no-match for a bounded
+        prefix, and short queries still work."""
+        db_path = tmp_path / "cap.db"
+        _build_healthy_complete_modern_db(db_path, n=2)
+        r = SessionDB(db_path=db_path)
+        try:
+            ok, hits = r._fts_session_trigram_candidates("Title")
+            assert ok is True and hits
+            ok2, hits2 = r._fts_session_trigram_candidates(
+                "Title" + "z" * (MAX_FTS5_QUERY_CHARS * 3)
+            )
+            assert ok2 is True
+            # The bounded prefix ("Titlezzz...") is not a trigram phrase in
+            # any compacted title → zero hits, NOT a failure.
+            assert hits2 == []
+        finally:
+            r.close()

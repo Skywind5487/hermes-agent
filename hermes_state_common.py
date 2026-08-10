@@ -636,6 +636,17 @@ _FTS_CJK_TRIGGERS = (
 FTS_CJK_STALE_KEY = "fts_cjk_stale"
 
 
+# state_meta breadcrumb for the normalized session-trigram lane (#30): set
+# when a runtime without the trigram tokenizer had to drop the owned modern
+# triggers to keep canonical `sessions` writes alive (round-10 finding 1), or
+# when an owned modern trigger was found missing (an unknown coverage gap).
+# While set, the target must not serve reads / rebuild / optimize; a capable
+# host resets from canonical rows, reinstalls the owned triggers, and only
+# then clears the breadcrumb. Stale dominates any old H/P claim — the old
+# ownership partition is invalid once rows can land without triggers.
+FTS_SESSION_TRIGRAM_STALE_KEY = "fts_session_trigram_stale"
+
+
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
 # Used ONLY to keep an existing pre-v23 install's search working and its
 # triggers repairable UNTIL the user opts into `hermes db optimize`. This is
@@ -870,6 +881,38 @@ SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES = (
     "sessions_fts_trigram_docsize",
     "sessions_fts_trigram_config",
 )
+
+# The EXACT FTS5 shadow tables FTS5 itself must create for a MODERN
+# external-content ``sessions_fts_trigram`` vtable. ``_content`` is NOT a
+# modern external-content shadow and must not be over-blocked. A
+# pre-existing TABLE/VIEW/INDEX at any of these names makes
+# ``CREATE VIRTUAL TABLE`` fail — the fresh-create path must fail closed on a
+# collision BEFORE any claim / migration mutation (round-10 finding 8).
+SESSIONS_TRIGRAM_MODERN_SHADOW_TABLES = (
+    "sessions_fts_trigram_data",
+    "sessions_fts_trigram_idx",
+    "sessions_fts_trigram_docsize",
+    "sessions_fts_trigram_config",
+)
+
+# The EXACT historical pre-#30 session trigram triggers (title-only, INTERNAL
+# content, keyed by the TEXT session id). The legacy demotion may drop only
+# triggers proven exact-historical — never by name alone, which would delete
+# a foreign same-name trigger (round-10 finding 2C).
+LEGACY_SESSIONS_TRIGRAM_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_insert AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_delete AFTER DELETE ON sessions BEGIN
+    DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_update AFTER UPDATE ON sessions BEGIN
+    DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
+    INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
+END;
+"""
 
 
 # CJK title search — cjk_unicode61 loadable tokenizer, mirroring
