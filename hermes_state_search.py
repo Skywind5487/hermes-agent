@@ -2042,6 +2042,7 @@ class SessionSearchMixin:
             "lineage_memo_entries": 0,
             "lineage_candidates_inspected": 0,
             "lineage_bound_hit": False,
+            "lineage_snapshot_ran": False,
             "lineage_title_root": None,
             "lineage_current_root": None,
             "route": "none",
@@ -2281,6 +2282,11 @@ class SessionSearchMixin:
         state = _LineageResolutionState(_LINEAGE_WORK_BUDGET)
         winners: List[Dict[str, Any]] = []
         seen_roots: set[str] = set()
+        # True once the winner phase actually executes the in-snapshot
+        # current/title resolution; stays False for early returns (FTS
+        # unavailable / empty query / MATCH error) so the tool can tell
+        # "snapshot could not prove lineage" from "snapshot never ran".
+        lineage_snapshot_ran = False
 
         with self._read_ctx() as conn:
             started_tx = not conn.in_transaction
@@ -2318,6 +2324,7 @@ class SessionSearchMixin:
                             "lineage_memo_entries": 0,
                             "lineage_candidates_inspected": 0,
                             "lineage_bound_hit": False,
+                            "lineage_snapshot_ran": False,
                             "lineage_title_root": None,
                             "lineage_current_root": None,
                             "route": route,
@@ -2342,6 +2349,7 @@ class SessionSearchMixin:
                 # resolved_title_root is reported so the tool can decide whether
                 # the title result itself is a PROVEN safe winner (distinct
                 # from the current lineage) or must be dropped on B exhaustion.
+                lineage_snapshot_ran = True
                 excluded_roots = {str(root) for root in excluded_lineage_roots}
                 resolved_title_root: Optional[str] = None
                 if title_session_id:
@@ -2484,6 +2492,7 @@ class SessionSearchMixin:
                     "lineage_memo_entries": len(state.memo),
                     "lineage_candidates_inspected": state.candidates_inspected,
                     "lineage_bound_hit": state.bound_hit,
+                    "lineage_snapshot_ran": lineage_snapshot_ran,
                     "lineage_title_root": resolved_title_root,
                     "lineage_current_root": resolved_current_root,
                     "route": route,

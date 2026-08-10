@@ -1029,6 +1029,30 @@ class TestCompressionRootToolParity:
         assert result.get("truncated") is True
         assert "warning" in result
 
+    def test_title_preserved_when_content_lane_unavailable(self, db):
+        """When the content FTS lane cannot run (FTS disabled / empty query /
+        MATCH error), the winner phase early-returns with no root stats.  The
+        title safety gate must NOT kill the already-found exact-title — that
+        is the designed title-only fallback, not a B-limited unproven result
+        (#68 review round-4)."""
+        db._fts_enabled = False
+        db.create_session("cur", source="cli")
+        db.create_session("title-session", source="cli")
+        db.set_session_title("title-session", "foo AND OR bar")
+        db.append_message("title-session", role="user",
+                          content="some content")
+
+        result = json.loads(session_search(
+            query="foo AND OR bar", db=db, limit=1,
+            current_session_id="cur",
+        ))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "title-session"
+        assert result.get("truncated") is False
+        assert "No matching sessions found" not in (result.get("message") or "")
+
 
 class TestDiscoveryTruncation:
     """B-hit responses are explicitly incomplete, never a silent top-K."""
