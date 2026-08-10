@@ -987,12 +987,20 @@ class TestCompressionRootToolParity:
         assert result.get("truncated") is True
         assert "warning" in result
 
-    def test_title_equal_to_current_session_excluded_and_truncated(self, db, monkeypatch):
-        """When the exact-title session IS the current session, its title is
-        excluded by the current-lineage guard (a session never surfaces as its
-        own result) — NOT by any proof gate.  The winner phase still runs and
-        honestly surfaces B exhaustion on the >B current chain via truncation
-        (#68 review round-5)."""
+    def test_title_equal_to_current_session_excluded_when_same_lineage(self, db, monkeypatch):
+        """The exact-title session IS the current session on a compression
+        chain: the title is excluded by the existing current-lineage guard (a
+        session never surfaces as its own result), and the winner phase still
+        runs and surfaces its own bound exhaustion via truncation.
+
+        Scope note (#68 review round-5): ``resolve_compression_lineage``'
+        default ``work_budget`` is captured at def time, so the B=4
+        monkeypatch below affects ONLY the winner phase (which reads the
+        module global dynamically).  The tool-side resolver here runs at the
+        real B=2000 and resolves the chain normally — this test does NOT
+        exercise "tool-side resolver itself B-hits on a >B chain".  That
+        edge is deliberately out of scope: no proof protocol is re-added to
+        cover it."""
         import hermes_state_search
         monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 4)
         for i in range(6):
@@ -1020,8 +1028,8 @@ class TestCompressionRootToolParity:
         ))
 
         assert result["success"] is True
-        # current session is never its own result; the >B current chain is
-        # honestly truncated
+        # current session is never its own result; the winner phase's >B
+        # current chain is honestly truncated
         assert result["count"] == 0
         assert result["results"] == []
         assert result.get("truncated") is True
