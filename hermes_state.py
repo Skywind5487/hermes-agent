@@ -70,6 +70,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     SCHEMA_VERSION,
     SESSIONS_FTS_SQL,
     SESSIONS_FTS_TRIGRAM_SQL,
+    SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
@@ -2851,8 +2852,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns one of:
 
-        - ``"absent"`` — no table OR view occupies the root name (fresh
-          install / never created).
+        - ``"absent"`` — no table, view, OR index occupies the root name
+          (fresh install / never created).
         - ``"legacy_simple"`` — the recognized historical Hermes shape
           (FTS5 ``tokenize='simple'``, INTERNAL content, and EXACTLY the
           title-only logical column set). This is the fork's pre-#30
@@ -2867,28 +2868,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           without built-in trigram may still carry a modern schema —
           unavailable there, not legacy.
         - ``"unknown_same_name"`` — an unrecognized same-name object: a VIEW
-          occupying the root name (classifying it ``absent`` would let
-          ``CREATE VIRTUAL TABLE IF NOT EXISTS`` no-op and seed H/P against
-          nothing), a non-FTS5 table, or any near-match that differs in
-          column shape / VIEW projection. Fail closed / diagnostic; never
-          blindly delete or demote it.
+          or INDEX occupying the root name (classifying either ``absent``
+          would let ``CREATE VIRTUAL TABLE IF NOT EXISTS`` no-op / raise
+          instead of failing closed), a non-FTS5 table, or any near-match
+          that differs in column shape / VIEW projection. Fail closed /
+          diagnostic; never blindly delete or demote it.
 
         ``cursor`` may be a Cursor or a Connection.
         """
         row = cursor.execute(
             "SELECT type, sql FROM sqlite_master "
-            "WHERE name = 'sessions_fts_trigram' AND type IN ('table', 'view')"
+            "WHERE name = 'sessions_fts_trigram' "
+            "AND type IN ('table', 'view', 'index')"
         ).fetchone()
         if row is None:
             return "absent"
         obj_type = row["type"] if isinstance(row, sqlite3.Row) else row[0]
         if obj_type != "table":
-            # A same-name VIEW occupies the root name — never a recognized
-            # Hermes shape. Classifying it ``absent`` would let the ensure
-            # path ``CREATE VIRTUAL TABLE IF NOT EXISTS`` silently no-op over
-            # the VIEW and then seed H/P + run a catch-up INSERT against a
-            # non-updatable VIEW (open error). #34: unknown same-name object
-            # → untouched, capability off.
+            # A same-name VIEW or INDEX occupies the root name — never a
+            # recognized Hermes shape. Classifying it ``absent`` would let
+            # the ensure path ``CREATE VIRTUAL TABLE IF NOT EXISTS`` silently
+            # no-op over the VIEW (then seed H/P + catch-up INSERT against a
+            # non-updatable VIEW) or raise ``there is already an index named
+            # ...`` for an INDEX — both are open errors, not fail-closed.
+            # #34: unknown same-name object → untouched, capability off.
             return "unknown_same_name"
         sql = (row[1] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
         # FTS5 itself is part of #34's identity: the same-name object must be
@@ -2952,10 +2955,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "AND sql LIKE '%tokenize=''simple''%'"
             )
             conn.execute("PRAGMA writable_schema=RESET")
+            # Only the EXACT legacy FTS5 shadow tables may move — never a
+            # prefix sweep: ``sessions_fts_trigram_%`` would rename any
+            # unrelated table that merely shares the prefix into the
+            # ``fts_v22_trash_`` namespace, where teardown deletes it
+            # (data loss, #30 round-9 P1).
+            placeholders = ", ".join("?" for _ in SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES)
             shadows = [
                 r[0] for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name LIKE 'sessions_fts_trigram\\_%' ESCAPE '\\'"
+                    f"AND name IN ({placeholders})",
+                    tuple(SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES),
                 ).fetchall()
             ]
             for sh in shadows:

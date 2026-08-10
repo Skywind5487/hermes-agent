@@ -450,6 +450,45 @@ def _build_same_name_root_view_db(db_path):
     conn.close()
 
 
+def _build_same_name_root_index_db(db_path):
+    """DB whose ``sessions_fts_trigram`` NAME is occupied by a plain INDEX
+    (on ``sessions``; no table/view with that name). #34: an unknown
+    same-name object must classify ``unknown_same_name`` — NEVER ``absent``,
+    which would let the ensure path ``CREATE VIRTUAL TABLE IF NOT EXISTS``
+    raise ``there is already an index named sessions_fts_trigram`` instead of
+    failing closed."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 'A', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute("CREATE INDEX sessions_fts_trigram ON sessions(id)")
+    conn.commit()
+    conn.close()
+
+
+def _build_legacy_simple_with_unrelated_shadow_db(db_path):
+    """Exact legacy ``tokenize='simple'`` same-name root PLUS an unrelated
+    table that merely shares the ``sessions_fts_trigram_`` prefix
+    (``sessions_fts_trigram_unrelated``) with a sentinel row. The demotion's
+    shadow discovery must NOT sweep it into ``fts_v22_trash_*`` (teardown
+    would delete it) — only the exact legacy FTS5 shadow tables may move."""
+    _build_legacy_simple_sessions_trigram_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE sessions_fts_trigram_unrelated (k TEXT PRIMARY KEY, v TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO sessions_fts_trigram_unrelated VALUES ('sentinel', 'keep')"
+    )
+    conn.commit()
+    conn.close()
+
+
 def _seed_an94_row(db):
     """Insert the canonical #30 sample metadata row (live, > H on a fresh
     DB with no markers) so search fixtures share one shape."""
@@ -747,6 +786,33 @@ class TestSchemaClassifier:
                 "WHERE name = 'sessions_fts_trigram'"
             ).fetchone()
             assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "view"
+        finally:
+            r.close()
+
+    def test_classifier_root_same_name_index_unknown(self, tmp_path):
+        """A same-name INDEX occupying the root name must classify
+        ``unknown_same_name`` — NEVER ``absent``. ``absent`` would let the
+        ensure path ``CREATE VIRTUAL TABLE IF NOT EXISTS`` raise ``there is
+        already an index named ...`` instead of failing closed. The open path
+        must fail closed: no H/P seed, the index preserved, capability false,
+        and open must not raise."""
+        db_path = tmp_path / "root_index.db"
+        _build_same_name_root_index_db(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.close()
+        r = SessionDB(db_path=db_path)  # must not raise
+        try:
+            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
+            assert r._sessions_trigram_available is False
+            # No durable trigram claim was staged.
+            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
+            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
+            # The same-name index survives untouched.
+            obj = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'sessions_fts_trigram'"
+            ).fetchone()
+            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "index"
         finally:
             r.close()
 
@@ -1181,6 +1247,44 @@ class TestLegacySameNameConvergence:
                 "AND name LIKE 'fts_v22_trash_%' ESCAPE '\\'"
             ).fetchone()[0]
             assert remaining == 0
+        finally:
+            r.close()
+
+    def test_legacy_demotion_leaves_unrelated_prefix_table(self, tmp_path):
+        """P1: the demotion's shadow discovery must only move the exact
+        legacy FTS5 shadow tables — an unrelated table that merely shares the
+        ``sessions_fts_trigram_`` prefix must survive migration AND teardown
+        (with its data), never being swept into ``fts_v22_trash_*``."""
+        db_path = tmp_path / "legacy_unrelated.db"
+        _build_legacy_simple_with_unrelated_shadow_db(db_path)
+        r = SessionDB(db_path=db_path)
+        try:
+            assert r._sessions_trigram_available is True
+            # The unrelated table was NOT renamed to trash — it survives in
+            # place with its sentinel data.
+            obj = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'sessions_fts_trigram_unrelated'"
+            ).fetchone()
+            assert obj is not None
+            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "table"
+            row = r._conn.execute(
+                "SELECT v FROM sessions_fts_trigram_unrelated WHERE k = 'sentinel'"
+            ).fetchone()
+            assert (row["v"] if isinstance(row, sqlite3.Row) else row[0]) == "keep"
+            # Run the trash teardown to completion — the unrelated table must
+            # not be touched even after teardown.
+            while r._fts_teardown_trash_step():
+                pass
+            obj2 = r._conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE name = 'sessions_fts_trigram_unrelated'"
+            ).fetchone()
+            assert obj2 is not None
+            row2 = r._conn.execute(
+                "SELECT v FROM sessions_fts_trigram_unrelated WHERE k = 'sentinel'"
+            ).fetchone()
+            assert (row2["v"] if isinstance(row2, sqlite3.Row) else row2[0]) == "keep"
         finally:
             r.close()
 

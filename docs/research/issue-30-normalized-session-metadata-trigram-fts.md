@@ -320,3 +320,29 @@ Pinned by `test_classifier_root_same_name_view_unknown` (same-name root VIEW
 open must not raise — RED with the exact `cannot modify ... because it is a
 view` error before the fix, GREEN after).
 
+### Round-9 fix — exact shadow allowlist + root classifier sees index (P1+P2, 2026-08-10)
+
+Round-9 review found two migration-safety findings:
+
+**P1 — legacy demotion shadow discovery too broad.** The demotion renamed
+shadow tables by prefix sweep (`name LIKE 'sessions_fts_trigram\_%'`), so any
+unrelated table that merely shares the prefix (e.g.
+`sessions_fts_trigram_unrelated`) was renamed into `fts_v22_trash_*` — where
+teardown deletes it (data loss). Now only the EXACT five legacy FTS5 shadow
+tables move, via the new `SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES` allowlist
+(`_data/_idx/_content/_docsize/_config`), never a prefix sweep. Pinned by
+`test_legacy_demotion_leaves_unrelated_prefix_table` (unrelated prefix table
++ sentinel row survives migration AND teardown — RED before, the table was
+swept into trash, GREEN after).
+
+**P2 — same-name INDEX classified `absent`.** The root classifier looked up
+only the table/view namespace, so a same-name index was `absent` — and
+`CREATE VIRTUAL TABLE IF NOT EXISTS` then raised `there is already an index
+named sessions_fts_trigram` instead of failing closed. The root lookup now
+covers `type IN ('table', 'view', 'index')`; only a table proceeds to the
+exact FTS5 DDL identity, anything else is `unknown_same_name`. Pinned by
+`test_classifier_root_same_name_index_unknown` (same-name harmless index →
+`unknown_same_name`, no H/P seed, index preserved, capability false, open not
+raise — RED with the exact `there is already an index named ...` error before
+the fix, GREEN after).
+

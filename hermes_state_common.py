@@ -858,6 +858,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_trigram USING fts5(
 );
 """
 
+# The EXACT FTS5 shadow tables of a ``sessions_fts_trigram`` vtable (INTERNAL
+# content, so all five exist). The legacy demotion may only move these — a
+# broad ``sessions_fts_trigram_%`` prefix sweep would rename unrelated
+# tables that merely share the prefix into the ``fts_v22_trash_`` namespace,
+# where teardown deletes them (data loss, #30 round-9 P1).
+SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES = (
+    "sessions_fts_trigram_data",
+    "sessions_fts_trigram_idx",
+    "sessions_fts_trigram_content",
+    "sessions_fts_trigram_docsize",
+    "sessions_fts_trigram_config",
+)
+
 
 # CJK title search — cjk_unicode61 loadable tokenizer, mirroring
 # messages_fts_cjk. Requires libfts5_cjk.so (native/fts5_cjk/build.sh);
