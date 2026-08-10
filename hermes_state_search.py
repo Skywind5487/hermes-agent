@@ -2380,11 +2380,26 @@ class SessionSearchMixin:
                         or int(candidate["message_compacted"] or 0) == 1
                     )
 
+                # Ranked DISTINCT owner candidates (frozen #68 pipeline): group
+                # the bounded raw hits by owning session with each owner's hits
+                # in rank order, then resolve each owner exactly ONCE.  From the
+                # owner's ranked hits pick the first displayable anchor — under
+                # current exclusion a live hit is skipped so the next
+                # compacted-history hit of the same owner still surfaces
+                # (compacted history is never erased by owner dedupe).
+                owner_hits: Dict[str, List[Dict[str, Any]]] = {}
+                owner_order: List[str] = []
                 for candidate in candidates:
+                    owner = str(candidate["owning_session_id"])
+                    if owner not in owner_hits:
+                        owner_hits[owner] = []
+                        owner_order.append(owner)
+                    owner_hits[owner].append(candidate)
+
+                for owner in owner_order:
                     if len(winners) >= result_limit:
                         break
                     state.candidates_inspected += 1
-                    owner = str(candidate["owning_session_id"])
                     outcome = self._resolve_compression_lineage_on_conn(
                         conn, owner, state
                     )
@@ -2399,38 +2414,37 @@ class SessionSearchMixin:
                     root = outcome
                     if root in excluded_roots:
                         continue
-                    if current_root is not None and root == current_root:
-                        # Current compression-lineage exclusion: live content
-                        # is already in context, but compression-archived
-                        # history (a compression-ended owner or a compacted
-                        # matched row) is not in live context and stays
-                        # discoverable.  Per-hit: if THIS hit is rejected, a
-                        # later compacted hit of the same owner is still tried,
-                        # so compacted history is never erased by owner dedupe.
-                        if not _is_archived(candidate):
-                            continue
-                    if owner in current_ancestors:
-                        # A live-context generic ancestor of the current
-                        # session (delegation/branch parent) is still visible
-                        # to the agent; the same compression carve-out applies.
-                        if not _is_archived(candidate):
-                            continue
                     if root in seen_roots:
+                        continue
+                    in_current_context = (
+                        (current_root is not None and root == current_root)
+                        or owner in current_ancestors
+                    )
+                    anchor: Optional[Dict[str, Any]] = None
+                    for hit in owner_hits[owner]:
+                        if in_current_context and not _is_archived(hit):
+                            # live content of the current lineage stays hidden;
+                            # a later compacted-history hit of this owner is
+                            # still tried as the anchor.
+                            continue
+                        anchor = hit
+                        break
+                    if anchor is None:
                         continue
                     seen_roots.add(root)
                     state.accepted_roots = len(seen_roots)
                     winners.append({
-                        "id": candidate["message_id"],
+                        "id": anchor["message_id"],
                         "session_id": owner,
-                        "role": candidate["role"],
-                        "snippet": candidate["snippet"],
-                        "timestamp": candidate["timestamp"],
-                        "source": candidate["source"],
-                        "model": candidate["model"],
-                        "session_started": candidate["session_started"],
+                        "role": anchor["role"],
+                        "snippet": anchor["snippet"],
+                        "timestamp": anchor["timestamp"],
+                        "source": anchor["source"],
+                        "model": anchor["model"],
+                        "session_started": anchor["session_started"],
                         "lineage_root_id": root,
-                        "candidate_order": candidate["candidate_order"],
-                        "source_priority": candidate["source_priority"],
+                        "candidate_order": anchor["candidate_order"],
+                        "source_priority": anchor["source_priority"],
                     })
 
                 if route != "like" and winners:

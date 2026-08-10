@@ -962,3 +962,22 @@ def test_sql_winners_concurrent_writer_does_not_tear_winner_snapshot(
     roots = {row["lineage_root_id"] for row in result["winners"]}
     assert roots == {"root", "other"}
     assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_sql_winners_candidates_inspected_counts_distinct_owners(db):
+    # The resolver consumes ranked DISTINCT owner candidates: two raw hits
+    # owned by one session count as ONE inspected candidate, even though the
+    # compacted-anchor fallback keeps all of the owner's hits available.
+    _create(db, "m1", source="cli")
+    _message(db, "m1", "needle first")
+    _message(db, "m1", "needle second")
+    _create(db, "m2", source="cli")
+    _message(db, "m2", "needle other")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )
+    assert result["stats"]["candidate_count"] == 3        # raw hits
+    assert result["stats"]["candidate_unique_sessions"] == 2  # distinct owners
+    assert result["stats"]["lineage_candidates_inspected"] == 2  # not 3
+    assert len(result["winners"]) == 2

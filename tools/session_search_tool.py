@@ -744,51 +744,35 @@ def _discover(
     _title_ms = (time.perf_counter() - _title_t0) * 1000
 
     _search_t0 = time.perf_counter()
-    if title_result and limit <= 1:
-        winner_response = {
-            "winners": [],
-            "stats": {
-                "candidate_count": 0,
-                "candidate_unique_sessions": 0,
-                "lineage_count": 0,
-                "winner_count": 0,
-                "lineage_work": 0,
-                "lineage_memo_hits": 0,
-                "lineage_memo_entries": 0,
-                "lineage_candidates_inspected": 0,
-                "lineage_bound_hit": False,
-                "route": "none",
-            },
-        }
-    else:
-        try:
-            # Pass the RAW current and title session ids so the winner phase
-            # re-resolves both inside its own snapshot with the SAME
-            # memo/state/budget used for candidate roots (#68): current and
-            # title exclusion share the DB compression-root semantics instead
-            # of trusting stale precomputed root strings, and a B-limited
-            # resolution is never rewritten into a fabricated root.
-            winner_response = db.search_session_winners(
-                query=query,
-                role_filter=role_list,
-                exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-                candidate_limit=_DISCOVER_SCAN_LIMIT,
-                result_limit=max(0, limit - (1 if title_result else 0)),
-                sort=sort,
-                current_session_id=current_session_id or None,
-                title_session_id=(
-                    title_result["session_id"] if title_result else None
-                ),
-                request_id=_request_id,
-            )
-        except Exception as e:
-            _elapsed = (time.perf_counter() - _t0) * 1000
-            logging.error(
-                "DISCOVER_FAIL total_ms=%d resolve_ms=%d title_ms=%d error=%s",
-                int(_elapsed), int(_resolve_ms), int(_title_ms), e,
-            )
-            logging.error("SQL session winner search failed: %s", e, exc_info=True)
-            return tool_error(f"Search failed: {e}", success=False)
+    try:
+        # Always run the winner phase — even when an exact-title result already
+        # fills the only slot (result_limit becomes 0) — so the RAW current and
+        # title session ids are re-resolved inside one snapshot with the SAME
+        # memo/state/budget used for candidate roots (#68).  A title-only K=1
+        # search must still surface B exhaustion: if the snapshot cannot prove
+        # the title is a distinct lineage, the answer is truncated, not a
+        # complete "title matched".
+        winner_response = db.search_session_winners(
+            query=query,
+            role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            candidate_limit=_DISCOVER_SCAN_LIMIT,
+            result_limit=max(0, limit - (1 if title_result else 0)),
+            sort=sort,
+            current_session_id=current_session_id or None,
+            title_session_id=(
+                title_result["session_id"] if title_result else None
+            ),
+            request_id=_request_id,
+        )
+    except Exception as e:
+        _elapsed = (time.perf_counter() - _t0) * 1000
+        logging.error(
+            "DISCOVER_FAIL total_ms=%d resolve_ms=%d title_ms=%d error=%s",
+            int(_elapsed), int(_resolve_ms), int(_title_ms), e,
+        )
+        logging.error("SQL session winner search failed: %s", e, exc_info=True)
+        return tool_error(f"Search failed: {e}", success=False)
     _search_ms = (time.perf_counter() - _search_t0) * 1000
     winner_rows = winner_response.get("winners", [])
     winner_stats = winner_response.get("stats", {})
