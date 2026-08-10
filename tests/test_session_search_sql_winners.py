@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 import time
 
 import pytest
@@ -742,3 +743,222 @@ def test_sql_winners_long_acyclic_chain_cut_by_budget_not_depth_cap(
     assert result["stats"]["lineage_bound_hit"] is True
     assert result["stats"]["lineage_work"] == 40
     assert result["winners"] == []
+
+
+# =====================================================================
+# #68 review round: title in-snapshot parity, compacted-history anchor
+# fallback, and the mandated acceptance matrix (real B boundaries,
+# concurrency snapshot, 10k chain, internal-K stress).
+# =====================================================================
+
+
+def _bulk_positive_chain(db, prefix, n, source="cli"):
+    """Bulk-build a positive compression chain of *n* sessions.
+
+    SessionDB's writer connection is autocommit, so a per-row insert would
+    fsync every row (~40x slower).  Wrapping the inserts + parent links in
+    one explicit BEGIN/COMMIT keeps the fixture fast enough for real
+    B=2000-boundary chains.
+    """
+    base = prefix
+    now = time.time()
+    db._conn.execute("BEGIN")
+    db._conn.executemany(
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+        [(f"{base}-{i}", source, now) for i in range(n)],
+    )
+    for i in range(n - 1):
+        child, parent = f"{base}-{i}", f"{base}-{i + 1}"
+        db._conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+            (parent, child),
+        )
+        db._conn.execute(
+            "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+            (parent,),
+        )
+    db._conn.execute("COMMIT")
+    return [f"{base}-{i}" for i in range(n)]
+
+
+def test_sql_winners_title_session_excludes_lineage_in_snapshot(db):
+    # title_session_id is re-resolved inside the winner snapshot; its whole
+    # compression lineage is fully excluded from content winners.
+    _create(db, "troot", source="cli")
+    _message(db, "troot", "needle title root")
+    db.end_session("troot", "compression")
+    _create(db, "tchild", source="cli", parent="troot")
+    _message(db, "tchild", "needle title child")
+    _create(db, "other", source="cli")
+    _message(db, "other", "needle title other")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5,
+        title_session_id="tchild",
+    )
+    assert [row["session_id"] for row in result["winners"]] == ["other"]
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_sql_winners_title_lineage_budget_shared_with_content(db, monkeypatch):
+    # title_session_id consumes the SAME budget as content candidates: a title
+    # lineage deeper than B honestly truncates instead of returning a duplicate
+    # lineage member with a stale/fabricated root.
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 4)
+    ids = _chain_sessions(db, "tl", 6)
+    _message(db, ids[0], "needle deep title")
+    _link_positive_chain(db, ids)
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5,
+        title_session_id=ids[0],
+    )
+    assert result["stats"]["lineage_bound_hit"] is True
+    assert result["winners"] == []
+
+
+def test_sql_winners_current_lineage_compacted_history_anchor_fallback(db):
+    # In the current lineage, the NEWEST hit is live (current-excluded), but
+    # the older compacted hit of the same owner must still surface AS THE
+    # ANCHOR — per-owner dedupe must never erase compacted history.
+    db.create_session("cur", source="cli")
+    compacted_id = _message(db, "cur", "old compacted needle")
+    db.archive_and_compact("cur", [{"role": "assistant", "content": "summary"}])
+    _message(db, "cur", "new live needle")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user", "assistant"], result_limit=5,
+        sort="newest", current_session_id="cur",
+    )
+    winners = result["winners"]
+    assert len(winners) == 1
+    assert winners[0]["session_id"] == "cur"
+    assert winners[0]["id"] == compacted_id
+
+
+def test_sql_winners_default_budget_1999_succeeds(db):
+    # A root resolved on successful lookup 1999 succeeds with the default B.
+    ids = _bulk_positive_chain(db, "b1999", 1999)
+    _message(db, ids[0], "needle 1999")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )
+    assert result["winners"][0]["lineage_root_id"] == ids[-1]
+    assert result["stats"]["lineage_work"] == 1999
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_sql_winners_default_budget_2000_succeeds(db):
+    # A root resolved on successful lookup 2000 (the boundary) succeeds.
+    ids = _bulk_positive_chain(db, "b2000", 2000)
+    _message(db, ids[0], "needle 2000")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )
+    assert result["winners"][0]["lineage_root_id"] == ids[-1]
+    assert result["stats"]["lineage_work"] == 2000
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_sql_winners_default_budget_2001_truncates(db):
+    # A resolution that would need lookup 2001 stops BEFORE it with the
+    # default B, flags bound-hit, and returns no fabricated winner.
+    ids = _bulk_positive_chain(db, "b2001", 2001)
+    _message(db, ids[0], "needle 2001")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )
+    assert result["stats"]["lineage_bound_hit"] is True
+    assert result["winners"] == []
+
+
+def test_sql_winners_10k_acyclic_chain_cut_by_default_budget(db):
+    # A real 10k-node acyclic chain is cut by the default B=2000 work budget,
+    # not by any semantic depth cap.
+    ids = _bulk_positive_chain(db, "path10k", 10000)
+    _message(db, ids[0], "needle path")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )
+    assert result["stats"]["lineage_bound_hit"] is True
+    assert result["stats"]["lineage_work"] == 2000
+    assert result["winners"] == []
+
+
+def test_sql_winners_internal_k_stress(db):
+    # Larger internal K (beyond the public K<=10 tool path) is a defensive DB
+    # contract, not the normal product path.
+    for i in range(60):
+        _create(db, f"ik-{i}", source="cli")
+        _message(db, f"ik-{i}", "needle internal k")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], candidate_limit=200, result_limit=60
+    )
+    assert len(result["winners"]) == 60
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_sql_winners_lineage_lookups_in_one_explicit_read_transaction(
+    db, monkeypatch,
+):
+    # Candidate selection plus every lineage point lookup for one logical
+    # search must run inside ONE explicit read transaction (one coherent
+    # logical snapshot), not separate autocommit statements.
+    original = SessionDB._resolve_compression_lineage_on_conn
+    observed = []
+
+    def spy(self, conn, session_id, state):
+        observed.append(conn.in_transaction)
+        return original(self, conn, session_id, state)
+
+    monkeypatch.setattr(SessionDB, "_resolve_compression_lineage_on_conn", spy)
+    _create(db, "root", source="cli")
+    _message(db, "root", "snap needle")
+    db.end_session("root", "compression")
+    _create(db, "child", source="cli", parent="root")
+    _message(db, "child", "snap needle")
+
+    db.search_session_winners("snap", role_filter=["user"], result_limit=5)
+
+    assert observed
+    assert all(observed)
+
+
+def test_sql_winners_concurrent_writer_does_not_tear_winner_snapshot(
+    db, monkeypatch,
+):
+    # A writer hammering the locked write path during a winner search cannot
+    # interleave into the winner snapshot: the search observes a coherent
+    # root set from one logical moment.
+    original = SessionDB._resolve_compression_lineage_on_conn
+
+    def slow(self, conn, session_id, state):
+        time.sleep(0.02)
+        return original(self, conn, session_id, state)
+
+    monkeypatch.setattr(SessionDB, "_resolve_compression_lineage_on_conn", slow)
+    _create(db, "root", source="cli")
+    _message(db, "root", "snap needle")
+    db.end_session("root", "compression")
+    _create(db, "child", source="cli", parent="root")
+    _message(db, "child", "snap needle")
+    _create(db, "other", source="cli")
+    _message(db, "other", "snap needle")
+
+    def writer():
+        for i in range(10):
+            db.create_session(f"cw-{i}", source="cli")
+
+    t = threading.Thread(target=writer)
+    t.start()
+    result = db.search_session_winners("snap", role_filter=["user"], result_limit=5)
+    t.join()
+
+    roots = {row["lineage_root_id"] for row in result["winners"]}
+    assert roots == {"root", "other"}
+    assert result["stats"]["lineage_bound_hit"] is False

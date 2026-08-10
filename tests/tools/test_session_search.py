@@ -893,6 +893,55 @@ class TestCompressionRootToolParity:
         assert "t_generic_child" in sids
         assert result["count"] == 2
 
+    def test_compacted_history_discoverable_even_when_best_hit_is_live(self, db):
+        """sort=newest ranks the LIVE needle first; the older compacted needle
+        of the same current session must still surface (with the compacted
+        anchor) instead of being erased by per-owner dedupe (#68 review)."""
+        db.create_session("s_cur", source="cli")
+        compacted_id = db.append_message(
+            "s_cur", role="user", content="old compacted needle content"
+        )
+        db.archive_and_compact("s_cur", [
+            {"role": "assistant", "content": "summary"},
+        ])
+        live_id = db.append_message(
+            "s_cur", role="user", content="new live needle content"
+        )
+
+        result = json.loads(session_search(
+            query="needle", db=db, current_session_id="s_cur", sort="newest",
+        ))
+
+        assert result["success"] is True
+        assert result["count"] >= 1
+        hit = result["results"][0]
+        assert hit["session_id"] == "s_cur"
+        # the anchor is the compacted (archived) message, not the live one
+        assert hit["match_message_id"] == compacted_id
+        assert hit["match_message_id"] != live_id
+
+    def test_title_and_content_share_compression_root_in_snapshot(self, db):
+        """Exact-title exclusion is re-resolved in the winner snapshot: a
+        content hit in the title's compression lineage is excluded even though
+        its own session id differs from the title session id."""
+        db.create_session("t_parent", source="cli")
+        db.set_session_title("t_parent", "needle-title")
+        db.append_message("t_parent", role="user", content="parent filler")
+        db.end_session("t_parent", "compression")
+        db.create_session("t_child", source="cli",
+                          parent_session_id="t_parent")
+        db.append_message("t_child", role="user",
+                          content="needle-title appears in child")
+
+        result = json.loads(session_search(query="needle-title", db=db, limit=5))
+
+        assert result["success"] is True
+        sids = [r["session_id"] for r in result["results"]]
+        # Title slot: t_parent. Content lane: t_child is the same compression
+        # lineage -> excluded, so the title is the only result.
+        assert sids == ["t_parent"]
+        assert result.get("truncated") is False
+
 
 class TestDiscoveryTruncation:
     """B-hit responses are explicitly incomplete, never a silent top-K."""
