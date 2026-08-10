@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 
 import pytest
 
@@ -29,7 +30,11 @@ def _create(db, session_id, source="cli", parent=None):
 
 
 def test_sql_winners_keep_best_hit_per_lineage_and_preserve_candidate_scan(db):
+    # Only a positive compression-continuation edge (parent ended by
+    # compression, child not a tool session, no parent-bound marker)
+    # collapses a child into its parent.  Generic parentage is NOT lineage.
     _create(db, "root", source="cli")
+    db.end_session("root", "compression")
     _create(db, "child", source="cli", parent="root")
     _create(db, "other", source="cli")
     root_id = _message(db, "root", "needle root")
@@ -58,7 +63,13 @@ def test_sql_winners_keep_best_hit_per_lineage_and_preserve_candidate_scan(db):
 
 
 def test_sql_winners_match_existing_python_oracle_for_all_temporal_orders(db):
+    # The Python oracle resolves lineage with the SAME positive
+    # compression-continuation semantics as the SQL winner seam (the
+    # public resolve_compression_lineage wrapper), so this test validates
+    # the candidate ranking / owner dedupe / early-K integration, not a
+    # second, generic-parent definition of lineage.
     _create(db, "oracle-root", source="telegram")
+    db.end_session("oracle-root", "compression")
     _create(db, "oracle-child", source="cron", parent="oracle-root")
     _create(db, "oracle-other", source="cli")
     _create(db, "oracle-cron", source="cron")
@@ -78,7 +89,9 @@ def test_sql_winners_match_existing_python_oracle_for_all_temporal_orders(db):
         expected = []
         seen = set()
         for hit in _order_for_recall(raw):
-            root = _resolve_to_parent(db, hit["session_id"])
+            root = db.resolve_compression_lineage(hit["session_id"])
+            if root is None:
+                continue
             if root in seen:
                 continue
             seen.add(root)
@@ -135,7 +148,11 @@ def test_sql_winners_apply_source_priority_before_final_limit(db):
 
 
 def test_sql_winners_exclude_current_and_explicit_lineages(db):
+    # A compression continuation child shares the parent's root, so current
+    # exclusion removes the whole positive compression lineage.  An explicit
+    # excluded root is removed entirely.
     _create(db, "current-root", source="cli")
+    db.end_session("current-root", "compression")
     _create(db, "current-child", source="cli", parent="current-root")
     _create(db, "excluded", source="cli")
     _create(db, "kept", source="cli")
@@ -153,28 +170,60 @@ def test_sql_winners_exclude_current_and_explicit_lineages(db):
     assert [row["lineage_root_id"] for row in result["winners"]] == ["kept"]
 
 
-def test_sql_winners_handle_missing_parent_cycle_and_depth_cap(db):
-    _create(db, "missing-parent-child", source="cli")
+def test_sql_winners_current_exclusion_generic_child_stays_distinct(db):
+    # Generic parentage is NOT compression lineage: a plain child of the
+    # current root keeps its own root and must not be swallowed by the
+    # current-session exclusion.
+    _create(db, "cur", source="cli")
+    _create(db, "gen-child", source="cli", parent="cur")
+    _message(db, "cur", "filter needle")
+    _message(db, "gen-child", "filter needle")
+
+    result = db.search_session_winners(
+        "filter",
+        role_filter=["user"],
+        result_limit=10,
+        current_lineage_root="cur",
+    )
+
+    assert [row["lineage_root_id"] for row in result["winners"]] == ["gen-child"]
+
+
+def _set_parent(db, session_id, parent):
+    """Point *session_id* at *parent* (FK-safe for dangling parents)."""
     db._conn.execute("PRAGMA foreign_keys = OFF")
     db._conn.execute(
         "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
-        ("missing-parent", "missing-parent-child"),
+        (parent, session_id),
     )
     db._conn.commit()
     db._conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _set_marker(db, session_id, **markers):
+    """Write branch/delegate markers into a session's model_config JSON."""
+    row = db._conn.execute(
+        "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    cfg = json.loads(row["model_config"]) if row["model_config"] else {}
+    cfg.update(markers)
+    db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        (json.dumps(cfg), session_id),
+    )
+    db._conn.commit()
+
+
+def test_sql_winners_handle_missing_parent_cycle_and_depth_cap(db):
+    # #68: missing parents and positive cycles fail closed (the candidate is
+    # dropped, never given a fabricated root), and generic parentage is not
+    # lineage identity, so lineage_depth_cap no longer participates.
+    _create(db, "missing-parent-child", source="cli")
+    _set_parent(db, "missing-parent-child", "missing-parent")
     _create(db, "cycle-a", source="cli")
     _create(db, "cycle-b", source="cli")
-    db._conn.execute("PRAGMA foreign_keys = OFF")
-    db._conn.execute(
-        "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
-        ("cycle-b", "cycle-a"),
-    )
-    db._conn.execute(
-        "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
-        ("cycle-a", "cycle-b"),
-    )
-    db._conn.commit()
-    db._conn.execute("PRAGMA foreign_keys = ON")
+    _set_parent(db, "cycle-a", "cycle-b")
+    _set_parent(db, "cycle-b", "cycle-a")
     _create(db, "depth-root", source="cli")
     _create(db, "depth-child", source="cli", parent="depth-root")
     _create(db, "depth-grandchild", source="cli", parent="depth-child")
@@ -194,9 +243,10 @@ def test_sql_winners_handle_missing_parent_cycle_and_depth_cap(db):
     )
     by_session = {row["session_id"]: row for row in result["winners"]}
 
-    assert by_session["missing-parent-child"]["lineage_root_id"] == "missing-parent-child"
-    assert by_session["cycle-a"]["lineage_root_id"] in {"cycle-a", "cycle-b"}
-    assert by_session["depth-grandchild"]["lineage_root_id"] == "depth-child"
+    assert "missing-parent-child" not in by_session
+    assert "cycle-a" not in by_session
+    assert "cycle-b" not in by_session
+    assert by_session["depth-grandchild"]["lineage_root_id"] == "depth-grandchild"
 
 
 def test_discovery_does_not_hydrate_candidate_context(db, caplog):
@@ -271,3 +321,406 @@ def test_sql_winners_cjk_trigram_route_when_available(db):
     assert result["stats"]["route"] == "trigram"
     assert result["winners"][0]["session_id"] == "cjk-trigram"
     assert "content" not in result["winners"][0]
+
+
+# =====================================================================
+# #68 compression-lineage resolver contract
+#
+# These tests exercise the observable winner-search contract: positive
+# compression-continuation roots, distinct-owner candidates with the best
+# preserved anchor, fail-closed missing/cycle semantics, query-local memo
+# reuse, early-K, and the B=2000 work budget.
+# =====================================================================
+
+
+def _positive_chain(db, prefix, n, source="cli"):
+    """Create a positive compression lineage of *n* sessions.
+
+    ``ids[0]`` is the tip; ``ids[i]``'s parent ``ids[i+1]`` ended by
+    compression, so resolving ``ids[0]`` walks ``n`` successful uncached
+    point lookups to the root ``ids[n-1]``.
+    """
+    ids = [f"{prefix}-{i}" for i in range(n)]
+    for sid in ids:
+        db.create_session(sid, source=source)
+    for i in range(n - 1):
+        child, parent = ids[i], ids[i + 1]
+        db._conn.execute("PRAGMA foreign_keys = OFF")
+        db._conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+            (parent, child),
+        )
+        db._conn.execute(
+            "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+            (parent,),
+        )
+        db._conn.commit()
+        db._conn.execute("PRAGMA foreign_keys = ON")
+    return ids
+
+
+def test_sql_winners_branch_marker_to_parent_stays_distinct(db):
+    _create(db, "broot", source="cli")
+    db.end_session("broot", "compression")
+    _create(db, "bchild", source="cli", parent="broot")
+    _set_marker(db, "bchild", _branched_from="broot")
+    _message(db, "broot", "needle branch")
+    _message(db, "bchild", "needle branch")
+
+    winners = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )["winners"]
+    by_root = {row["lineage_root_id"] for row in winners}
+    assert {"broot", "bchild"} <= by_root
+
+
+def test_sql_winners_delegate_marker_to_parent_stays_distinct(db):
+    _create(db, "droot", source="cli")
+    db.end_session("droot", "compression")
+    _create(db, "dchild", source="cli", parent="droot")
+    _set_marker(db, "dchild", _delegate_from="droot")
+    _message(db, "droot", "needle delegate")
+    _message(db, "dchild", "needle delegate")
+
+    winners = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )["winners"]
+    by_root = {row["lineage_root_id"] for row in winners}
+    assert {"droot", "dchild"} <= by_root
+
+
+def test_sql_winners_tool_child_stays_distinct(db):
+    _create(db, "troot", source="cli")
+    db.end_session("troot", "compression")
+    _create(db, "tchild", source="tool", parent="troot")
+    _message(db, "troot", "needle toolchild")
+    _message(db, "tchild", "needle toolchild")
+
+    winners = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )["winners"]
+    by_root = {row["lineage_root_id"] for row in winners}
+    assert {"troot", "tchild"} <= by_root
+
+
+def test_sql_winners_foreign_marker_does_not_block_continuation(db):
+    # A branch/delegate marker pointing somewhere OTHER than the parent is
+    # foreign and must not disqualify a real compression-continuation edge.
+    _create(db, "froot", source="cli")
+    db.end_session("froot", "compression")
+    _create(db, "fchild", source="cli", parent="froot")
+    _set_marker(db, "fchild", _branched_from="somewhere-else")
+    _message(db, "froot", "needle foreign")
+    _message(db, "fchild", "needle foreign")
+
+    winners = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )["winners"]
+    assert {row["lineage_root_id"] for row in winners} == {"froot"}
+    assert all(row["session_id"] != "fchild" for row in winners)
+
+
+def test_sql_winners_owner_dedupe_preserves_best_anchor(db):
+    # Two raw hits owned by one session become ONE owner candidate whose
+    # anchor is the earliest/highest-ranked raw hit (first by candidate
+    # order), not the last one.
+    _create(db, "multi", source="cli")
+    first_id = _message(db, "multi", "needle anchor first")
+    _message(db, "multi", "needle anchor second")
+    _create(db, "multi2", source="cli")
+    _message(db, "multi2", "needle anchor other")
+
+    winners = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )["winners"]
+    multi_winner = next(w for w in winners if w["session_id"] == "multi")
+    assert multi_winner["id"] == first_id
+    assert len(winners) == 2
+
+
+def test_sql_winners_early_k_stops_before_trailing_candidates(db):
+    # K=1 must stop after the first accepted root even when a pathological
+    # candidate sits later in the ranked scan.
+    _create(db, "e1", source="cli")
+    _message(db, "e1", "early needle")
+    _create(db, "e2", source="cli")
+    db.end_session("e2", "compression")
+    for i in range(30):
+        _create(db, f"e2-child-{i}", source="cli", parent="e2")
+        _message(db, f"e2-child-{i}", "early needle")
+
+    result = db.search_session_winners(
+        "early", role_filter=["user"], candidate_limit=100, result_limit=1
+    )
+    assert len(result["winners"]) == 1
+    assert result["stats"]["lineage_candidates_inspected"] <= 2
+
+
+def test_sql_winners_missing_parent_fails_closed_and_memo_reuses(db):
+    _create(db, "m-child", source="cli")
+    _set_parent(db, "m-child", "m-missing")
+    _message(db, "m-child", "needle missing")
+    _create(db, "m-child2", source="cli")
+    _set_parent(db, "m-child2", "m-missing")
+    _message(db, "m-child2", "needle missing")
+    _create(db, "m-ok", source="cli")
+    _message(db, "m-ok", "needle missing")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )
+    winners = result["winners"]
+    assert [row["session_id"] for row in winners] == ["m-ok"]
+    # Both missing-parent children resolve to the SAME proven-unresolved
+    # outcome: the second reuses the memo at zero extra lookup work.
+    assert result["stats"]["lineage_work"] == 2  # m-child + m-ok
+
+
+def test_sql_winners_two_node_cycle_fails_closed(db):
+    # Every edge must be a positive compression edge for the cycle to be
+    # reachable, so each member ends by compression.
+    _create(db, "c-a", source="cli")
+    _create(db, "c-b", source="cli")
+    db.end_session("c-a", "compression")
+    db.end_session("c-b", "compression")
+    _set_parent(db, "c-a", "c-b")
+    _set_parent(db, "c-b", "c-a")
+    _message(db, "c-a", "needle cycle")
+    _message(db, "c-b", "needle cycle")
+
+    winners = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )["winners"]
+    assert winners == []
+
+
+def test_sql_winners_long_cycle_fails_closed(db):
+    _create(db, "l-a", source="cli")
+    _create(db, "l-b", source="cli")
+    _create(db, "l-c", source="cli")
+    for sid in ("l-a", "l-b", "l-c"):
+        db.end_session(sid, "compression")
+    _set_parent(db, "l-a", "l-b")
+    _set_parent(db, "l-b", "l-c")
+    _set_parent(db, "l-c", "l-a")
+    for sid in ("l-a", "l-b", "l-c"):
+        _message(db, sid, "needle cycle")
+
+    winners = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )["winners"]
+    assert winners == []
+
+
+def test_sql_winners_tail_entering_cycle_fails_closed(db):
+    _create(db, "t-a", source="cli")
+    _create(db, "t-b", source="cli")
+    _create(db, "t-c", source="cli")
+    db.end_session("t-b", "compression")
+    db.end_session("t-c", "compression")
+    _set_parent(db, "t-a", "t-b")
+    _set_parent(db, "t-b", "t-c")
+    _set_parent(db, "t-c", "t-b")
+    for sid in ("t-a", "t-b", "t-c"):
+        _message(db, sid, "needle cycle")
+
+    winners = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )["winners"]
+    assert winners == []
+
+
+def test_sql_winners_positive_lineage_memo_reuse(db):
+    # A 15-session positive lineage (observed depth-14/size-15 tail): every
+    # candidate in the lineage resolves to the same root, and after the
+    # first candidate all later ones are memo hits (zero extra lookups).
+    ids = _positive_chain(db, "memo", 15)
+    for sid in ids:
+        _message(db, sid, "needle memo")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], candidate_limit=100, result_limit=10
+    )
+    winners = result["winners"]
+    assert len(winners) == 1
+    assert winners[0]["lineage_root_id"] == ids[-1]
+    # 15 distinct owner candidates: first walk is 15 lookups, the rest are
+    # memo hits -> 15 successful uncached row fetches total.
+    assert result["stats"]["lineage_work"] == 15
+    assert result["stats"]["lineage_memo_hits"] == 14
+    assert result["stats"]["lineage_memo_entries"] == 15
+
+
+def test_sql_winners_cycle_at_work_bound_is_cycle_not_bound_hit(
+    db, monkeypatch
+):
+    # Cycle becomes provable from the traversal-local seen-set when work has
+    # already consumed the whole budget: classify as cycle, NOT bound-hit.
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 3)
+    _create(db, "cb-a", source="cli")
+    _create(db, "cb-b", source="cli")
+    _create(db, "cb-c", source="cli")
+    for sid in ("cb-a", "cb-b", "cb-c"):
+        db.end_session(sid, "compression")
+    _set_parent(db, "cb-a", "cb-b")
+    _set_parent(db, "cb-b", "cb-c")
+    _set_parent(db, "cb-c", "cb-a")
+    for sid in ("cb-a", "cb-b", "cb-c"):
+        _message(db, sid, "needle cycle")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )
+    assert result["winners"] == []
+    assert result["stats"]["lineage_bound_hit"] is False
+    assert result["stats"]["lineage_work"] == 3
+
+
+def test_sql_winners_bound_hit_before_cycle_proof(db, monkeypatch):
+    # Proving the cycle would need one MORE uncached lookup after the budget
+    # is exhausted -> bound-hit, and the partial path must not be memoized as
+    # unresolved (a fresh query resolves it).
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 4)
+    ids = _positive_chain(db, "bp", 5)
+    # Close the 5-node chain into a cycle: bp-4 -> bp-0 (positive edge).
+    db._conn.execute(
+        "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+        (ids[0],),
+    )
+    db._conn.commit()
+    _set_parent(db, ids[-1], ids[0])
+    for sid in ids:
+        _message(db, sid, "needle cycle")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )
+    assert result["winners"] == []
+    assert result["stats"]["lineage_bound_hit"] is True
+    assert result["stats"]["lineage_work"] == 4
+
+
+def test_sql_winners_root_resolved_exactly_at_work_bound(db, monkeypatch):
+    # A root resolved on successful lookup number B succeeds (boundary is
+    # inclusive of legitimate completed work).
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 5)
+    ids = _positive_chain(db, "b5", 5)
+    _message(db, ids[0], "needle exact")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )
+    assert result["winners"][0]["lineage_root_id"] == ids[-1]
+    assert result["stats"]["lineage_work"] == 5
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_sql_winners_lookup_beyond_work_bound_truncates(db, monkeypatch):
+    # A resolution that requires lookup B+1 stops BEFORE that lookup,
+    # flags bound-hit, and returns only already-proven safe winners.
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 5)
+    ids = _positive_chain(db, "b6", 6)
+    _message(db, ids[0], "needle trunc")
+    _create(db, "trunc-safe", source="cli")
+    _message(db, "trunc-safe", "needle trunc")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )
+    assert result["stats"]["lineage_bound_hit"] is True
+    # The bound is reached on the first (higher-ranked) candidate, so the
+    # scan stops rather than accepting the later safe candidate.
+    assert result["winners"] == []
+
+
+def test_sql_winners_bound_exhaustion_does_not_poison_memo(db, monkeypatch):
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 3)
+    ids = _positive_chain(db, "poison", 5)
+    _message(db, ids[0], "needle poison")
+
+    first = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )
+    assert first["stats"]["lineage_bound_hit"] is True
+
+    # A fresh query (new memo + restored budget) resolves the same chain
+    # normally, proving the exhausted partial path was never memoized.
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 2000)
+    second = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )
+    assert second["stats"]["lineage_bound_hit"] is False
+    assert second["winners"][0]["lineage_root_id"] == ids[-1]
+
+
+def test_sql_winners_stats_report_work_and_bound(db):
+    _create(db, "st-root", source="cli")
+    db.end_session("st-root", "compression")
+    _create(db, "st-child", source="cli", parent="st-root")
+    _message(db, "st-root", "needle stats")
+    _message(db, "st-child", "needle stats")
+    _create(db, "st-other", source="cli")
+    _message(db, "st-other", "needle stats")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=5
+    )
+    stats = result["stats"]
+    assert stats["candidate_count"] == 3
+    assert stats["candidate_unique_sessions"] == 3
+    assert stats["lineage_count"] == 2
+    assert stats["winner_count"] == 2
+    assert stats["lineage_work"] >= 1
+    assert stats["lineage_candidates_inspected"] == 3
+    assert stats["lineage_bound_hit"] is False
+
+
+def test_sql_winners_k1_k3_k10_early_stop(db):
+    _create(db, "k0", source="cli")
+    db.end_session("k0", "compression")
+    for i in range(12):
+        _create(db, f"k0-child-{i}", source="cli", parent="k0")
+        _message(db, f"k0-child-{i}", "needle k")
+    for i in range(1, 15):
+        _create(db, f"k{i}", source="cli")
+        _message(db, f"k{i}", "needle k")
+
+    for k in (1, 3, 10):
+        result = db.search_session_winners(
+            "needle", role_filter=["user"], candidate_limit=100, result_limit=k
+        )
+        assert len(result["winners"]) == k
+        assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_sql_winners_long_acyclic_chain_cut_by_budget_not_depth_cap(
+    db, monkeypatch,
+):
+    # A long acyclic chain is cut by the work budget, not by any semantic
+    # depth cap.  The resolver is iterative + memoized, so a chain longer
+    # than B simply stops at B successful lookups.  (Fixture stays small by
+    # monkeypatching B; the default 2000 is just that same constant.)
+    monkeypatch.setattr("hermes_state_search._LINEAGE_WORK_BUDGET", 40)
+    n = 50
+    now = time.time()
+    base = "path"
+    db._conn.executemany(
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+        [(f"{base}-{i}", "cli", now) for i in range(n)],
+    )
+    for i in range(n - 1):
+        child, parent = f"{base}-{i}", f"{base}-{i + 1}"
+        db._conn.execute(
+            "UPDATE sessions SET parent_session_id = ?, "
+            "end_reason = 'compression' WHERE id = ?",
+            (parent, child),
+        )
+    db._conn.commit()
+    _message(db, f"{base}-0", "needle path")
+
+    result = db.search_session_winners(
+        "needle", role_filter=["user"], result_limit=10
+    )
+    assert result["stats"]["lineage_bound_hit"] is True
+    assert result["stats"]["lineage_work"] == 40
+    assert result["winners"] == []
