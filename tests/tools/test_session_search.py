@@ -113,23 +113,21 @@ class TestBrowseShape:
 # =========================================================================
 
 class TestDiscoveryShape:
-    def test_discovery_field_plan_preserves_full_default_result(self, db, monkeypatch):
+    def test_discovery_does_not_use_search_messages(self, db, monkeypatch):
+        # Discovery winner selection runs through the SQL winner seam, not
+        # the per-message search_messages() path, so candidate context is
+        # never projected.  (Replaced the pre-SQL era field-plan test.)
         _seed_modpack_sessions(db)
         original = db.search_messages
-        requested_fields = None
 
-        def search_spy(*args, **kwargs):
-            nonlocal requested_fields
-            requested_fields = kwargs.get("fields")
-            return original(*args, **kwargs)
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("discovery must not call search_messages()")
 
-        monkeypatch.setattr(db, "search_messages", search_spy)
+        monkeypatch.setattr(db, "search_messages", fail_if_called)
 
         result = json.loads(session_search(query="modpack", limit=1, db=db))
 
         assert result["success"] is True
-        assert requested_fields is not None
-        assert "context" not in requested_fields
         assert len(result["results"]) == 1
         hit = result["results"][0]
         assert "bookend_start" in hit
@@ -823,3 +821,300 @@ class TestLegacyContinuationPlusDelegation:
 
         # Delegation child must NOT appear
         assert "s_delegate" not in sids
+
+
+# =========================================================================
+# #68 compression-root parity at the tool layer
+# =========================================================================
+
+class TestCompressionRootToolParity:
+    """Current-session / exact-title exclusion shares the DB winner seam's
+    positive compression-continuation root semantics."""
+
+    def test_current_compression_child_live_content_excluded_ancestor_surfaces(self, db):
+        """Searching from a compression continuation child: the child's own
+        live content is in context (excluded), but the compression-ended
+        ancestor's archived content surfaces."""
+        db.create_session("s_parent", source="cli")
+        db.append_message("s_parent", role="user",
+                          content="parent needle archived")
+        db.end_session("s_parent", "compression")
+        db.create_session("s_current", source="cli", parent_session_id="s_parent")
+        db.append_message("s_current", role="user",
+                          content="current live needle")
+
+        result = json.loads(session_search(
+            query="needle", db=db, current_session_id="s_current",
+        ))
+        sids = [r["session_id"] for r in result["results"]]
+        assert "s_current" not in sids
+        assert "s_parent" in sids
+
+    def test_branch_child_under_current_lineage_stays_distinct(self, db):
+        """A branch child (parent-bound _branched_from marker) is NOT part of
+        the current compression lineage, so it surfaces as its own result."""
+        db.create_session("s_parent", source="cli")
+        db.append_message("s_parent", role="user",
+                          content="parent needle content")
+        db.end_session("s_parent", "compression")
+        db.create_session("s_current", source="cli", parent_session_id="s_parent")
+        db.create_session("s_branch", source="cli", parent_session_id="s_parent")
+        db._conn.execute(
+            "UPDATE sessions SET model_config = ? WHERE id = ?",
+            (json.dumps({"_branched_from": "s_parent"}), "s_branch"),
+        )
+        db._conn.commit()
+        db.append_message("s_branch", role="user",
+                          content="branch needle content")
+
+        result = json.loads(session_search(
+            query="needle", db=db, current_session_id="s_current",
+        ))
+        sids = [r["session_id"] for r in result["results"]]
+        assert "s_parent" in sids
+        assert "s_branch" in sids
+
+    def test_title_and_content_lanes_share_compression_root_semantics(self, db):
+        """A generic (non-compression) child of the title-matched session is
+        NOT in the title's compression lineage, so the content lane surfaces it
+        instead of swallowing it into the title slot's exclusion."""
+        db.create_session("t_parent", source="cli")
+        db.set_session_title("t_parent", "quartzgate")
+        db.append_message("t_parent", role="user",
+                          content="irrelevant filler content")
+        db.create_session("t_generic_child", source="cli",
+                          parent_session_id="t_parent")
+        db.append_message("t_generic_child", role="user",
+                          content="quartzgate is the key here")
+
+        result = json.loads(session_search(query="quartzgate", db=db, limit=5))
+        sids = [r["session_id"] for r in result["results"]]
+        assert "t_parent" in sids
+        assert "t_generic_child" in sids
+        assert result["count"] == 2
+
+    def test_compacted_history_discoverable_even_when_best_hit_is_live(self, db):
+        """sort=newest ranks the LIVE needle first; the older compacted needle
+        of the same current session must still surface (with the compacted
+        anchor) instead of being erased by per-owner dedupe (#68 review)."""
+        db.create_session("s_cur", source="cli")
+        compacted_id = db.append_message(
+            "s_cur", role="user", content="old compacted needle content"
+        )
+        db.archive_and_compact("s_cur", [
+            {"role": "assistant", "content": "summary"},
+        ])
+        live_id = db.append_message(
+            "s_cur", role="user", content="new live needle content"
+        )
+
+        result = json.loads(session_search(
+            query="needle", db=db, current_session_id="s_cur", sort="newest",
+        ))
+
+        assert result["success"] is True
+        assert result["count"] >= 1
+        hit = result["results"][0]
+        assert hit["session_id"] == "s_cur"
+        # the anchor is the compacted (archived) message, not the live one
+        assert hit["match_message_id"] == compacted_id
+        assert hit["match_message_id"] != live_id
+
+    def test_title_and_content_share_compression_root_in_snapshot(self, db):
+        """Exact-title exclusion resolves the title's compression lineage
+        (same implementation as the winner phase) and excludes it from the
+        content lane: a content hit in the title's compression lineage is
+        excluded even though its own session id differs from the title session
+        id (#68 review round-5)."""
+        db.create_session("t_parent", source="cli")
+        db.set_session_title("t_parent", "needle-title")
+        db.append_message("t_parent", role="user", content="parent filler")
+        db.end_session("t_parent", "compression")
+        db.create_session("t_child", source="cli",
+                          parent_session_id="t_parent")
+        db.append_message("t_child", role="user",
+                          content="needle-title appears in child")
+
+        result = json.loads(session_search(query="needle-title", db=db, limit=5))
+
+        assert result["success"] is True
+        sids = [r["session_id"] for r in result["results"]]
+        # Title slot: t_parent. Content lane: t_child is the same compression
+        # lineage -> excluded, so the title is the only result.
+        assert sids == ["t_parent"]
+        assert result.get("truncated") is False
+
+    def test_title_only_limit_one_surfaces_bound_exhaustion(self, db, monkeypatch):
+        """A title-only K=1 search must still run the winner phase with the
+        current session id.  When the current chain is deeper than B the
+        answer is honestly truncated, but the exact-title result is preserved
+        (no proof-gate drops it) — the title lane and the content lane are
+        independent (#68 review round-5)."""
+        import hermes_state_search
+        monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 4)
+        # current session is the tip of a compression chain deeper than B
+        for i in range(6):
+            db.create_session(f"cur-{i}", source="cli")
+        for i in range(5):
+            child, parent = f"cur-{i}", f"cur-{i + 1}"
+            db._conn.execute("PRAGMA foreign_keys = OFF")
+            db._conn.execute(
+                "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+                (parent, child),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+                (parent,),
+            )
+            db._conn.commit()
+            db._conn.execute("PRAGMA foreign_keys = ON")
+        # a separate exact-title session
+        db.create_session("title-session", source="cli")
+        db.set_session_title("title-session", "needle-title")
+        db.append_message("title-session", role="user",
+                          content="title content filler")
+
+        result = json.loads(session_search(
+            query="needle-title", db=db, limit=1,
+            current_session_id="cur-0",
+        ))
+
+        assert result["success"] is True
+        # the exact title is preserved; B exhaustion on the current chain is
+        # surfaced as truncation, not as a silently complete answer
+        assert result["count"] == 1
+        assert [r["session_id"] for r in result["results"]] == ["title-session"]
+        assert result.get("truncated") is True
+        assert "warning" in result
+
+    def test_title_equal_to_current_session_excluded_when_same_lineage(self, db, monkeypatch):
+        """The exact-title session IS the current session on a compression
+        chain: the title is excluded by the existing current-lineage guard (a
+        session never surfaces as its own result), and the winner phase still
+        runs and surfaces its own bound exhaustion via truncation.
+
+        Scope note (#68 review round-5): ``resolve_compression_lineage``'
+        default ``work_budget`` is captured at def time, so the B=4
+        monkeypatch below affects ONLY the winner phase (which reads the
+        module global dynamically).  The tool-side resolver here runs at the
+        real B=2000 and resolves the chain normally — this test does NOT
+        exercise "tool-side resolver itself B-hits on a >B chain".  That
+        edge is deliberately out of scope: no proof protocol is re-added to
+        cover it."""
+        import hermes_state_search
+        monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 4)
+        for i in range(6):
+            db.create_session(f"cur-{i}", source="cli")
+        for i in range(5):
+            child, parent = f"cur-{i}", f"cur-{i + 1}"
+            db._conn.execute("PRAGMA foreign_keys = OFF")
+            db._conn.execute(
+                "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+                (parent, child),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+                (parent,),
+            )
+            db._conn.commit()
+            db._conn.execute("PRAGMA foreign_keys = ON")
+        db.set_session_title("cur-0", "needle-title")
+        db.append_message("cur-0", role="user",
+                          content="needle-title content")
+
+        result = json.loads(session_search(
+            query="needle-title", db=db, limit=3,
+            current_session_id="cur-0",
+        ))
+
+        assert result["success"] is True
+        # current session is never its own result; the winner phase's >B
+        # current chain is honestly truncated
+        assert result["count"] == 0
+        assert result["results"] == []
+        assert result.get("truncated") is True
+        assert "warning" in result
+
+    def test_title_preserved_when_content_lane_unavailable(self, db):
+        """When the content FTS lane cannot run (FTS disabled / empty query /
+        MATCH error), the winner phase early-returns with no root stats.  The
+        title safety gate must NOT kill the already-found exact-title — that
+        is the designed title-only fallback, not a B-limited unproven result
+        (#68 review round-4)."""
+        db._fts_enabled = False
+        db.create_session("cur", source="cli")
+        db.create_session("title-session", source="cli")
+        db.set_session_title("title-session", "foo AND OR bar")
+        db.append_message("title-session", role="user",
+                          content="some content")
+
+        result = json.loads(session_search(
+            query="foo AND OR bar", db=db, limit=1,
+            current_session_id="cur",
+        ))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "title-session"
+        assert result.get("truncated") is False
+        assert "No matching sessions found" not in (result.get("message") or "")
+
+
+class TestDiscoveryTruncation:
+    """B-hit responses are explicitly incomplete, never a silent top-K."""
+
+    def _seed_bound_chain(self, db, n=6):
+        """A positive compression chain longer than the monkeypatched budget."""
+        base = "bhit"
+        for i in range(n):
+            db.create_session(f"{base}-{i}", source="cli")
+        for i in range(n - 1):
+            child, parent = f"{base}-{i}", f"{base}-{i + 1}"
+            db._conn.execute("PRAGMA foreign_keys = OFF")
+            db._conn.execute(
+                "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+                (parent, child),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+                (parent,),
+            )
+            db._conn.commit()
+            db._conn.execute("PRAGMA foreign_keys = ON")
+        db.append_message(f"{base}-0", role="user",
+                          content="bound needle chain")
+
+    def test_bound_hit_returns_truncated_safe_prefix(self, db, monkeypatch):
+        import hermes_state_search
+        monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 5)
+        # Safe winner ranks first and is accepted before the bound chain hits.
+        db.create_session("safe", source="cli")
+        db.append_message("safe", role="user", content="bound needle safe")
+        self._seed_bound_chain(db)
+
+        result = json.loads(session_search(query="bound needle", db=db))
+
+        assert result["success"] is True
+        assert result.get("truncated") is True
+        assert "warning" in result
+        assert result["count"] == 1
+        assert [r["session_id"] for r in result["results"]] == ["safe"]
+
+    def test_bound_hit_with_zero_winners_is_incomplete_not_no_match(self, db, monkeypatch):
+        import hermes_state_search
+        monkeypatch.setattr(hermes_state_search, "_LINEAGE_WORK_BUDGET", 5)
+        self._seed_bound_chain(db)
+
+        result = json.loads(session_search(query="bound needle", db=db))
+
+        assert result["success"] is True
+        assert result.get("truncated") is True
+        assert result["count"] == 0
+        assert "No matching sessions found" not in (result.get("message") or "")
+
+    def test_normal_discovery_truncated_false(self, db):
+        _seed_modpack_sessions(db)
+        result = json.loads(session_search(query="modpack", db=db))
+        assert result["success"] is True
+        assert result.get("truncated") is False
+        assert "warning" not in result

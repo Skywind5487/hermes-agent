@@ -313,6 +313,28 @@ The `_sanitize_fts5_query()` method handles edge cases:
 Sessions can form chains via `parent_session_id`. This happens when context
 compression triggers a session split in the gateway.
 
+### Search-lineage resolution (`resolve_compression_lineage`)
+
+Session *search* does **not** treat every `parent_session_id` chain as one
+lineage (issue #68). `SessionDB.resolve_compression_lineage()` follows only
+**positive compression-continuation edges**:
+
+1. the parent row exists;
+2. the parent ended with `end_reason = 'compression'`;
+3. the child is not a `tool` session;
+4. the child's `model_config` `_branched_from` / `_delegate_from` markers do
+   **not** explicitly point at that parent (foreign markers pointing
+   elsewhere do not disqualify the edge).
+
+Generic parentage — branch / delegation / tool children — is therefore a
+**distinct** session, not a lineage member. `search_session_winners()`
+dedupes discovery results by this compression root, and current-session /
+exact-title exclusion use the same meaning. A missing parent or a positive
+cycle fails closed (the candidate is dropped, never given a fabricated
+root), and a per-query successful-row work budget (`B = 2000`) caps
+pathological graphs with an explicit truncation signal instead of a depth
+cap.
+
 ### Query: Find Session Lineage
 
 ```sql
