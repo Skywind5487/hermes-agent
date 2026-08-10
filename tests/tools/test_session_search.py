@@ -906,9 +906,12 @@ class TestDiscoveryTruncation:
             child, parent = f"{base}-{i}", f"{base}-{i + 1}"
             db._conn.execute("PRAGMA foreign_keys = OFF")
             db._conn.execute(
-                "UPDATE sessions SET parent_session_id = ?, "
-                "end_reason = 'compression' WHERE id = ?",
+                "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
                 (parent, child),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+                (parent,),
             )
             db._conn.commit()
             db._conn.execute("PRAGMA foreign_keys = ON")
