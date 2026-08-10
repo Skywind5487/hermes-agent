@@ -2590,3 +2590,62 @@ class TestWriteAuthorizationCAS:
             assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
         finally:
             r.close()
+
+
+# =========================================================================
+# Round-11 commit 4 — snapshot-consistent candidate serving
+# =========================================================================
+
+
+class TestSnapshotConsistentServing:
+    def test_candidates_single_snapshot(self, tmp_path, monkeypatch):
+        """R11-C4-R1: one candidate call is linearizable to ONE DB snapshot.
+        A peer quarantine + canonical metadata update that lands between the
+        ownership read and the MATCH (the old separate-snapshot seam —
+        ``_session_trigram_rebuild_gap`` was a fresh-autocommit read) is
+        either blocked by / invisible to the single read snapshot; the call
+        NEVER returns an old FTS hit joined to post-quarantine canonical
+        metadata."""
+        db_path = tmp_path / "snap.db"
+        _build_healthy_complete_modern_db(db_path, n=2)  # Title 1, Title 2
+        r = SessionDB(db_path=db_path)
+        try:
+            real = SessionDB._session_trigram_rebuild_gap
+            fired = []
+
+            def injected(self, conn=None):
+                if not fired:
+                    fired.append(1)
+                    # Peer: quarantine + canonical metadata update mid-call.
+                    try:
+                        raw = sqlite3.connect(str(db_path), timeout=0.05)
+                        raw.execute(
+                            "INSERT INTO state_meta (key, value) "
+                            "VALUES (?, '1') "
+                            "ON CONFLICT(key) DO UPDATE "
+                            "SET value = excluded.value",
+                            (FTS_SESSION_TRIGRAM_STALE_KEY,),
+                        )
+                        raw.execute(
+                            "UPDATE sessions SET title = 'Zebra Changed' "
+                            "WHERE row_id = 1"
+                        )
+                        raw.commit()
+                    except sqlite3.OperationalError:
+                        # Blocked by our held read snapshot — consistent by
+                        # construction (DELETE journal shared-lock).
+                        pass
+                    finally:
+                        raw.close()
+                return real(self, conn)
+
+            monkeypatch.setattr(
+                SessionDB, "_session_trigram_rebuild_gap", injected
+            )
+            ok, hits = r._fts_session_trigram_candidates("Title")
+            # Never an old FTS hit joined to post-quarantine canonical rows.
+            for h in hits:
+                assert h["title"] in ("Title 1", "Title 2")
+                assert h["title"] != "Zebra Changed"
+        finally:
+            r.close()

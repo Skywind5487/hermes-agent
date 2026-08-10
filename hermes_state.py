@@ -6964,7 +6964,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             by_row_id.values(), key=lambda c: c["started_at"], reverse=True
         )
 
-    def _session_trigram_rebuild_gap(self) -> Optional[Tuple[int, int]]:
+    def _session_trigram_rebuild_gap(
+        self, conn=None
+    ) -> Optional[Tuple[int, int]]:
         """Bounded unindexed session-trigram gap ``(progress, high_water]``.
 
         During a #30 normalized trigram backfill, rows whose ``row_id`` falls
@@ -6973,23 +6975,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         raw-ID policy as the indexed lane) so no valid session is hidden
         while the rebuild is pending. Returns ``(progress, high_water)`` or
         ``None`` when no trigram rebuild is pending (normal operation).
+
+        Round-11 P1 #4: ``conn`` is the candidate call's single read snapshot
+        connection — when given, the markers are read from THAT connection so
+        ownership/H/P/MATCH observe the same committed state; otherwise a
+        fresh read connection is used.
         """
-        with self._read_ctx() as conn:
-            row = conn.execute(
+        def _read(c):
+            row = c.execute(
                 "SELECT value FROM state_meta "
                 "WHERE key = 'fts_session_trigram_rebuild_high_water'"
             ).fetchone()
             if row is None:
                 return None
             high_water = int(row[0])
-            p = conn.execute(
+            p = c.execute(
                 "SELECT value FROM state_meta "
                 "WHERE key = 'fts_session_trigram_rebuild_progress'"
             ).fetchone()
             progress = int(p[0]) if p is not None else 0
-        if progress >= high_water:
-            return None
-        return progress, high_water
+            if progress >= high_water:
+                return None
+            return progress, high_water
+        if conn is not None:
+            return _read(conn)
+        with self._read_ctx() as conn:
+            return _read(conn)
 
     @staticmethod
     def _trigram_match_needle(needle: str) -> str:
@@ -7044,12 +7055,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # the #14 router falls back to LIKE instead of serving stale hits.
         if not self._sessions_trigram_available:
             return False, []
-        with self._read_ctx() as conn:
-            if not self._sessions_trigram_owned_servable(conn):
-                return False, []
-        gap = self._session_trigram_rebuild_gap()
         fts_ok = True
         by_row_id: Dict[int, Dict[str, Any]] = {}
+        gap = None
 
         def _candidate(c) -> Dict[str, Any]:
             return {
@@ -7061,76 +7069,95 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             }
 
         with self._read_ctx() as conn:
+            # Round-11 P1 #4: ONE explicit read transaction (one DB snapshot)
+            # for the whole candidate call — the ownership/stale decision, the
+            # H/P gap, the MATCH, the canonical join, and the gap supplement
+            # must all observe the SAME committed state. A peer quarantine or
+            # canonical metadata update cannot interleave between them (a
+            # stale FTS hit joined to post-quarantine canonical rows is never
+            # served). The gap markers are read inline from this same
+            # connection, NOT via helpers that open fresh autocommit reads.
+            conn.execute("BEGIN")
             try:
-                # Field-aware trigram MATCH: compact title/display needle (if
-                # any) plus the RAW id needle. Both are quoted phrases so
-                # punctuation is preserved (trigram does substring matching).
-                match_parts = []
-                if compact_needle:
+                if not self._sessions_trigram_owned_servable(conn):
+                    return False, []
+                gap = self._session_trigram_rebuild_gap(conn)
+                try:
+                    # Field-aware trigram MATCH: compact title/display needle
+                    # (if any) plus the RAW id needle. Both are quoted phrases
+                    # so punctuation is preserved (trigram does substring
+                    # matching).
+                    match_parts = []
+                    if compact_needle:
+                        match_parts.append(
+                            f"title:{self._trigram_match_needle(compact_needle)}"
+                        )
+                        match_parts.append(
+                            "display_name:"
+                            f"{self._trigram_match_needle(compact_needle)}"
+                        )
                     match_parts.append(
-                        f"title:{self._trigram_match_needle(compact_needle)}"
+                        f"id:{self._trigram_match_needle(needle)}"
                     )
-                    match_parts.append(
-                        f"display_name:{self._trigram_match_needle(compact_needle)}"
+                    match_expr = " OR ".join(match_parts)
+                    cursor = conn.execute(
+                        "SELECT s.id AS id, s.title, s.display_name, "
+                        "       s.started_at, s.row_id AS row_id "
+                        "FROM sessions_fts_trigram f "
+                        "JOIN sessions s ON s.row_id = f.rowid "
+                        "WHERE sessions_fts_trigram MATCH ? ",
+                        (match_expr,),
                     )
-                match_parts.append(f"id:{self._trigram_match_needle(needle)}")
-                match_expr = " OR ".join(match_parts)
-                cursor = conn.execute(
-                    "SELECT s.id AS id, s.title, s.display_name, "
-                    "       s.started_at, s.row_id AS row_id "
-                    "FROM sessions_fts_trigram f "
-                    "JOIN sessions s ON s.row_id = f.rowid "
-                    "WHERE sessions_fts_trigram MATCH ? ",
-                    (match_expr,),
-                )
-                for c in cursor:
-                    by_row_id[c["row_id"]] = _candidate(c)
-            except sqlite3.OperationalError:
-                # Trigram lane unavailable/corrupt: signal failure so the #14
-                # router can fall back instead of trusting a partial result;
-                # the gap supplement below still runs.
-                fts_ok = False
-                logging.debug(
-                    "sessions_fts_trigram MATCH failed for %r",
-                    match_expr,
-                    exc_info=True,
-                )
-            if gap is not None:
-                progress, high_water = gap
-                gap_rows = conn.execute(
-                    "SELECT id, title, display_name, started_at, row_id "
-                    "FROM sessions "
-                    "WHERE row_id > ? AND row_id <= ? ",
-                    (progress, high_water),
-                ).fetchall()
-                # Case-insensitive like the trigram tokenizer's default:
-                # fold both sides before the substring test (the indexed lane
-                # folds at tokenization, so a case-sensitive Python test
-                # would let a gap row hide until backfilled).
-                compact_needle_folded = compact_needle.casefold()
-                needle_folded = needle.casefold()
-                for c in gap_rows:
-                    # Same policy as the indexed lane: compact title/display
-                    # needles and the raw id needle, on the COMPACTED field
-                    # values (the index stores compacted text, so matching
-                    # raw would miss once backfilled).
-                    if (
-                        compact_needle_folded
-                        and compact_needle_folded
-                        in compact_session_metadata_text(
-                            c["title"]
-                        ).casefold()
-                    ) or (
-                        compact_needle_folded
-                        and compact_needle_folded
-                        in compact_session_metadata_text(
-                            c["display_name"]
-                        ).casefold()
-                    ) or (
-                        needle_folded
-                        and needle_folded in (c["id"] or "").casefold()
-                    ):
-                        by_row_id.setdefault(c["row_id"], _candidate(c))
+                    for c in cursor:
+                        by_row_id[c["row_id"]] = _candidate(c)
+                except sqlite3.OperationalError:
+                    # Trigram lane unavailable/corrupt: signal failure so the
+                    # #14 router can fall back instead of trusting a partial
+                    # result; the gap supplement below still runs.
+                    fts_ok = False
+                    logging.debug(
+                        "sessions_fts_trigram MATCH failed for %r",
+                        match_expr,
+                        exc_info=True,
+                    )
+                if gap is not None:
+                    progress, high_water = gap
+                    gap_rows = conn.execute(
+                        "SELECT id, title, display_name, started_at, row_id "
+                        "FROM sessions "
+                        "WHERE row_id > ? AND row_id <= ? ",
+                        (progress, high_water),
+                    ).fetchall()
+                    # Case-insensitive like the trigram tokenizer's default:
+                    # fold both sides before the substring test (the indexed
+                    # lane folds at tokenization, so a case-sensitive Python
+                    # test would let a gap row hide until backfilled).
+                    compact_needle_folded = compact_needle.casefold()
+                    needle_folded = needle.casefold()
+                    for c in gap_rows:
+                        # Same policy as the indexed lane: compact title/display
+                        # needles and the raw id needle, on the COMPACTED field
+                        # values (the index stores compacted text, so matching
+                        # raw would miss once backfilled).
+                        if (
+                            compact_needle_folded
+                            and compact_needle_folded
+                            in compact_session_metadata_text(
+                                c["title"]
+                            ).casefold()
+                        ) or (
+                            compact_needle_folded
+                            and compact_needle_folded
+                            in compact_session_metadata_text(
+                                c["display_name"]
+                            ).casefold()
+                        ) or (
+                            needle_folded
+                            and needle_folded in (c["id"] or "").casefold()
+                        ):
+                            by_row_id.setdefault(c["row_id"], _candidate(c))
+            finally:
+                conn.execute("ROLLBACK")
         return fts_ok, sorted(
             by_row_id.values(), key=lambda c: c["started_at"], reverse=True
         )
