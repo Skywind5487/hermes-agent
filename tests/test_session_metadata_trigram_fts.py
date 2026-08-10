@@ -26,7 +26,6 @@ from hermes_state_common import (
     FTS_SESSION_TRIGRAM_STALE_KEY,
     MAX_FTS5_QUERY_CHARS,
     SESSIONS_FTS_TRIGRAM_SQL,
-    SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES,
     SESSION_METADATA_COMPACT_SEPARATORS,
     SessionTrigramOwnershipLost,
     compact_session_metadata_text,
@@ -174,59 +173,6 @@ def _gap_trigram_db(tmp_path):
     return SessionDB(db_path=db_path)
 
 
-def _build_legacy_simple_sessions_trigram_db(db_path):
-    """Build a DB carrying the exact historical same-name
-    ``sessions_fts_trigram(tokenize='simple')`` object: FTS5, title-only,
-    INTERNAL content, three broad triggers keyed by the text session id.
-
-    ``simple`` is not loadable in the test environment, so the fixture builds
-    a real vtable and rewrites its stored sqlite_master declaration to
-    ``tokenize='simple'`` (the #34 writable_schema repro technique) — the
-    classifier must key on the stored declaration, not the runtime.
-    """
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA foreign_keys=OFF")
-    conn.executescript(SCHEMA_SQL)
-    t0 = time.time()
-    conn.executemany(
-        "INSERT INTO sessions (row_id, id, source, started_at, title) "
-        "VALUES (?, ?, 'cli', ?, ?)",
-        [(1, "A", t0, "Alpha Project"), (2, "B", t0 + 1, "AN-94 Prestige")],
-    )
-    conn.executescript(
-        """
-        CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5(
-            title,
-            tokenize='trigram'
-        );
-
-        CREATE TRIGGER sessions_fts_trigram_insert AFTER INSERT ON sessions BEGIN
-            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
-        END;
-
-        CREATE TRIGGER sessions_fts_trigram_delete AFTER DELETE ON sessions BEGIN
-            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
-        END;
-
-        CREATE TRIGGER sessions_fts_trigram_update AFTER UPDATE ON sessions BEGIN
-            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
-            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
-        END;
-        """
-    )
-    conn.execute("PRAGMA writable_schema=ON")
-    conn.execute(
-        "UPDATE sqlite_master "
-        "SET sql = replace(sql, \"tokenize='trigram'\", \"tokenize='simple'\") "
-        "WHERE name = 'sessions_fts_trigram' AND type = 'table'"
-    )
-    ver = conn.execute("PRAGMA schema_version").fetchone()[0]
-    conn.execute(f"PRAGMA schema_version={ver + 1}")
-    conn.execute("PRAGMA writable_schema=OFF")
-    conn.commit()
-    conn.close()
-
-
 def _build_unknown_same_name_trigram_db(db_path):
     """DB whose ``sessions_fts_trigram`` is an UNRECOGNIZED same-name object
     (a unicode61 vtable with a different column shape — not the historical
@@ -245,44 +191,6 @@ def _build_unknown_same_name_trigram_db(db_path):
         "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5(x, "
         "tokenize='unicode61')"
     )
-    conn.commit()
-    conn.close()
-
-
-def _rewrite_tokenizer_to_simple(conn, table):
-    """Emulate the historical same-name ``tokenize='simple'`` declaration by
-    rewriting the stored sqlite_master.sql (the #34 writable_schema repro)."""
-    conn.execute("PRAGMA writable_schema=ON")
-    conn.execute(
-        "UPDATE sqlite_master "
-        "SET sql = replace(sql, \"tokenize='trigram'\", \"tokenize='simple'\") "
-        "WHERE name = ? AND type = 'table'",
-        (table,),
-    )
-    ver = conn.execute("PRAGMA schema_version").fetchone()[0]
-    conn.execute(f"PRAGMA schema_version={ver + 1}")
-    conn.execute("PRAGMA writable_schema=OFF")
-
-
-def _build_legacy_simple_wrong_shape_trigram_db(db_path):
-    """DB whose ``sessions_fts_trigram`` declares ``tokenize='simple'``
-    INTERNAL content but is NOT the historical Hermes title-only shape (it
-    carries title + display_name). A same-name simple object that is not
-    ours — must classify unknown and never be demoted/deleted."""
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA foreign_keys=OFF")
-    conn.executescript(SCHEMA_SQL)
-    t0 = time.time()
-    conn.execute(
-        "INSERT INTO sessions (row_id, id, source, started_at) "
-        "VALUES (1, 'A', 'cli', ?)",
-        (t0,),
-    )
-    conn.execute(
-        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
-        "title, display_name, tokenize='trigram')"
-    )
-    _rewrite_tokenizer_to_simple(conn, "sessions_fts_trigram")
     conn.commit()
     conn.close()
 
@@ -425,20 +333,6 @@ def _build_root_absent_source_table_db(db_path):
     conn.close()
 
 
-def _build_legacy_simple_with_source_table_db(db_path):
-    """Exact legacy ``tokenize='simple'`` same-name root PLUS a same-name
-    TABLE occupying the source name ``sessions_fts_trigram_src``. #30 must
-    NOT demote the legacy root before exposing the source collision — the
-    demoted path would build a modern index against the wrong source."""
-    _build_legacy_simple_sessions_trigram_db(db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE sessions_fts_trigram_src (row_id INTEGER, title TEXT)"
-    )
-    conn.commit()
-    conn.close()
-
-
 def _build_same_name_root_view_db(db_path):
     """DB whose ``sessions_fts_trigram`` NAME is occupied by a plain VIEW
     (not an FTS5 vtable). #34: an unknown same-name object must classify
@@ -477,24 +371,6 @@ def _build_same_name_root_index_db(db_path):
         (t0,),
     )
     conn.execute("CREATE INDEX sessions_fts_trigram ON sessions(id)")
-    conn.commit()
-    conn.close()
-
-
-def _build_legacy_simple_with_unrelated_shadow_db(db_path):
-    """Exact legacy ``tokenize='simple'`` same-name root PLUS an unrelated
-    table that merely shares the ``sessions_fts_trigram_`` prefix
-    (``sessions_fts_trigram_unrelated``) with a sentinel row. The demotion's
-    shadow discovery must NOT sweep it into ``fts_v22_trash_*`` (teardown
-    would delete it) — only the exact legacy FTS5 shadow tables may move."""
-    _build_legacy_simple_sessions_trigram_db(db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE sessions_fts_trigram_unrelated (k TEXT PRIMARY KEY, v TEXT)"
-    )
-    conn.execute(
-        "INSERT INTO sessions_fts_trigram_unrelated VALUES ('sentinel', 'keep')"
-    )
     conn.commit()
     conn.close()
 
@@ -652,64 +528,6 @@ class TestSchemaClassifier:
         content source), not by table name."""
         assert db._classify_sessions_fts_trigram(db._conn) == "modern_trigram"
 
-    def test_classifier_legacy_simple(self, tmp_path):
-        """A same-name ``tokenize='simple'`` internal-content object classifies
-        as the recognized historical legacy shape."""
-        db_path = tmp_path / "legacy.db"
-        _build_legacy_simple_sessions_trigram_db(db_path)
-        raw = sqlite3.connect(str(db_path))
-        try:
-            sql = raw.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'sessions_fts_trigram'"
-            ).fetchone()[0]
-            assert "tokenize='simple'" in sql
-        finally:
-            raw.close()
-        r = SessionDB(db_path=db_path)
-        try:
-            # The open path demotes legacy to modern; classify the FINAL shape.
-            assert r._classify_sessions_fts_trigram(r._conn) == "modern_trigram"
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is not None
-        finally:
-            r.close()
-
-    def test_classifier_legacy_simple_without_simple_tokenizer(self, tmp_path):
-        """The legacy identity must classify on a RAW connection with NO
-        ``simple`` tokenizer loaded — and the open path must still demote it to
-        modern. #34's contract: legacy-simple → modern must never require
-        ``simple`` (PRAGMA table_info would connect the vtable and raise
-        ``no such tokenizer: simple`` on a host without it)."""
-        db_path = tmp_path / "legacy.db"
-        _build_legacy_simple_sessions_trigram_db(db_path)
-        raw = sqlite3.connect(str(db_path))  # no simple loaded
-        try:
-            assert SessionDB._classify_sessions_fts_trigram(raw) == "legacy_simple"
-        finally:
-            raw.close()
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is True
-            assert "tokenize='trigram'" in _fts_sql(r._conn, "sessions_fts_trigram")
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is not None
-        finally:
-            r.close()
-
-    def test_classifier_legacy_never_connects_vtable(self, tmp_path):
-        """Legacy identity is decided from the stored DDL alone — it must
-        never issue a statement that CONNECTS the FTS5 vtable (e.g. PRAGMA
-        table_info), which raises ``no such tokenizer: simple`` on a host
-        without the legacy tokenizer (the #34 legacy→modern-must-not-require-
-        simple contract)."""
-        db_path = tmp_path / "legacy.db"
-        _build_legacy_simple_sessions_trigram_db(db_path)
-        raw = sqlite3.connect(str(db_path))
-        try:
-            cursor = _FtsProbeBlockingCursor(raw.cursor())
-            assert SessionDB._classify_sessions_fts_trigram(cursor) == "legacy_simple"
-        finally:
-            raw.close()
-
     def test_classifier_modern_never_connects_vtable(self, db):
         """Modern identity is decided from the stored DDL alone — it must
         never CONNECT the FTS5 vtable (PRAGMA table_info), which raises
@@ -733,28 +551,6 @@ class TestSchemaClassifier:
             sql = _fts_sql(r._conn, "sessions_fts_trigram")
             assert "tokenize='unicode61'" in sql
             assert r._sessions_trigram_available is False
-        finally:
-            r.close()
-
-    def test_classifier_simple_wrong_column_shape_unknown(self, tmp_path):
-        """A same-name ``tokenize='simple'`` INTERNAL object that is NOT the
-        historical Hermes title-only shape (here title + display_name) must
-        classify unknown and be left untouched — never demoted/deleted."""
-        db_path = tmp_path / "legacy_wrong.db"
-        _build_legacy_simple_wrong_shape_trigram_db(db_path)
-        raw = sqlite3.connect(str(db_path))
-        raw.close()
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._classify_sessions_fts_trigram(r._conn) == "unknown_same_name"
-            assert r._sessions_trigram_available is False
-            # Not demoted: the object (and its title+display_name shape)
-            # survives untouched.
-            sql = _fts_sql(r._conn, "sessions_fts_trigram")
-            assert "tokenize='simple'" in sql
-            assert "display_name" in sql
-            # No durable trigram claim was staged for a non-ours object.
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
         finally:
             r.close()
 
@@ -1342,213 +1138,6 @@ class TestSourceCollisionGuard:
         finally:
             r.close()
 
-    def test_legacy_simple_bad_source_does_not_demote(self, tmp_path):
-        """exact legacy-simple root + source-name collision (same-name
-        TABLE): #30 must NOT demote the legacy root before exposing the
-        collision — the demoted path would build a modern index against the
-        wrong source. Fail closed: legacy survives, no modern build, no H/P
-        seed."""
-        db_path = tmp_path / "legacy_src_table.db"
-        _build_legacy_simple_with_source_table_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is False
-            # The legacy root was NOT demoted — still the historical shape.
-            assert r._classify_sessions_fts_trigram(r._conn) == "legacy_simple"
-            assert "tokenize='simple'" in _fts_sql(
-                r._conn, "sessions_fts_trigram"
-            )
-            # No durable trigram claim was staged.
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
-            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
-            # The same-name source TABLE survives untouched.
-            obj = r._conn.execute(
-                "SELECT type FROM sqlite_master "
-                "WHERE name = 'sessions_fts_trigram_src'"
-            ).fetchone()
-            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "table"
-        finally:
-            r.close()
-
-
-# =========================================================================
-# Group E — legacy same-name convergence
-# =========================================================================
-
-
-class TestLegacySameNameConvergence:
-    def test_legacy_simple_converges_to_modern(self, tmp_path):
-        """Opening a legacy-simple DB converges to the modern external-content
-        trigram object and stages its own H/P claim."""
-        db_path = tmp_path / "legacy.db"
-        _build_legacy_simple_sessions_trigram_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            sql = _fts_sql(r._conn, "sessions_fts_trigram")
-            assert "tokenize='trigram'" in sql
-            assert "content='sessions_fts_trigram_src'" in sql
-            assert r._sessions_trigram_available is True
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is not None
-        finally:
-            r.close()
-
-    def test_legacy_shadow_tables_moved_to_trash(self, tmp_path):
-        """The demoted legacy shadows land in the ordinary FTS trash namespace
-        (no longer requiring `simple`) and teardown reclaims them."""
-        db_path = tmp_path / "legacy.db"
-        _build_legacy_simple_sessions_trigram_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            trash = [
-                row[0] for row in r._conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name LIKE 'fts_v22_trash_sessions_fts_trigram%' "
-                    "ESCAPE '\\'"
-                ).fetchall()
-            ]
-            assert trash, "legacy shadows expected in trash namespace"
-            # Teardown drains and drops them.
-            while r._fts_teardown_trash_step():
-                pass
-            remaining = r._conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
-                "AND name LIKE 'fts_v22_trash_%' ESCAPE '\\'"
-            ).fetchone()[0]
-            assert remaining == 0
-        finally:
-            r.close()
-
-    def test_legacy_demotion_leaves_unrelated_prefix_table(self, tmp_path):
-        """P1: the demotion's shadow discovery must only move the exact
-        legacy FTS5 shadow tables — an unrelated table that merely shares the
-        ``sessions_fts_trigram_`` prefix must survive migration AND teardown
-        (with its data), never being swept into ``fts_v22_trash_*``."""
-        db_path = tmp_path / "legacy_unrelated.db"
-        _build_legacy_simple_with_unrelated_shadow_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is True
-            # The unrelated table was NOT renamed to trash — it survives in
-            # place with its sentinel data.
-            obj = r._conn.execute(
-                "SELECT type FROM sqlite_master "
-                "WHERE name = 'sessions_fts_trigram_unrelated'"
-            ).fetchone()
-            assert obj is not None
-            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "table"
-            row = r._conn.execute(
-                "SELECT v FROM sessions_fts_trigram_unrelated WHERE k = 'sentinel'"
-            ).fetchone()
-            assert (row["v"] if isinstance(row, sqlite3.Row) else row[0]) == "keep"
-            # Run the trash teardown to completion — the unrelated table must
-            # not be touched even after teardown.
-            while r._fts_teardown_trash_step():
-                pass
-            obj2 = r._conn.execute(
-                "SELECT type FROM sqlite_master "
-                "WHERE name = 'sessions_fts_trigram_unrelated'"
-            ).fetchone()
-            assert obj2 is not None
-            row2 = r._conn.execute(
-                "SELECT v FROM sessions_fts_trigram_unrelated WHERE k = 'sentinel'"
-            ).fetchone()
-            assert (row2["v"] if isinstance(row2, sqlite3.Row) else row2[0]) == "keep"
-        finally:
-            r.close()
-
-    def test_legacy_demotion_does_not_require_simple(self, tmp_path):
-        """The demotion never touches the legacy vtable directly (no SELECT /
-        DROP on it), so it works on a runtime where `simple` is absent."""
-        db_path = tmp_path / "legacy.db"
-        _build_legacy_simple_sessions_trigram_db(db_path)
-        # Confirm the environment really lacks `simple`.
-        raw = sqlite3.connect(":memory:")
-        try:
-            raw.execute("CREATE VIRTUAL TABLE t USING fts5(x, tokenize='simple')")
-            pytest.skip("simple tokenizer unexpectedly available")
-        except sqlite3.OperationalError:
-            pass
-        finally:
-            raw.close()
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is True
-            assert "tokenize='trigram'" in _fts_sql(r._conn, "sessions_fts_trigram")
-        finally:
-            r.close()
-
-    def test_unknown_same_name_not_deleted(self, tmp_path):
-        """An unknown same-name shape is never deleted and never treated as
-        the search implementation."""
-        db_path = tmp_path / "unknown.db"
-        _build_unknown_same_name_trigram_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            assert _fts_sql(r._conn, "sessions_fts_trigram") != ""
-            assert r._sessions_trigram_available is False
-            # The object is untouched by the open path.
-            assert "tokenize='unicode61'" in _fts_sql(
-                r._conn, "sessions_fts_trigram"
-            )
-        finally:
-            r.close()
-
-    def test_legacy_simple_demotion_before_modern_create(self, tmp_path):
-        """Demotion-before-modern-create: after the legacy root is removed but
-        before the modern schema lands, the durable trigram H/P claim exists
-        and reopen resumes the ensure."""
-        db_path = tmp_path / "legacy.db"
-        _build_legacy_simple_sessions_trigram_db(db_path)
-        # Stage the demotion by hand (drop legacy triggers + remove root +
-        # rename shadows to trash + seed markers) and LEAVE the modern schema
-        # uncreated — the crash window between demotion commit and schema
-        # ensure. This mirrors the production demotion's atomic outcome.
-        raw = sqlite3.connect(str(db_path))
-        raw.execute("BEGIN IMMEDIATE")
-        for t in (
-            "sessions_fts_trigram_insert",
-            "sessions_fts_trigram_delete",
-            "sessions_fts_trigram_update",
-        ):
-            raw.execute(f"DROP TRIGGER IF EXISTS {t}")
-        raw.execute("PRAGMA writable_schema=ON")
-        raw.execute(
-            "DELETE FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'sessions_fts_trigram'"
-        )
-        raw.execute("PRAGMA writable_schema=RESET")
-        shadows = [
-            r[0] for r in raw.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name LIKE 'sessions_fts_trigram\\_%' ESCAPE '\\'"
-            ).fetchall()
-        ]
-        for sh in shadows:
-            raw.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
-        hw = raw.execute("SELECT COALESCE(MAX(row_id), 0) FROM sessions").fetchone()[0]
-        raw.execute(
-            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            ("fts_session_trigram_rebuild_high_water", str(hw)),
-        )
-        raw.execute(
-            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            ("fts_session_trigram_rebuild_progress", "0"),
-        )
-        raw.commit()
-        raw.close()
-
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is True
-            sql = _fts_sql(r._conn, "sessions_fts_trigram")
-            assert "tokenize='trigram'" in sql
-            # The preserved claim is still pending (not stamped complete).
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is not None
-        finally:
-            r.close()
-
 
 # =========================================================================
 # Group F — end to end
@@ -1685,21 +1274,6 @@ def _build_modern_root_foreign_trigger_db(db_path):
     conn.close()
 
 
-def _build_legacy_simple_foreign_insert_trigger_db(db_path):
-    """Exact legacy simple root with ``sessions_fts_trigram_insert`` replaced
-    by a foreign body. The demotion must not run (finding 2 regression 4) and
-    the foreign trigger must survive."""
-    _build_legacy_simple_sessions_trigram_db(db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("DROP TRIGGER sessions_fts_trigram_insert")
-    conn.execute(
-        "CREATE TRIGGER sessions_fts_trigram_insert "
-        f"AFTER INSERT ON sessions BEGIN {_FOREIGN_TRIGGER_BODY}; END"
-    )
-    conn.commit()
-    conn.close()
-
-
 def _build_root_absent_data_shadow_table_db(db_path):
     """Root absent + an unrelated TABLE named ``sessions_fts_trigram_data``
     with a sentinel. The modern CREATE VIRTUAL TABLE would fail; #30 must
@@ -1792,42 +1366,6 @@ def _build_modern_empty_no_claim_db(db_path, n=2):
     conn.close()
 
 
-def _build_legacy_simple_empty_db(db_path):
-    """Exact legacy simple root with ZERO sessions (finding 7: no zombie
-    H=0/P=0 claim)."""
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA foreign_keys=OFF")
-    conn.executescript(SCHEMA_SQL)
-    conn.executescript(
-        """
-        CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5(
-            title, tokenize='trigram'
-        );
-        CREATE TRIGGER sessions_fts_trigram_insert AFTER INSERT ON sessions BEGIN
-            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
-        END;
-        CREATE TRIGGER sessions_fts_trigram_delete AFTER DELETE ON sessions BEGIN
-            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
-        END;
-        CREATE TRIGGER sessions_fts_trigram_update AFTER UPDATE ON sessions BEGIN
-            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
-            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
-        END;
-        """
-    )
-    conn.execute("PRAGMA writable_schema=ON")
-    conn.execute(
-        "UPDATE sqlite_master "
-        "SET sql = replace(sql, \"tokenize='trigram'\", \"tokenize='simple'\") "
-        "WHERE name = 'sessions_fts_trigram' AND type = 'table'"
-    )
-    ver = conn.execute("PRAGMA schema_version").fetchone()[0]
-    conn.execute(f"PRAGMA schema_version={ver + 1}")
-    conn.execute("PRAGMA writable_schema=OFF")
-    conn.commit()
-    conn.close()
-
-
 class TestTriggerNamespaceOwnership:
     def test_root_absent_foreign_trigger_fail_closed(self, tmp_path):
         """F2-R1: root absent + foreign same-name trigger on another table →
@@ -1907,25 +1445,6 @@ class TestTriggerNamespaceOwnership:
         finally:
             r.close()
 
-    def test_legacy_foreign_trigger_no_demotion(self, tmp_path):
-        """F2-R4: exact legacy root + foreign same-name legacy trigger → no
-        demotion and no trigger deletion."""
-        db_path = tmp_path / "lf.db"
-        _build_legacy_simple_foreign_insert_trigger_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is False
-            # Legacy root NOT demoted; foreign trigger survives.
-            assert r._classify_sessions_fts_trigram(r._conn) == "legacy_simple"
-            sql = r._conn.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
-                "AND name = 'sessions_fts_trigram_insert'"
-            ).fetchone()
-            assert sql is not None and _FOREIGN_TRIGGER_BODY.split()[0] in sql[0]
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
-        finally:
-            r.close()
-
 
 class TestShadowNamespacePreflight:
     def test_root_absent_data_shadow_collision_fail_closed(self, tmp_path):
@@ -1960,37 +1479,6 @@ class TestShadowNamespacePreflight:
                 "WHERE name = 'sessions_fts_trigram_src' AND type = 'view'"
             ).fetchone()
             assert obj is not None
-        finally:
-            r.close()
-
-
-class TestDemotionCAS:
-    def test_demotion_cas_superseded_after_convergence(self, tmp_path):
-        """F3: a stale second opener that classified legacy before another
-        process converged must no-op/refuse inside its demotion transaction —
-        the modern root/triggers/shadows stay intact and no new claim is
-        written."""
-        db_path = tmp_path / "cas.db"
-        _build_legacy_simple_sessions_trigram_db(db_path)
-        r = SessionDB(db_path=db_path)  # process 1 converges legacy -> modern
-        try:
-            # Drain the trash left by the first demotion (the stale second
-            # opener's demotion must not collide with a fresh trash namespace).
-            while r._fts_teardown_trash_step():
-                pass
-            hw_before = r.get_meta("fts_session_trigram_rebuild_high_water")
-            # Invoke the demotion as though a stale process still believed
-            # the root was legacy.
-            result = r._demote_legacy_sessions_trigram_fts()
-            assert result == "superseded"
-            # Modern root intact; no new claim written.
-            assert "tokenize='trigram'" in _fts_sql(
-                r._conn, "sessions_fts_trigram"
-            )
-            assert (
-                r.get_meta("fts_session_trigram_rebuild_high_water")
-                == hw_before
-            )
         finally:
             r.close()
 
@@ -2237,34 +1725,6 @@ class TestOpenTimeOrphanRepair:
             r.close()
 
 
-class TestEmptySessionClaim:
-    def test_empty_legacy_no_zombie_claim(self, tmp_path):
-        """F7: exact legacy-simple root with zero canonical sessions →
-        converges to modern, H/P both absent, status None, and the first
-        post-convergence session insert is indexed normally."""
-        db_path = tmp_path / "e.db"
-        _build_legacy_simple_empty_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is True
-            assert "tokenize='trigram'" in _fts_sql(
-                r._conn, "sessions_fts_trigram"
-            )
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
-            assert r.get_meta("fts_session_trigram_rebuild_progress") is None
-            assert r.fts_session_trigram_rebuild_status() is None
-            r.create_session("first", source="cli")
-            r._conn.execute(
-                "UPDATE sessions SET title = 'First Row' WHERE id = 'first'"
-            )
-            r._conn.commit()
-            ok, hits = r._fts_session_trigram_candidates("First")
-            assert ok is True
-            assert any(h["id"] == "first" for h in hits)
-        finally:
-            r.close()
-
-
 class TestQueryCap:
     def test_trigram_query_cap_bounded(self, tmp_path):
         """F9: a query far beyond MAX_FTS5_QUERY_CHARS is bounded before the
@@ -2283,163 +1743,6 @@ class TestQueryCap:
             # The bounded prefix ("Titlezzz...") is not a trigram phrase in
             # any compacted title → zero hits, NOT a failure.
             assert hits2 == []
-        finally:
-            r.close()
-
-
-# =========================================================================
-# Round-11 commit 1 — transition namespace / trash-destination hardening
-# =========================================================================
-
-
-def _build_legacy_orphan_triggers_db(db_path):
-    """Root ABSENT but exact historical legacy orphan triggers survive on
-    ``sessions`` (the root was removed earlier; the triggers, attached to
-    ``sessions``, were not). The fresh transition must drop ONLY these exact
-    legacy orphans under its own lock before installing the modern root /
-    triggers (round-11 P1 #1)."""
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA foreign_keys=OFF")
-    conn.executescript(SCHEMA_SQL)
-    t0 = time.time()
-    conn.execute(
-        "INSERT INTO sessions (row_id, id, source, started_at, title) "
-        "VALUES (1, 'A', 'cli', ?, 'Alpha')",
-        (t0,),
-    )
-    conn.execute(
-        "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5("
-        "title, tokenize='trigram')"
-    )
-    # The three exact historical legacy triggers (attached to sessions).
-    conn.executescript(
-        """
-        CREATE TRIGGER sessions_fts_trigram_insert AFTER INSERT ON sessions BEGIN
-            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
-        END;
-        CREATE TRIGGER sessions_fts_trigram_delete AFTER DELETE ON sessions BEGIN
-            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
-        END;
-        CREATE TRIGGER sessions_fts_trigram_update AFTER UPDATE ON sessions BEGIN
-            DELETE FROM sessions_fts_trigram WHERE rowid = old.id;
-            INSERT INTO sessions_fts_trigram(rowid, title) VALUES (new.id, new.title);
-        END;
-        """
-    )
-    # Remove the root + its shadows, leaving ONLY the orphan triggers.
-    conn.execute("PRAGMA writable_schema=ON")
-    conn.execute(
-        "DELETE FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'sessions_fts_trigram'"
-    )
-    conn.execute("PRAGMA writable_schema=RESET")
-    for sh in SESSIONS_TRIGRAM_LEGACY_SHADOW_TABLES:
-        conn.execute(f"DROP TABLE IF EXISTS {sh}")
-    conn.commit()
-    conn.close()
-
-
-def _build_legacy_orphan_mixed_foreign_db(db_path):
-    """Root ABSENT with exact legacy orphans PLUS one foreign same-name
-    trigger — the mixed namespace must fail closed (no mutation)."""
-    _build_legacy_orphan_triggers_db(db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("DROP TRIGGER sessions_fts_trigram_insert")
-    conn.execute(
-        "CREATE TRIGGER sessions_fts_trigram_insert "
-        f"AFTER INSERT ON sessions BEGIN {_FOREIGN_TRIGGER_BODY}; END"
-    )
-    conn.commit()
-    conn.close()
-
-
-def _build_legacy_simple_trash_view_db(db_path):
-    """Exact legacy simple root with a VIEW occupying one of the trash
-    destination names (``fts_v22_trash_sessions_fts_trigram_data``). The
-    demotion trash preflight must see the shared namespace (round-11 P2 #1)
-    and refuse instead of colliding inside the destructive transaction."""
-    _build_legacy_simple_sessions_trigram_db(db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE VIEW fts_v22_trash_sessions_fts_trigram_data AS "
-        "SELECT 1 AS x"
-    )
-    conn.commit()
-    conn.close()
-
-
-class TestTransitionNamespaces:
-    def test_root_absent_legacy_orphan_triggers_converge(self, tmp_path):
-        """R11-C1-R1: root absent + exact legacy insert/delete/update orphans
-        → open converges to modern, all four modern trigger identities exact,
-        legacy-only ``update`` absent, and a normal session INSERT/UPDATE
-        succeeds and is indexed."""
-        db_path = tmp_path / "orphan.db"
-        _build_legacy_orphan_triggers_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is True
-            # Modern root landed.
-            assert "tokenize='trigram'" in _fts_sql(
-                r._conn, "sessions_fts_trigram"
-            )
-            # All four modern triggers are exact; legacy-only update absent.
-            status = r._sessions_trigram_trigger_status(r._conn)
-            for name in _MODERN_TRIGGER_NAMES:
-                assert status[name] == "exact_modern", name
-            assert status.get("sessions_fts_trigram_update") == "absent"
-            # A normal INSERT + UPDATE succeeds and indexes.
-            r.create_session("post", source="cli")
-            r._conn.execute(
-                "UPDATE sessions SET title = 'Post Row' WHERE id = 'post'"
-            )
-            r._conn.commit()
-            ok, hits = r._fts_session_trigram_candidates("Post")
-            assert ok is True
-            assert any(h["id"] == "post" for h in hits)
-        finally:
-            r.close()
-
-    def test_root_absent_mixed_foreign_trigger_fail_closed(self, tmp_path):
-        """R11-C1-R2: root absent + mixed exact-legacy + one foreign
-        same-name trigger → no mutation / fail closed."""
-        db_path = tmp_path / "mixed.db"
-        _build_legacy_orphan_mixed_foreign_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is False
-            # No modern root was created; no claim staged.
-            assert _fts_sql(r._conn, "sessions_fts_trigram") == ""
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
-            # The foreign trigger survives untouched.
-            sql = r._conn.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
-                "AND name = 'sessions_fts_trigram_insert'"
-            ).fetchone()
-            assert sql is not None and _FOREIGN_TRIGGER_BODY.split()[0] in sql[0]
-        finally:
-            r.close()
-
-    def test_legacy_demotion_trash_view_refused(self, tmp_path):
-        """R11-C1-R3: exact legacy root + trash destination occupied by a
-        VIEW → demotion returns refused, legacy root/triggers/shadows
-        untouched, no H/P mutation, open does not raise."""
-        db_path = tmp_path / "tv.db"
-        _build_legacy_simple_trash_view_db(db_path)
-        r = SessionDB(db_path=db_path)
-        try:
-            assert r._sessions_trigram_available is False
-            # Legacy root NOT demoted; foreign VIEW survives.
-            assert r._classify_sessions_fts_trigram(r._conn) == "legacy_simple"
-            assert "tokenize='simple'" in _fts_sql(
-                r._conn, "sessions_fts_trigram"
-            )
-            obj = r._conn.execute(
-                "SELECT type FROM sqlite_master "
-                "WHERE name = 'fts_v22_trash_sessions_fts_trigram_data'"
-            ).fetchone()
-            assert (obj["type"] if isinstance(obj, sqlite3.Row) else obj[0]) == "view"
-            assert r.get_meta("fts_session_trigram_rebuild_high_water") is None
         finally:
             r.close()
 
