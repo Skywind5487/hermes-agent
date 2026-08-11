@@ -148,9 +148,30 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     return cur, has_compression
 
 
-def _resolve_lineage(db, session_id: str) -> str:
-    """Convenience: return only the lineage root (ignores compression hop)."""
-    return _resolve_to_parent(db, session_id)[0]
+def _resolve_lineage(db, session_id: str) -> Optional[str]:
+    """Resolve the session-search compression lineage root.
+
+    Production ``SessionDB`` exposes the same positive compression-continuation
+    resolver used by SQL winner selection.  Returns ``None`` when the outcome
+    is unresolved / budget-exhausted — never a fabricated root (#68): a
+    resource limit is not evidence, so a B-limited resolution must not pretend
+    the session is its own root.  The old generic-parent walk is kept only as
+    a compatibility fallback for small test doubles / older DB objects.
+    """
+    if not session_id:
+        return session_id
+    resolver = getattr(db, "resolve_compression_lineage", None)
+    if resolver is None:
+        return _resolve_to_parent(db, session_id)[0]
+    try:
+        return resolver(session_id)
+    except Exception:
+        logging.debug(
+            "compression lineage resolution failed for %s",
+            session_id,
+            exc_info=True,
+        )
+        return None
 
 
 def _is_compression_ended(db, session_id: str) -> bool:
@@ -522,8 +543,12 @@ def _scroll(
 
     if current_session_id:
         anchor_session_id = owning_session_id or session_id
-        a_root = _resolve_lineage(db, anchor_session_id)
-        c_root = _resolve_lineage(db, current_session_id)
+        # Scroll's guard is about LIVE CONTEXT, not search lineage (#68): a
+        # delegation/branch child is still visible to the parent agent, so its
+        # content must be rejected even though it is a DISTINCT compression
+        # lineage in discovery.  Generic parentage is the correct model here.
+        a_root, _ = _resolve_to_parent(db, anchor_session_id)
+        c_root, _ = _resolve_to_parent(db, current_session_id)
         if a_root and c_root and a_root == c_root:
             is_compacted_anchor = (
                 anchor_state is not None
@@ -570,8 +595,11 @@ def _scroll(
     if not messages:
         owning = owning_session_id
         if owning and owning != session_id:
-            a_root = _resolve_lineage(db, session_id)
-            o_root = _resolve_lineage(db, owning)
+            # Same live-context rationale as the guard above: rebind across
+            # any parentage (compression or delegation), not just positive
+            # compression-continuation lineage.
+            a_root, _ = _resolve_to_parent(db, session_id)
+            o_root, _ = _resolve_to_parent(db, owning)
             if a_root and o_root and a_root == o_root:
                 try:
                     rebind_view = db.get_messages_around(owning, around_message_id, window=window)
@@ -652,13 +680,17 @@ def _title_match_result(
     if session_meta.get("source") in _HIDDEN_SESSION_SOURCES:
         return None
 
+    # Title matching only needs a lightweight anchor before bounded hydration.
+    # Do not load the whole transcript via get_messages() (#68 salvage).
     try:
-        messages = db.get_messages(session_id)
+        anchor_id = db.get_first_message_id(session_id)
     except Exception:
-        logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
-        messages = []
-
-    anchor_id = messages[0].get("id") if messages else None
+        logging.debug(
+            "first-message anchor lookup failed for title match %s",
+            session_id,
+            exc_info=True,
+        )
+        anchor_id = None
     if anchor_id is not None:
         try:
             view = db.get_anchored_view(session_id, anchor_id, window=5, bookend=3)
@@ -677,11 +709,11 @@ def _title_match_result(
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
-        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
-        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
-        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
+        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or [])],
+        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or [])],
+        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or [])],
         "messages_before": view.get("messages_before", 0),
-        "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
+        "messages_after": view.get("messages_after", 0),
         "_lineage_root": lineage_root,
     }
     if lineage_root and lineage_root != session_id:
@@ -714,62 +746,77 @@ def _discover(
 
     excluded_lineages = (title_lineage,) if title_lineage else ()
     _search_t0 = time.perf_counter()
-    if title_result and limit <= 1:
-        winner_response = {
-            "winners": [],
-            "stats": {
-                "candidate_count": 0,
-                "candidate_unique_sessions": 0,
-                "lineage_count": 0,
-                "winner_count": 0,
-                "route": "none",
-            },
-        }
-    else:
-        try:
-            winner_response = db.search_session_winners(
-                query=query,
-                role_filter=role_list,
-                exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-                candidate_limit=_DISCOVER_SCAN_LIMIT,
-                result_limit=max(0, limit - (1 if title_result else 0)),
-                sort=sort,
-                excluded_lineage_roots=excluded_lineages,
-                current_lineage_root=current_lineage_root,
-                request_id=_request_id,
-            )
-        except Exception as e:
-            _elapsed = (time.perf_counter() - _t0) * 1000
-            logging.error(
-                "DISCOVER_FAIL total_ms=%d resolve_ms=%d title_ms=%d error=%s",
-                int(_elapsed), int(_resolve_ms), int(_title_ms), e,
-            )
-            logging.error("SQL session winner search failed: %s", e, exc_info=True)
-            return tool_error(f"Search failed: {e}", success=False)
+    try:
+        # Always run the winner phase — even when an exact-title result already
+        # fills the only slot (result_limit becomes 0) — so the current session
+        # is still re-resolved inside the winner snapshot and a title-only K=1
+        # search surfaces B exhaustion instead of silently claiming a complete
+        # answer.  Exact-title exclusion uses the same compression-lineage
+        # implementation: the title lineage is resolved here with
+        # resolve_compression_lineage() and passed as excluded_lineage_roots.
+        winner_response = db.search_session_winners(
+            query=query,
+            role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            candidate_limit=_DISCOVER_SCAN_LIMIT,
+            result_limit=max(0, limit - (1 if title_result else 0)),
+            sort=sort,
+            excluded_lineage_roots=excluded_lineages,
+            current_session_id=current_session_id or None,
+            request_id=_request_id,
+        )
+    except Exception as e:
+        _elapsed = (time.perf_counter() - _t0) * 1000
+        logging.error(
+            "DISCOVER_FAIL total_ms=%d resolve_ms=%d title_ms=%d error=%s",
+            int(_elapsed), int(_resolve_ms), int(_title_ms), e,
+        )
+        logging.error("SQL session winner search failed: %s", e, exc_info=True)
+        return tool_error(f"Search failed: {e}", success=False)
     _search_ms = (time.perf_counter() - _search_t0) * 1000
     winner_rows = winner_response.get("winners", [])
     winner_stats = winner_response.get("stats", {})
     _raw_hits = int(winner_stats.get("candidate_count", 0))
     _unique_raw_sessions = int(winner_stats.get("candidate_unique_sessions", 0))
+    _truncated = bool(winner_stats.get("lineage_bound_hit"))
     _order_ms = 0
 
     if not winner_rows and not title_result:
-        _empty_payload = {
-            "success": True,
-            "mode": "discover",
-            "query": query,
-            "results": [],
-            "count": 0,
-            "message": "No matching sessions found.",
-        }
+        if _truncated:
+            # The lineage safety work bound stopped the scan before any
+            # winner: this is an incomplete result, never "no matches".
+            _empty_payload = {
+                "success": True,
+                "mode": "discover",
+                "query": query,
+                "results": [],
+                "count": 0,
+                "truncated": True,
+                "warning": (
+                    "Session search stopped at the lineage safety work bound; "
+                    "results are a safe ranked prefix and may be incomplete."
+                ),
+            }
+        else:
+            _empty_payload = {
+                "success": True,
+                "mode": "discover",
+                "query": query,
+                "results": [],
+                "count": 0,
+                "truncated": False,
+                "message": "No matching sessions found.",
+            }
         _annotate_rebuild_status(db, _empty_payload)
         _elapsed = (time.perf_counter() - _t0) * 1000
         logging.info(
             "DISCOVER_DONE request_id=%s total_ms=%d resolve_ms=%d title_ms=%d "
             "search_ms=%d order_ms=0 view_ms=0 json_ms=0 results=0 "
-            "raw_hits=%d unique_raw_sessions=%d unique_lineages=0",
+            "raw_hits=%d unique_raw_sessions=%d unique_lineages=0 "
+            "lineage_work=%d lineage_bound_hit=%s",
             _request_id, int(_elapsed), int(_resolve_ms), int(_title_ms),
             int(_search_ms), _raw_hits, _unique_raw_sessions,
+            int(winner_stats.get("lineage_work", 0)), _truncated,
         )
         return json.dumps(_empty_payload, ensure_ascii=False)
 
@@ -842,8 +889,15 @@ def _discover(
         "query": query,
         "results": results,
         "count": len(results),
+        "truncated": _truncated,
         "sessions_searched": len(winner_rows) + (1 if title_result else 0),
     }
+    if _truncated:
+        # A partial safe prefix must never be presented as a complete top-K.
+        _final_payload["warning"] = (
+            "Session search stopped at the lineage safety work bound; "
+            "results are a safe ranked prefix and may be incomplete."
+        )
     _annotate_rebuild_status(db, _final_payload)
     _json = json.dumps(_final_payload, ensure_ascii=False)
     _json_ms = (time.perf_counter() - _json_t0) * 1000
@@ -851,11 +905,13 @@ def _discover(
     logging.info(
         "DISCOVER_DONE request_id=%s total_ms=%d resolve_ms=%d title_ms=%d search_ms=%d "
         "order_ms=%d view_ms=%d json_ms=%d results=%d raw_hits=%d "
-        "unique_raw_sessions=%d unique_lineages=%d",
+        "unique_raw_sessions=%d unique_lineages=%d "
+        "lineage_work=%d lineage_bound_hit=%s",
         _request_id, int(_elapsed), int(_resolve_ms), int(_title_ms), int(_search_ms),
         _order_ms, int(_view_ms), int(_json_ms), len(results), _raw_hits,
         _unique_raw_sessions,
         int(winner_stats.get("lineage_count", 0)) + (1 if title_result else 0),
+        int(winner_stats.get("lineage_work", 0)), _truncated,
     )
     return _json
 

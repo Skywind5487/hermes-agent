@@ -594,6 +594,18 @@ def test_cli_allow_partial_salvages_rows_across_a_corrupt_leaf(
     }
 
 
+def test_session_cjk_derived_keys_are_generated_meta():
+    """#26: the session-CJK derived markers (H/P/stale) are regenerated from
+    the fresh destination's own schema on recovery — never copied from the
+    source — mirroring the #25 session Unicode pair."""
+    for key in (
+        "fts_session_cjk_rebuild_high_water",
+        "fts_session_cjk_rebuild_progress",
+        "fts_session_cjk_stale",
+    ):
+        assert key in session_recovery._GENERATED_META_KEYS, key
+
+
 def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
     tmp_path: Path,
 ) -> None:

@@ -1,6 +1,7 @@
 # Session metadata FTS (#25) — stable `row_id` + resumable Unicode external-content index
 
-Status: **implemented on `fts/session-row-id-unicode-migration`** (fork #25).
+Status: **implemented** — #25 on `fts/session-row-id-unicode-migration`, its
+optional CJK variant (#26) on `fts/session-cjk-highwater`.
 
 This documents the architecture shipped by #25 and the invariants later tickets
 (#26 CJK, #27 unified lifecycle/storage settlement, #30 normalized trigram) build on.
@@ -131,30 +132,82 @@ helper returns `(fts_ok, candidates)`: when the `sessions_fts` MATCH lane
 itself fails, `fts_ok` is False so title resolution falls back to the LIKE
 lane instead of trusting a partial result.
 
+## CJK variant (issue #26)
+
+`sessions_fts_cjk` is an **optional CJK specialization** of the same
+architecture: the same external-content raw `(title, id, display_name)`
+document keyed by the same named `row_id`, but tokenized with the loadable
+`cjk_unicode61` bigram tokenizer. It does not get a second scheduler — it
+reuses the generic `_FTS_*_SPEC` chunk/finish/repair/pacing engine with its
+own spec.
+
+The one structural difference from Unicode is capability: the tokenizer is an
+optional loadable extension, so **worker operability** (can this process build
+/maintain the index) is a separate in-process fact from **search-serving
+availability** (is the index complete, non-stale, and queryable). A pending
+backfill is a valid `worker-operable = true, search-serving = false` state and
+the worker must still advance there — the donor deadlock that a single
+conflated boolean caused. Durable state is independent:
+`fts_session_cjk_rebuild_high_water` / `_progress` / `fts_session_cjk_stale`
+— never the Unicode-session pair, never the message-CJK pair.
+
+Degradation rules (pinned by tests):
+
+- A tokenizer-less host drops the unsafe CJK triggers only after persisting
+the stale breadcrumb, and **never clears pending H/P** — missing local
+capability is not evidence of completion.
+- A stale index (unknown post-drop gap) is never served and its triggers are
+not blindly reinstalled; a later capable host resets it to a known-empty
+surface and reseeds a fresh CJK H/P from current `MAX(row_id)`.
+- `#77629`: the same operability capability that gates the chunk step gates
+finish; only a successful boundary-sweep finish clears the CJK markers and
+flips search-serving on.
+- Pending/stale/unavailable CJK and lone single-CJK-character queries are
+served by the canonical Unicode/LIKE fallback — never a partial index.
+`_fts_cjk_metadata_candidates` returns `(servable, candidates)` so a valid
+zero-match is distinct from unservable (the seam #14 will route on).
+- All CJK MATCH runs through `_read_ctx()`; the dedicated
+`SessionDB(read_only=True)` attach probes/loads the tokenizer per connection,
+degrading to fallback on failure.
+
+The tokenizer ships as a loadable extension built from
+`native/fts5_cjk/fts5_cjk.c` (`build.sh` on Linux; a Windows `.dll` via
+mingw). The CJK tests build it on the fly in CI or honor a prebuilt
+`HERMES_FTS5_CJK_SO` artifact.
+
 ## Files
 
 - `hermes_state_common.py` — `SESSIONS_FTS_SQL` (external DDL + gated narrow
-  triggers), `SESSION_TABLE_REBUILD_SQL` / `SESSION_INDEX_SQL_STATEMENTS`
-  (the unique title index is deliberately excluded: the existing post-migration
-  duplicate-title repair owns it).
+  triggers), `SESSIONS_FTS_CJK_TABLE_SQL` / `SESSIONS_FTS_CJK_TRIGGER_SQL`
+  (split CJK DDL + gated narrow triggers), `_FTS_SESSION_CJK_TRIGGERS`,
+  `FTS_SESSION_CJK_STALE_KEY`, `SESSION_TABLE_REBUILD_SQL` /
+  `SESSION_INDEX_SQL_STATEMENTS` (the unique title index is deliberately
+  excluded: the existing post-migration duplicate-title repair owns it).
 - `hermes_state.py` — `_migrate_sessions_row_id`, `_ensure_sessions_fts_schema`,
-  `_db_has_internal_content_sessions_fts`, `_backfill_sessions_fts_cjk`,
-  `_session_fts_rebuild_gap`, `_fts_unicode61_fold`, `_fts_query_positive_terms`,
-  `_fts_metadata_candidates` (returns `(fts_ok, candidates)` sorted globally;
-  the gap supplement is a term-superset of the FTS predicate), updated
-  `_fts_numbered_variants`.
+  `_fts_session_schema_transition`, `_db_has_internal_content_sessions_fts`,
+  `_ensure_sessions_fts_cjk_schema`, `_fts_session_cjk_schema_transition`,
+  `_db_has_internal_content_sessions_fts_cjk`, `_session_fts_rebuild_gap`,
+  `_fts_unicode61_fold`, `_fts_query_positive_terms`, `_fts_metadata_candidates`
+  (returns `(fts_ok, candidates)` sorted globally; the gap supplement is a
+  term-superset of the FTS predicate), `_fts_cjk_metadata_candidates` (returns
+  `(servable, candidates)`; unservable on pending/stale/unavailable/lone-char),
+  updated `_fts_numbered_variants`.
 - `hermes_state_schema.py` — `_init_schema` wiring: the sessions-FTS block is
   placed OUTSIDE the message legacy/`else` branch so it runs for every message
   layout (the `fts_storage_version` stamp stays message-scoped; unified
   storage-version settlement is #27).
-- `hermes_state_search.py` — shared `_FTS_MESSAGE_SPEC` / `_FTS_SESSION_SPEC`,
-  parameterized `fts_rebuild_status/step`, `_fts_rebuild_finish`,
-  `_seed_fts_rebuild_markers`, `_repair_missing_progress` (the shared crash-safe
-  repair), `_repair_optimize_bookkeeping` / `_repair_session_fts_bookkeeping`,
+- `hermes_state_search.py` — shared `_FTS_MESSAGE_SPEC` / `_FTS_SESSION_SPEC` /
+  `_FTS_SESSION_CJK_SPEC`, parameterized `fts_rebuild_status/step`,
+  `_fts_rebuild_finish` (honors the spec's operability gate + `finish_hook`;
+  the session-CJK hook gates search-serving on "not stale"),
+  `_seed_fts_rebuild_markers` / `_seed_session_spec_rebuild_markers`,
+  `_repair_missing_progress` (the shared crash-safe repair) /
+  `_repair_session_spec_bookkeeping`, `_fts_reset_stale_cjk_surface` /
+  `_fts_cjk_reset_if_stale` / `_fts_session_cjk_reset_if_stale`,
   `_fts_rebuild_pause`, `fts_optimize_available` / `optimize_fts_storage`
-  session phase.
-- `hermes_cli/session_recovery.py` — session markers treated as generated /
-  pending in offline recovery.
+  session (+ session-CJK) phase.
+- `hermes_cli/session_recovery.py` — session Unicode + CJK markers treated as
+  generated / pending in offline recovery.
 - `tests/test_session_metadata_fts.py` — rowid-hole migration (incl. legacy
   duplicate-title upgrade), raw Unicode external-content, H/P ownership
   regions, crash/restart (incl. the partial-index H-without-P orphan

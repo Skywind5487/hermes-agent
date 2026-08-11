@@ -24,7 +24,6 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
-    SESSIONS_FTS_CJK_SQL,
     SESSIONS_FTS_SQL,
     SESSION_INDEX_SQL_STATEMENTS,
     SESSION_TABLE_REBUILD_SQL,
@@ -1189,16 +1188,15 @@ class SessionSchemaMixin:
             # sessions_fts with no triggers and no H/P claim.
             sessions_fts_ok = self._ensure_sessions_fts_schema(cursor)
             self._sessions_fts_available = sessions_fts_ok
-            # CJK title table stays internal-content and one-shot
-            # backfilled (the CJK lifecycle is owned by #26).
-            sessions_cjk_ok = False
-            if sessions_fts_ok and self._fts_cjk_loaded:
-                sessions_cjk_ok = self._ensure_fts_schema(
-                    cursor, "sessions_fts_cjk", SESSIONS_FTS_CJK_SQL,
-                )
-            self._sessions_cjk_available = sessions_cjk_ok
-            if sessions_cjk_ok:
-                self._backfill_sessions_fts_cjk(cursor)
+            # CJK session metadata (issue #26): an optional specialization of
+            # the Unicode session lifecycle over the same raw (title, id,
+            # display_name) document. Runs unconditionally (even when the
+            # tokenizer is unavailable) so a tokenizer-less host can degrade
+            # the session-CJK surface safely. Sets
+            # ``_sessions_cjk_worker_operable`` (can this process build/
+            # maintain the CJK index) and ``_sessions_cjk_available`` (is the
+            # completed index search-serving) as separate facts.
+            self._ensure_sessions_fts_cjk_schema(cursor)
 
             # ── Sessions normalized trigram FTS5 (#30) ──────────────
             # External-content trigram over the derived compact/raw VIEW,

@@ -19,6 +19,7 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
     FTS_CJK_STALE_KEY,
+    FTS_SESSION_CJK_STALE_KEY,
     FTS_SQL,
     FTS_SESSION_TRIGRAM_STALE_KEY,
     FTS_STORAGE_VERSION,
@@ -26,11 +27,110 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    _FTS_SESSION_CJK_TRIGGERS,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
+
+
+# ── Compression-lineage resolver (#68) ────────────────────────────────────
+#
+# One logical session-search query resolves each ranked owner candidate to
+# its positive compression-continuation root with a query-local
+# memo/path-compression pass.  Generic parentage is NOT lineage: only a
+# child whose parent exists, whose parent ended by ``'compression'``, that is
+# not a ``tool`` session, and whose branch/delegate markers do not explicitly
+# point at that parent forms a compression edge.  Foreign markers pointing
+# elsewhere do not disqualify the edge.
+#
+# Safety is orthogonal to lineage identity: a traversal-local seen-set proves
+# cycles, and a global per-query work budget bounds indexed row fetches.  A
+# budget-exhausted partial path is operational uncertainty, never semantic
+# evidence, so it is not memoized as unresolved.
+_LINEAGE_WORK_BUDGET = 2000
+_UNRESOLVED = object()
+_BUDGET_EXHAUSTED = object()
+
+_LINEAGE_NODE_SQL = """
+SELECT
+    child.id,
+    child.parent_session_id,
+    child.source,
+    child.model_config,
+    parent.id AS parent_exists,
+    parent.end_reason AS parent_end_reason
+FROM sessions child
+LEFT JOIN sessions parent ON parent.id = child.parent_session_id
+WHERE child.id = ?
+"""
+
+
+def _lineage_markers(
+    model_config: Any,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Return ``(config_valid, branched_from, delegate_from)`` for a session.
+
+    Malformed / non-object ``model_config`` is treated as "no proven positive
+    edge" (the conservative direction): the current node becomes its own root
+    rather than traversing an unproven parent.
+    """
+    if model_config in (None, ""):
+        return True, None, None
+    value = model_config
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return False, None, None
+    if not isinstance(value, dict):
+        return False, None, None
+    markers: List[Optional[str]] = []
+    for key in ("_branched_from", "_delegate_from"):
+        marker = value.get(key)
+        if marker is None:
+            markers.append(None)
+        elif isinstance(marker, str) and marker:
+            markers.append(marker)
+        else:
+            return False, None, None
+    return True, markers[0], markers[1]
+
+
+class _LineageResolutionState:
+    """Per-logical-query resolver state for one winner search.
+
+    ``work`` counts exactly one successful uncached lineage-node row fetch;
+    memo hits, absent-row fetches, and local cycle checks consume nothing.
+    ``memo`` maps a lineage node to a resolved root string or ``_UNRESOLVED``.
+    A budget-exhausted partial path is never written to the memo.
+    """
+
+    __slots__ = (
+        "budget",
+        "work",
+        "memo",
+        "memo_hits",
+        "bound_hit",
+        "candidates_inspected",
+        "accepted_roots",
+    )
+
+    def __init__(self, budget: int = _LINEAGE_WORK_BUDGET) -> None:
+        self.budget = max(1, int(budget))
+        self.work = 0
+        self.memo: Dict[str, Any] = {}
+        self.memo_hits = 0
+        self.bound_hit = False
+        self.candidates_inspected = 0
+        self.accepted_roots = 0
+
+    def _memoize_unresolved(self, path: List[str], node: str) -> None:
+        """Mark *path* plus *node* as proven unresolved (zero later lookups)."""
+        for visited in path:
+            self.memo.setdefault(visited, _UNRESOLVED)
+        self.memo.setdefault(node, _UNRESOLVED)
 
 
 # Deferred-rebuild specs shared by the message and session metadata FTS
@@ -102,6 +202,38 @@ _FTS_SESSION_TRIGRAM_SPEC = {
         self, "_sessions_trigram_available", False
     ),
     "trigram_available": lambda self: False,
+}
+
+# Optional CJK session-metadata specialization (issue #26) of the SAME
+# generic rebuild engine: identical external-content raw (title, id,
+# display_name) document keyed by named row_id, its OWN H/P marker pair and
+# stale key (never the Unicode-session pair, never the message-CJK pair).
+#
+# The worker gate is ``_sessions_cjk_worker_operable`` (can this process
+# build/maintain the CJK index) — NOT ``_sessions_cjk_available`` (search
+# serving). The donor deadlock was one boolean doing both jobs: pending made
+# serving false, the same false blocked the worker, finish never ran, search
+# never became available. The #77629 invariant (optional capability gates
+# finish exactly as it gates step) is honored by routing both through this
+# same callback and by the availability gate in ``_fts_rebuild_finish``.
+# ``finish_hook`` flips search-serving on only after the boundary sweep
+# clears the CJK markers.
+_FTS_SESSION_CJK_SPEC = {
+    "name": "sessions_cjk",
+    "high_water_key": "fts_session_cjk_rebuild_high_water",
+    "progress_key": "fts_session_cjk_rebuild_progress",
+    "fts_table": "sessions_fts_cjk",
+    "fts_columns": ("title", "id", "display_name"),
+    "source_table": "sessions",
+    "source_columns": ("title", "id", "display_name"),
+    "row_key": "row_id",
+    "trigram_fts": None,
+    "trigram_columns": (),
+    "trigram_where": None,
+    "reset_tables": ("sessions_fts_cjk",),
+    "available": lambda self: getattr(self, "_sessions_cjk_worker_operable", False),
+    "trigram_available": lambda self: False,
+    "finish_hook": lambda self: self._fts_session_cjk_finish_set_serving(),
 }
 
 
@@ -219,6 +351,12 @@ class SessionSearchMixin:
         down with it.
         """
         spec = spec or _FTS_MESSAGE_SPEC
+        # #77629 invariant: the SAME optional operability capability that
+        # gates the chunked step must gate finish. A host that lost the
+        # capability (e.g. a CJK tokenizer it could load at open) must not
+        # enter a finish path that falsely settles durable work.
+        if not spec["available"](self):
+            return
         include_trigram = bool(
             spec.get("trigram_fts") and spec["trigram_available"](self)
         )
@@ -266,6 +404,11 @@ class SessionSearchMixin:
                 (spec["high_water_key"], spec["progress_key"]),
             )
         self._execute_write(_do)
+        # Optional per-spec post-finish transition (e.g. flip session-CJK
+        # search-serving availability once the boundary sweep has settled).
+        hook = spec.get("finish_hook")
+        if hook is not None:
+            hook(self)
         logger.info(
             "Deferred %s FTS rebuild complete — all rows indexed.", spec["name"]
         )
@@ -436,6 +579,40 @@ class SessionSearchMixin:
             return False
         return self.fts_rebuild_step(spec=_FTS_SESSION_TRIGRAM_SPEC)
 
+    def fts_session_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Session CJK metadata index backfill progress, or None when none is
+        pending (issue #26)."""
+        return self.fts_rebuild_status(spec=_FTS_SESSION_CJK_SPEC)
+
+    def fts_session_cjk_rebuild_step(self) -> bool:
+        """Backfill one chunk of the session CJK metadata index (issue #26).
+
+        True while work remains. Shares the generic chunk / finish / crash
+        rules with the Unicode session and message rebuilds. The worker gate
+        is **worker operability** (``_sessions_cjk_worker_operable``), never
+        search-serving availability — a pending CJK backfill (W=1, S=0) must
+        still advance, run finish, and only then flip to serving.
+        """
+        return self.fts_rebuild_step(spec=_FTS_SESSION_CJK_SPEC)
+
+    def _fts_session_cjk_finish_set_serving(self) -> None:
+        """Flip session-CJK search-serving on after finish, unless the index
+        is stale (issue #26).
+
+        #77629/#26 invariant: only a successful boundary-sweep finish that
+        also finds no stale breadcrumb makes the index search-serving. An
+        incapable host may have persisted ``fts_session_cjk_stale`` and
+        dropped the CJK triggers mid-rebuild, leaving a gap of unknown
+        extent — that index is never served until a capable host resets and
+        rebuilds.
+        """
+        with self._read_ctx() as conn:
+            stale = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (FTS_SESSION_CJK_STALE_KEY,),
+            ).fetchone()
+        self._sessions_cjk_available = stale is None
+
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
         with self._read_ctx() as conn:
@@ -526,37 +703,56 @@ class SessionSearchMixin:
         self._fts_cjk_available = True
         logger.info("CJK FTS index backfill complete — serving CJK search.")
 
-    def _fts_cjk_reset_if_stale(self) -> None:
-        """Rebuild path for a stale cjk index (triggers were dropped).
+    def _fts_reset_stale_cjk_surface(
+        self,
+        *,
+        stale_key: str,
+        trigger_tuple: Collection[str],
+        drop_tables: Collection[str],
+        drop_views: Collection[str] = (),
+        meta_keys: Collection[str],
+        recreate: Callable[[], None],
+    ) -> None:
+        """Drop-and-recreate a stale optional CJK index from scratch, shared
+        by the message (``_fts_cjk_reset_if_stale``) and session
+        (``_fts_session_cjk_reset_if_stale``) CJK surfaces.
 
-        The gap's extent is unknown, so the only safe recovery is a from-
-        scratch rebuild: drop the table + triggers, clear the breadcrumb,
-        recreate via ``_ensure_fts_cjk_schema`` (which sets fresh backfill
-        markers on a populated DB). Called from ``optimize_fts_storage`` on
-        a tokenizer-capable host; no-op when not stale.
+        A stale index (its triggers were dropped by a tokenizer-less host) has
+        a gap of unknown extent, so the only safe recovery is a from-scratch
+        rebuild: drop the table + triggers, clear the stale breadcrumb and any
+        H/P, then let ``recreate`` re-ensure the surface (which sets fresh
+        backfill markers on a populated DB). No-op when not stale or not
+        tokenizer-capable.
         """
         if not self._fts_cjk_loaded:
             return
 
         def _do(conn):
             stale = conn.execute(
-                "SELECT 1 FROM state_meta WHERE key = ?",
-                (FTS_CJK_STALE_KEY,),
+                "SELECT 1 FROM state_meta WHERE key = ?", (stale_key,),
             ).fetchone()
             if not stale:
                 return False
-            for trig in _FTS_CJK_TRIGGERS:
+            for trig in trigger_tuple:
                 conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
-            conn.execute("DROP TABLE IF EXISTS messages_fts_cjk")
-            conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+            for tbl in drop_tables:
+                conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+            for view in drop_views:
+                conn.execute(f"DROP VIEW IF EXISTS {view}")
+            ph = ", ".join("?" for _ in meta_keys)
             conn.execute(
-                "DELETE FROM state_meta WHERE key IN "
-                f"('{FTS_CJK_STALE_KEY}', 'fts_cjk_rebuild_high_water', "
-                "'fts_cjk_rebuild_progress')"
+                f"DELETE FROM state_meta WHERE key IN ({ph})", tuple(meta_keys),
             )
             return True
+
         was_stale = self._execute_write(_do)
         if was_stale:
+            recreate()
+
+    def _fts_cjk_reset_if_stale(self) -> None:
+        """Rebuild path for a stale message CJK index (triggers were dropped).
+        See ``_fts_reset_stale_cjk_surface``."""
+        def _recreate():
             # Recreate outside the write transaction — _ensure_fts_cjk_schema
             # uses executescript(), which implicitly commits any pending
             # transaction and must not run inside _execute_write's BEGIN
@@ -564,6 +760,48 @@ class SessionSearchMixin:
             with self._lock:
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
+
+        self._fts_reset_stale_cjk_surface(
+            stale_key=FTS_CJK_STALE_KEY,
+            trigger_tuple=_FTS_CJK_TRIGGERS,
+            drop_tables=("messages_fts_cjk",),
+            drop_views=("messages_fts_cjk_src",),
+            meta_keys=(
+                FTS_CJK_STALE_KEY,
+                "fts_cjk_rebuild_high_water",
+                "fts_cjk_rebuild_progress",
+            ),
+            recreate=_recreate,
+        )
+
+    def _fts_session_cjk_reset_if_stale(self) -> None:
+        """Rebuild path for a stale session-CJK index (triggers were dropped
+        by a tokenizer-less host, issue #26). See
+        ``_fts_reset_stale_cjk_surface``."""
+        def _recreate():
+            # Recreate OUTSIDE the write transaction and OUTSIDE self._lock:
+            # _ensure_sessions_fts_cjk_schema manages its own locking (its
+            # crash-atomic transition uses _execute_write, and self._lock is a
+            # plain non-reentrant Lock). Sets fresh CJK-session markers on a
+            # populated DB.
+            self._ensure_sessions_fts_cjk_schema(self._conn)
+            self._conn.commit()
+
+        self._fts_reset_stale_cjk_surface(
+            stale_key=FTS_SESSION_CJK_STALE_KEY,
+            trigger_tuple=_FTS_SESSION_CJK_TRIGGERS,
+            drop_tables=(
+                "sessions_fts_cjk", "sessions_fts_cjk_data",
+                "sessions_fts_cjk_idx", "sessions_fts_cjk_content",
+                "sessions_fts_cjk_docsize", "sessions_fts_cjk_config",
+            ),
+            meta_keys=(
+                FTS_SESSION_CJK_STALE_KEY,
+                "fts_session_cjk_rebuild_high_water",
+                "fts_session_cjk_rebuild_progress",
+            ),
+            recreate=_recreate,
+        )
 
     def _fts_external_index_empty_with_source(
         self, conn, source_table: str, fts_table: str
@@ -696,14 +934,14 @@ class SessionSearchMixin:
     def _seed_session_metadata_fts_rebuild_markers(
         self, conn, spec: Dict[str, Any], *, force: bool = False
     ) -> int:
-        """Session-metadata variant of ``_seed_fts_rebuild_markers``.
+        """Shared session-metadata variant of ``_seed_fts_rebuild_markers``.
 
         An empty DB is complete by construction (the triggers cover every
         future row) and must not carry a spurious claim that would make
         ``fts_optimize_available`` advertise pending work forever. Shared by
-        the Unicode (#25) and normalized trigram (#30) session metadata lanes
-        so the empty-DB rule lives once — only the spec (marker keys, source
-        table, row key) differs.
+        the Unicode (#25), normalized trigram (#30), and CJK (#26) session
+        metadata lanes so the empty-DB rule lives once — only the spec
+        (marker keys, source table, row key) differs.
         """
         n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
         if n == 0:
@@ -736,6 +974,15 @@ class SessionSearchMixin:
         (issue #30). Same empty-DB-is-complete rule on its OWN marker pair."""
         return self._seed_session_metadata_fts_rebuild_markers(
             conn, _FTS_SESSION_TRIGRAM_SPEC, force=force
+        )
+
+    def _seed_session_cjk_fts_rebuild_markers(
+        self, conn, *, force: bool = False
+    ) -> int:
+        """Session CJK metadata variant of ``_seed_fts_rebuild_markers``
+        (issue #26). Gated on tokenizer capability by the caller."""
+        return self._seed_session_metadata_fts_rebuild_markers(
+            conn, _FTS_SESSION_CJK_SPEC, force=force
         )
 
     def _repair_missing_progress(self, conn, spec: Dict[str, Any]) -> bool:
@@ -824,57 +1071,9 @@ class SessionSearchMixin:
                 self._seed_fts_rebuild_markers(conn, force=True)
         self._execute_write(_do)
 
-    def _repair_session_fts_bookkeeping(
-        self, spec: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Heal interrupted session-metadata backfill bookkeeping (#25 / #30).
-
-        Reuses ``_repair_missing_progress`` (the shared crash-safe rule) for
-        the orphan high_water-without-progress case, and its own orphan
-        claim-seeding for a fresh external index over a populated DB that
-        lost its markers. Never re-implements the reset-before-replay rule.
-        Parameterized by the rebuild spec so the Unicode (#25) and normalized
-        trigram (#30) session metadata lanes share one implementation — only
-        the marker keys and the source/index table names differ (the trigram
-        lane is INDEPENDENT of the Unicode lane's markers).
-        """
-        spec = spec or _FTS_SESSION_SPEC
-        self._execute_write(
-            lambda conn: self._repair_session_fts_bookkeeping_inner(conn, spec)
-        )
-
-    def _repair_session_fts_bookkeeping_inner(
-        self, conn, spec: Dict[str, Any]
-    ) -> None:
-        """The bookkeeping repair body, given a held write transaction."""
-        existing_hw = conn.execute(
-            "SELECT value FROM state_meta WHERE key = ?",
-            (spec["high_water_key"],),
-        ).fetchone()
-        if existing_hw is not None:
-            progress = conn.execute(
-                "SELECT 1 FROM state_meta WHERE key = ?",
-                (spec["progress_key"],),
-            ).fetchone()
-            if progress is None:
-                # Respect the reset postcondition (finding 5): if the required
-                # primary target could not be proven empty after reset, refuse
-                # and preserve H-without-P for a later capable retry.
-                self._repair_missing_progress(conn, spec)
-            return
-        # No claim: a freshly-created external index over a populated DB
-        # that lost its markers, or a crash window after schema ensure
-        # without a claim. Seed a full backfill (orphan recovery).
-        if self._fts_external_index_empty_with_source(
-            conn, spec["source_table"], spec["fts_table"]
-        ):
-            self._seed_session_metadata_fts_rebuild_markers(
-                conn, spec, force=True
-            )
-
     def _repair_session_trigram_fts_bookkeeping(self) -> None:
         """Session normalized trigram variant of
-        ``_repair_session_fts_bookkeeping`` (issue #30). Independent markers;
+        ``_repair_session_spec_bookkeeping`` (issue #30). Independent markers;
         shares the crash-safe implementation.
 
         Serving gate: only repairs a target this process serves (available at
@@ -883,15 +1082,59 @@ class SessionSearchMixin:
         when it happens to look canonical; a stale target is only repaired
         through the dedicated stale-recovery path.
         """
-        def _do(conn):
-            if not self._sessions_trigram_available:
-                return
+        if not self._sessions_trigram_available:
+            return
+        with self._read_ctx() as conn:
             if self._session_trigram_is_stale(conn):
                 return
-            self._repair_session_fts_bookkeeping_inner(
-                conn, _FTS_SESSION_TRIGRAM_SPEC
-            )
+        self._repair_session_spec_bookkeeping(_FTS_SESSION_TRIGRAM_SPEC)
+
+    def _repair_session_spec_bookkeeping(self, spec: Dict[str, Any]) -> None:
+        """Shared session-metadata repair for interrupted backfill bookkeeping
+        (#25 Unicode / #30 trigram / #26 CJK). Reuses
+        ``_repair_missing_progress`` (the shared crash-safe rule) for the
+        orphan high_water-without-progress case, and seeds a fresh claim for
+        a fresh external index over a populated DB that lost its markers.
+        Never re-implements the reset-before-replay rule.
+        """
+        def _do(conn):
+            existing_hw = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (spec["high_water_key"],),
+            ).fetchone()
+            if existing_hw is not None:
+                progress = conn.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ?",
+                    (spec["progress_key"],),
+                ).fetchone()
+                if progress is None:
+                    self._repair_missing_progress(conn, spec)
+                return
+            # No claim: a freshly-created external index over a populated DB
+            # that lost its markers, or a crash window after schema ensure
+            # without a claim. Seed a full backfill (orphan recovery).
+            if self._fts_external_index_empty_with_source(
+                conn, spec["source_table"], spec["fts_table"]
+            ):
+                self._seed_session_metadata_fts_rebuild_markers(
+                    conn, spec, force=True
+                )
         self._execute_write(_do)
+
+    def _repair_session_fts_bookkeeping(self) -> None:
+        """Heal interrupted session Unicode metadata backfill bookkeeping
+        (#25). See ``_repair_session_spec_bookkeeping``."""
+        self._repair_session_spec_bookkeeping(_FTS_SESSION_SPEC)
+
+    def _repair_session_cjk_fts_bookkeeping(self) -> None:
+        """Heal interrupted session-CJK backfill bookkeeping (issue #26). See
+        ``_repair_session_spec_bookkeeping``. Only meaningful on a
+        tokenizer-capable host: an incapable host cannot have created the CJK
+        surface, and must never fabricate durable CJK claims.
+        """
+        if not self._fts_cjk_loaded:
+            return
+        self._repair_session_spec_bookkeeping(_FTS_SESSION_CJK_SPEC)
 
     def fts_optimize_available(self) -> bool:
         """True when `optimize_fts_storage()` has work to do: either this DB
@@ -944,6 +1187,14 @@ class SessionSearchMixin:
             if self._fts_cjk_loaded and self._conn.execute(
                 "SELECT 1 FROM state_meta WHERE key IN "
                 f"('fts_cjk_rebuild_high_water', '{FTS_CJK_STALE_KEY}') LIMIT 1"
+            ).fetchone():
+                return True
+            # Session CJK metadata rebuild pending or stale (issue #26) —
+            # same tokenizer-capability gate as the message CJK index.
+            if self._fts_cjk_loaded and self._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key IN "
+                "('fts_session_cjk_rebuild_high_water', "
+                f"'{FTS_SESSION_CJK_STALE_KEY}') LIMIT 1"
             ).fetchone():
                 return True
             if self._has_fts_trash(self._conn):
@@ -1072,6 +1323,9 @@ class SessionSearchMixin:
         # Same healing for the session normalized trigram rebuild (#30) — its
         # OWN markers, independent of the Unicode lane.
         self._repair_session_trigram_fts_bookkeeping()
+        # Same healing for the session CJK metadata rebuild (issue #26);
+        # no-op on a host that cannot tokenize.
+        self._repair_session_cjk_fts_bookkeeping()
 
         # Only demote if we're actually still on the legacy shape. If a prior
         # run already demoted (markers/trash present), skip straight to
@@ -1113,6 +1367,9 @@ class SessionSearchMixin:
         # below rebuilds it. No-op without trigram capability (finding 1
         # point 4).
         self._fts_session_trigram_recover_if_stale()
+        # Same from-scratch recovery for a stale session-CJK index (issue
+        # #26); no-op without the tokenizer.
+        self._fts_session_cjk_reset_if_stale()
         # An optimized v23 DB gaining the cjk index for the first time (no
         # legacy work left, tokenizer newly installed): ensure the table +
         # markers exist so the backfill phase has work to claim.
@@ -1131,6 +1388,8 @@ class SessionSearchMixin:
                 st = self.fts_session_rebuild_status()
             if st is None:
                 st = self.fts_session_trigram_rebuild_status()
+            if st is None:
+                st = self.fts_session_cjk_rebuild_status()
             progress_cb({
                 "phase": phase,
                 "percent": st["percent"] if st else 100,
@@ -1176,6 +1435,17 @@ class SessionSearchMixin:
             while True:
                 _t0 = time.monotonic()
                 if not self.fts_session_trigram_rebuild_step():
+                    break
+                _emit("backfill")
+                self._fts_rebuild_pause(time.monotonic() - _t0)
+
+        # Phase 1e: backfill the session CJK metadata index (issue #26) — the
+        # same shared chunk engine and pacing, gated on the independent
+        # CJK-session markers (worker operability, never search availability).
+        if self.fts_session_cjk_rebuild_status() is not None:
+            while True:
+                _t0 = time.monotonic()
+                if not self.fts_session_cjk_rebuild_step():
                     break
                 _emit("backfill")
                 self._fts_rebuild_pause(time.monotonic() - _t0)
@@ -1725,6 +1995,183 @@ class SessionSearchMixin:
                 return None
             return [dict(row) for row in tri_cursor.fetchall()]
 
+    def _resolve_compression_lineage_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: _LineageResolutionState,
+    ) -> Any:
+        """Resolve *session_id* to its compression root on *conn*.
+
+        Returns the resolved root string, ``_UNRESOLVED`` for a proven
+        semantic unresolved outcome (missing row / dangling parent / positive
+        cycle), or ``_BUDGET_EXHAUSTED`` when the global work budget would be
+        exceeded by the next uncached lookup.
+
+        The loop ordering is correctness-significant at the B boundary:
+        memo lookup first, then traversal-local cycle proof, then the budget
+        check (only because another uncached lookup is now required), then the
+        one-node point lookup.
+        """
+        if not session_id:
+            return _UNRESOLVED
+        node = str(session_id)
+        path: List[str] = []
+        seen: set[str] = set()
+
+        while True:
+            cached = state.memo.get(node)
+            if cached is _UNRESOLVED:
+                state.memo_hits += 1
+                for visited in path:
+                    state.memo.setdefault(visited, _UNRESOLVED)
+                return _UNRESOLVED
+            if cached is not None:
+                # Memo hit: path-compress the visited prefix to the known root.
+                state.memo_hits += 1
+                for visited in path:
+                    state.memo.setdefault(visited, cached)
+                return cached
+
+            if node in seen:
+                # Positive cycle proven from the traversal-local seen-set
+                # with no further DB lookup (valid even at work == B).
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+            seen.add(node)
+
+            if state.work >= state.budget:
+                # Another uncached lookup is required and the budget is gone.
+                # This is operational uncertainty, NOT semantic unresolved, so
+                # the partial path is left out of the memo.
+                state.bound_hit = True
+                return _BUDGET_EXHAUSTED
+
+            row = conn.execute(_LINEAGE_NODE_SQL, (node,)).fetchone()
+            if row is None:
+                # The node row itself is missing: zero successful-fetch work
+                # for that absent row; the traversed path is semantically
+                # unresolved.
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+            state.work += 1
+
+            current = str(row["id"])
+            path.append(current)
+            parent_id = row["parent_session_id"]
+            if parent_id is None:
+                root = current
+                break
+            parent_id = str(parent_id)
+
+            if row["parent_exists"] is None:
+                # Dangling parent: malformed lineage, fail closed.
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+
+            config_valid, branched_from, delegate_from = _lineage_markers(
+                row["model_config"]
+            )
+            positive_edge = (
+                config_valid
+                and row["parent_end_reason"] == "compression"
+                and row["source"] != "tool"
+                and branched_from != parent_id
+                and delegate_from != parent_id
+            )
+            if not positive_edge:
+                root = current
+                break
+
+            node = parent_id
+
+        for visited in path:
+            state.memo.setdefault(visited, root)
+        return root
+
+    def resolve_compression_lineage(
+        self,
+        session_id: str,
+        *,
+        work_budget: int = _LINEAGE_WORK_BUDGET,
+    ) -> Optional[str]:
+        """Resolve *session_id* to its positive compression-continuation root.
+
+        Returns the root id, or ``None`` when the outcome is a proven semantic
+        unresolved (missing row / dangling parent / positive cycle) or the work
+        budget is exhausted.  Never falls back to generic parent ancestry; an
+        unresolved session is kept separate instead of broadening exclusion to
+        an unproven ancestor.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            started_tx = not conn.in_transaction
+            if started_tx:
+                conn.execute("BEGIN")
+            try:
+                state = _LineageResolutionState(work_budget)
+                outcome = self._resolve_compression_lineage_on_conn(
+                    conn, str(session_id), state
+                )
+            finally:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+        if outcome is _UNRESOLVED or outcome is _BUDGET_EXHAUSTED:
+            return None
+        return outcome
+
+    def get_first_message_id(self, session_id: str) -> Optional[int]:
+        """Return the first active message id for *session_id*, or None.
+
+        Lightweight bounded anchor lookup used by session-search title
+        discovery; avoids loading the whole transcript just to find one id.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                "ORDER BY id LIMIT 1",
+                (str(session_id),),
+            ).fetchone()
+        return row["id"] if row is not None else None
+
+    def _current_lineage_ancestors_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: _LineageResolutionState,
+    ) -> set:
+        """Collect the current session's generic parent chain ids.
+
+        Current-session exclusion must also hide live-context ancestors that
+        are NOT compression lineage: a delegation/branch child is still
+        visible to its parent agent, so the parent's content stays excluded
+        even though the child is a distinct compression root (#68).  Walks
+        ``parent_session_id`` links on the same connection, counts successful
+        row fetches toward the work budget, and stops on a missing row, a
+        cycle, or budget exhaustion.
+        """
+        ancestors: set = set()
+        seen: set = set()
+        node = str(session_id) if session_id else None
+        while node and node not in seen:
+            seen.add(node)
+            if state.work >= state.budget:
+                state.bound_hit = True
+                break
+            row = conn.execute(_LINEAGE_NODE_SQL, (node,)).fetchone()
+            if row is None:
+                break
+            state.work += 1
+            parent = row["parent_session_id"]
+            if parent is None:
+                break
+            node = str(parent)
+            ancestors.add(node)
+        return ancestors
+
     def search_session_winners(
         self,
         query: str,
@@ -1739,20 +2186,42 @@ class SessionSearchMixin:
         current_lineage_root: Optional[str] = None,
         lineage_depth_cap: int = 64,
         request_id: str = None,
+        current_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Select discovery winners in SQLite without candidate hydration.
 
-        The candidate scan deliberately remains wider than the requested result
-        limit. SQLite first ranks up to ``candidate_limit`` lightweight FTS/LIKE
-        rows, resolves their parent chains with a recursive CTE, keeps one hit
-        per lineage, and only then applies ``result_limit``. The returned rows
-        contain no full message content and no candidate context.
+        The candidate scan deliberately remains wider than the requested
+        result limit.  SQLite ranks up to ``candidate_limit`` lightweight
+        FTS/LIKE rows; a query-local Python resolver then walks each hit's
+        owning session to its positive compression-continuation root under
+        one coherent logical read snapshot, keeps the first eligible hit per
+        owner as its anchor, dedupes by root, and stops as soon as
+        ``result_limit`` distinct roots survive (early-K).  The returned rows
+        contain no full message content and no candidate context; FTS
+        snippets are computed only for the final winners.
+
+        ``current_session_id`` is a raw session id re-resolved inside this
+        snapshot with the SAME memo/state used for candidate roots, so
+        current-session exclusion and winner dedupe share one root meaning and
+        one work budget.  Exact-title exclusion arrives via
+        ``excluded_lineage_roots`` (resolved by the caller with the same
+        compression-lineage implementation).
+
+        ``lineage_depth_cap`` is retained only for caller compatibility; #68
+        replaced depth as an identity/safety boundary with a traversal-local
+        cycle seen-set plus a global successful-row work budget.
         """
+        del lineage_depth_cap
         empty = {"winners": [], "stats": {
             "candidate_count": 0,
             "candidate_unique_sessions": 0,
             "lineage_count": 0,
             "winner_count": 0,
+            "lineage_work": 0,
+            "lineage_memo_hits": 0,
+            "lineage_memo_entries": 0,
+            "lineage_candidates_inspected": 0,
+            "lineage_bound_hit": False,
             "route": "none",
         }}
         if not self._fts_enabled or not query or not query.strip():
@@ -1763,7 +2232,6 @@ class SessionSearchMixin:
             return empty
         candidate_limit = max(1, min(int(candidate_limit), 1000))
         result_limit = max(0, min(int(result_limit), 100))
-        lineage_depth_cap = max(1, min(int(lineage_depth_cap), 256))
         role_filter = list(role_filter or ("user", "assistant"))
         exclude_sources = list(exclude_sources or ())
         source_filter = list(source_filter or ())
@@ -1898,7 +2366,9 @@ class SessionSearchMixin:
                     s.model,
                     s.started_at AS session_started,
                     0.0 AS fts_rank,
-                    {source_priority} AS source_priority
+                    {source_priority} AS source_priority,
+                    s.end_reason AS session_end_reason,
+                    m.compacted AS message_compacted
                 FROM messages m
                 JOIN sessions s ON s.id = m.session_id
                 WHERE {candidate_where}
@@ -1915,7 +2385,9 @@ class SessionSearchMixin:
                     s.model,
                     s.started_at AS session_started,
                     rank AS fts_rank,
-                    {source_priority} AS source_priority
+                    {source_priority} AS source_priority,
+                    s.end_reason AS session_end_reason,
+                    m.compacted AS message_compacted
                 FROM {candidate_from}
                 JOIN messages m ON m.id = {candidate_from}.rowid
                 JOIN sessions s ON s.id = m.session_id
@@ -1946,34 +2418,13 @@ class SessionSearchMixin:
                 ranked_candidates = ""
                 candidate_base = fts_candidate
 
-        exclusion_parts = []
-        exclusion_params: list = []
-        if excluded_lineage_roots:
-            exclusion_parts.append(
-                "lineage_root_id NOT IN "
-                f"({','.join('?' for _ in excluded_lineage_roots)})"
-            )
-            exclusion_params.extend(excluded_lineage_roots)
-        if current_lineage_root:
-            exclusion_parts.append("lineage_root_id != ?")
-            exclusion_params.append(current_lineage_root)
-        exclusion_sql = " AND ".join(exclusion_parts) or "1 = 1"
-
-        if route == "like":
-            final_snippet_expr = "ranked.snippet"
-            final_snippet_join = ""
-        else:
-            # FTS5's snippet() needs the MATCH expression on the same table
-            # cursor.  Keep the exact tokenized query used for candidate
-            # selection and apply it only after lineage winners are selected.
-            final_snippet_expr = (
-                f"snippet({candidate_from}, 0, '>>>', '<<<', '...', 40)"
-            )
-            final_snippet_join = (
-                f"JOIN {candidate_from} ON {candidate_from}.rowid = ranked.message_id "
-                f"AND {candidate_from} MATCH ?"
-            )
-
+        # The bounded ranked raw-hit set stays the upstream source.  Owner
+        # dedupe happens in Python AFTER per-hit current-visibility: the first
+        # eligible hit of an owner becomes its anchor, so a compacted-history
+        # hit is never erased by an earlier live hit that current-session
+        # exclusion rejects (#68 review finding).  Lineage resolution supplies
+        # only a dedupe/exclusion key and must never rewrite the match anchor
+        # to the root session.
         sql = f"""
             WITH
             {ranked_candidates}
@@ -1993,159 +2444,226 @@ class SessionSearchMixin:
                     COUNT(*) AS candidate_count,
                     COUNT(DISTINCT owning_session_id) AS candidate_unique_sessions
                 FROM candidate_hits
-            ),
-            lineage_seeds AS (
-                SELECT DISTINCT owning_session_id AS seed_session_id
-                FROM candidate_hits
-            ),
-            lineage_walk(seed_session_id, session_id, parent_session_id, depth, path) AS (
-                SELECT
-                    seeds.seed_session_id,
-                    s.id,
-                    s.parent_session_id,
-                    0,
-                    printf('|%s|', s.id)
-                FROM lineage_seeds seeds
-                JOIN sessions s ON s.id = seeds.seed_session_id
-                UNION ALL
-                SELECT
-                    walk.seed_session_id,
-                    parent.id,
-                    parent.parent_session_id,
-                    walk.depth + 1,
-                    walk.path || parent.id || '|'
-                FROM lineage_walk walk
-                JOIN sessions parent ON parent.id = walk.parent_session_id
-                WHERE walk.depth < {lineage_depth_cap}
-                  AND instr(walk.path, printf('|%s|', parent.id)) = 0
-            ),
-            lineage_resolution AS (
-                SELECT
-                    seeds.seed_session_id,
-                    COALESCE(
-                        (
-                            SELECT walk.parent_session_id
-                            FROM lineage_walk walk
-                            WHERE walk.seed_session_id = seeds.seed_session_id
-                              AND walk.parent_session_id IS NOT NULL
-                              AND instr(
-                                  walk.path,
-                                  printf('|%s|', walk.parent_session_id)
-                              ) > 0
-                            ORDER BY walk.depth DESC
-                            LIMIT 1
-                        ),
-                        (
-                            SELECT walk.session_id
-                            FROM lineage_walk walk
-                            WHERE walk.seed_session_id = seeds.seed_session_id
-                            ORDER BY walk.depth DESC
-                            LIMIT 1
-                        ),
-                        seeds.seed_session_id
-                    ) AS lineage_root_id
-                FROM lineage_seeds seeds
-            ),
-            lineage_ranked AS (
-                SELECT
-                    hits.*,
-                    resolution.lineage_root_id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY resolution.lineage_root_id
-                        ORDER BY hits.source_priority, hits.candidate_order
-                    ) AS lineage_rank
-                FROM candidate_hits hits
-                JOIN lineage_resolution resolution
-                  ON resolution.seed_session_id = hits.owning_session_id
             )
             SELECT
-                ranked.message_id AS id,
-                ranked.owning_session_id AS session_id,
-                ranked.role,
-                {final_snippet_expr} AS snippet,
-                ranked.timestamp,
-                ranked.source,
-                ranked.model,
-                ranked.session_started,
-                ranked.lineage_root_id,
-                ranked.candidate_order,
-                ranked.source_priority,
+                candidate_hits.*,
                 stats.candidate_count,
                 stats.candidate_unique_sessions
-            FROM lineage_ranked ranked
-            {final_snippet_join}
+            FROM candidate_hits
             CROSS JOIN candidate_stats stats
-            WHERE ranked.lineage_rank = 1
-              AND {exclusion_sql}
-            ORDER BY ranked.source_priority, ranked.candidate_order
-            LIMIT ?
+            ORDER BY candidate_hits.source_priority, candidate_hits.candidate_order
         """
-        # The LIKE candidate SELECT has an extra snippet parameter before the
-        # WHERE values; candidate_limit/offset were already appended above for
-        # that route and must not be duplicated.
-        if route == "like":
-            sql_params = params + exclusion_params + [result_limit]
-        else:
-            # params[0] is the tokenized FTS query; candidate_limit/offset are
-            # already at the tail of params.  The final MATCH cursor needs the
-            # same query before the result LIMIT parameter.
-            sql_params = params + [params[0]] + exclusion_params + [result_limit]
 
         request_value = request_id or "-"
         started = time.perf_counter()
-        try:
-            with self._lock:
-                execute_started = time.perf_counter()
-                cursor = self._conn.execute(sql, sql_params)
-                rows = [dict(row) for row in cursor.fetchall()]
-                execute_ms = int((time.perf_counter() - execute_started) * 1000)
-        except sqlite3.OperationalError as exc:
-            # Match search_messages() behavior: malformed FTS input is a
-            # no-result search, not a tool-level failure. This also preserves
-            # title-only discovery when the title contains FTS punctuation.
-            logger.warning(
-                "SESSION_WINNERS query failed request_id=%s route=%s error=%s",
-                request_value,
-                route,
-                type(exc).__name__,
-            )
-            return {
-                "winners": [],
-                "stats": {
-                    "candidate_count": 0,
-                    "candidate_unique_sessions": 0,
-                    "lineage_count": 0,
-                    "winner_count": 0,
-                    "route": route,
-                },
-            }
+        state = _LineageResolutionState(_LINEAGE_WORK_BUDGET)
+        winners: List[Dict[str, Any]] = []
+        seen_roots: set[str] = set()
 
-        if rows:
-            stats = {
-                "candidate_count": int(rows[0].pop("candidate_count", 0)),
-                "candidate_unique_sessions": int(
-                    rows[0].pop("candidate_unique_sessions", 0)
-                ),
-            }
-        else:
-            stats = {"candidate_count": 0, "candidate_unique_sessions": 0}
-        winners = rows
-        stats.update({
-            "lineage_count": len({row["lineage_root_id"] for row in winners}),
-            "winner_count": len(winners),
-            "route": route,
-        })
+        with self._read_ctx() as conn:
+            started_tx = not conn.in_transaction
+            if started_tx:
+                conn.execute("BEGIN")
+            try:
+                try:
+                    execute_started = time.perf_counter()
+                    candidates = [
+                        dict(row) for row in conn.execute(sql, params).fetchall()
+                    ]
+                    execute_ms = int(
+                        (time.perf_counter() - execute_started) * 1000
+                    )
+                except sqlite3.OperationalError as exc:
+                    # Match search_messages() behavior: malformed FTS input is
+                    # a no-result search, not a tool-level failure.  This also
+                    # preserves title-only discovery when the title contains
+                    # FTS punctuation.
+                    logger.warning(
+                        "SESSION_WINNERS query failed request_id=%s route=%s error=%s",
+                        request_value,
+                        route,
+                        type(exc).__name__,
+                    )
+                    return {
+                        "winners": [],
+                        "stats": {
+                            "candidate_count": 0,
+                            "candidate_unique_sessions": 0,
+                            "lineage_count": 0,
+                            "winner_count": 0,
+                            "lineage_work": 0,
+                            "lineage_memo_hits": 0,
+                            "lineage_memo_entries": 0,
+                            "lineage_candidates_inspected": 0,
+                            "lineage_bound_hit": False,
+                            "route": route,
+                        },
+                    }
+
+                candidate_count = 0
+                candidate_unique_sessions = 0
+                if candidates:
+                    candidate_count = int(
+                        candidates[0].pop("candidate_count", 0)
+                    )
+                    candidate_unique_sessions = int(
+                        candidates[0].pop("candidate_unique_sessions", 0)
+                    )
+
+                # Exact-title exclusion arrives as pre-resolved roots in
+                # ``excluded_lineage_roots`` (the caller resolves them with the
+                # same compression-lineage implementation).  Full exclusion:
+                # the title already occupies its slot, so its lineage members
+                # must not duplicate it as content winners.
+                excluded_roots = {str(root) for root in excluded_lineage_roots}
+
+                current_root: Optional[str] = None
+                current_ancestors: set = set()
+                if current_session_id:
+                    # Re-resolve the raw current identity inside this winner
+                    # snapshot with the SAME memo/state so current-session
+                    # exclusion and candidate dedupe share one root meaning.
+                    outcome = self._resolve_compression_lineage_on_conn(
+                        conn, str(current_session_id), state
+                    )
+                    if outcome is _BUDGET_EXHAUSTED:
+                        state.bound_hit = True
+                    elif outcome is _UNRESOLVED:
+                        # Conservative: an unresolved current session excludes
+                        # only its own id rather than broadening exclusion to
+                        # an unproven ancestor.
+                        current_root = str(current_session_id)
+                    else:
+                        current_root = outcome
+                        current_ancestors = (
+                            self._current_lineage_ancestors_on_conn(
+                                conn, str(current_session_id), state
+                            )
+                        )
+                elif current_lineage_root:
+                    current_root = str(current_lineage_root)
+
+                def _is_archived(candidate: Dict[str, Any]) -> bool:
+                    """True when a hit's content left the live context."""
+                    return (
+                        candidate["session_end_reason"] == "compression"
+                        or int(candidate["message_compacted"] or 0) == 1
+                    )
+
+                # Resolve each owner exactly ONCE (lazily, on first encounter)
+                # while iterating the bounded raw hits in rank order.  Winner
+                # ordering therefore follows the rank of each owner's FIRST
+                # DISPLAYABLE anchor — a live current-lineage hit is skipped so
+                # a later compacted-history hit of the same owner can still
+                # surface, but it must not let that owner jump ahead of a
+                # higher-ranked displayable winner from another session (#68
+                # review round-3: ranking/winner ordering unchanged).
+                owner_resolved: set = set()
+                owner_root: Dict[str, Optional[str]] = {}
+                for candidate in candidates:
+                    if len(winners) >= result_limit:
+                        break
+                    owner = str(candidate["owning_session_id"])
+                    if owner not in owner_resolved:
+                        owner_resolved.add(owner)
+                        state.candidates_inspected += 1
+                        outcome = self._resolve_compression_lineage_on_conn(
+                            conn, owner, state
+                        )
+                        if outcome is _BUDGET_EXHAUSTED:
+                            state.bound_hit = True
+                            # Stop the entire ranked scan: the bound candidate
+                            # may have produced a higher-ranked new root than
+                            # every later candidate, so skipping it would
+                            # violate ranking.
+                            break
+                        owner_root[owner] = (
+                            outcome if outcome is not _UNRESOLVED else None
+                        )
+                    root = owner_root[owner]
+                    if root is None:
+                        continue
+                    if root in excluded_roots or root in seen_roots:
+                        continue
+                    in_current_context = (
+                        (current_root is not None and root == current_root)
+                        or owner in current_ancestors
+                    )
+                    if in_current_context and not _is_archived(candidate):
+                        # live content of the current lineage stays hidden; the
+                        # owner's displayable anchor is a later compacted hit,
+                        # so this hit does not (yet) produce a winner.
+                        continue
+                    # First displayable hit of this owner in rank order.
+                    seen_roots.add(root)
+                    state.accepted_roots = len(seen_roots)
+                    winners.append({
+                        "id": candidate["message_id"],
+                        "session_id": owner,
+                        "role": candidate["role"],
+                        "snippet": candidate["snippet"],
+                        "timestamp": candidate["timestamp"],
+                        "source": candidate["source"],
+                        "model": candidate["model"],
+                        "session_started": candidate["session_started"],
+                        "lineage_root_id": root,
+                        "candidate_order": candidate["candidate_order"],
+                        "source_priority": candidate["source_priority"],
+                    })
+
+                if route != "like" and winners:
+                    # FTS5 snippet() needs the MATCH expression on the same
+                    # table cursor.  Keep the exact tokenized query used for
+                    # candidate selection and apply it only after winners are
+                    # known so the candidate scan stays narrow.
+                    match_query = params[0]
+                    snippet_sql = (
+                        f"SELECT snippet({candidate_from}, 0, '>>>', '<<<', "
+                        f"'...', 40) AS snippet FROM {candidate_from} "
+                        f"WHERE rowid = ? AND {candidate_from} MATCH ?"
+                    )
+                    for winner in winners:
+                        snippet_row = conn.execute(
+                            snippet_sql, (winner["id"], match_query)
+                        ).fetchone()
+                        winner["snippet"] = (
+                            snippet_row["snippet"]
+                            if snippet_row is not None else None
+                        )
+
+                stats = {
+                    "candidate_count": candidate_count,
+                    "candidate_unique_sessions": candidate_unique_sessions,
+                    "lineage_count": len(seen_roots),
+                    "winner_count": len(winners),
+                    "lineage_work": state.work,
+                    "lineage_memo_hits": state.memo_hits,
+                    "lineage_memo_entries": len(state.memo),
+                    "lineage_candidates_inspected": state.candidates_inspected,
+                    "lineage_bound_hit": state.bound_hit,
+                    "route": route,
+                }
+            finally:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+
         logger.info(
             "SESSION_WINNERS request_id=%s route=%s candidate_count=%d "
             "candidate_unique_sessions=%d lineage_count=%d winner_count=%d "
-            "query_ms=%d",
+            "lineage_work=%d lineage_memo_hits=%d lineage_candidates_inspected=%d "
+            "lineage_bound_hit=%s query_ms=%d execute_ms=%d",
             request_value,
             route,
             stats["candidate_count"],
             stats["candidate_unique_sessions"],
             stats["lineage_count"],
             stats["winner_count"],
+            stats["lineage_work"],
+            stats["lineage_memo_hits"],
+            stats["lineage_candidates_inspected"],
+            stats["lineage_bound_hit"],
             int((time.perf_counter() - started) * 1000),
+            execute_ms,
         )
         return {"winners": winners, "stats": stats}
 

@@ -50,6 +50,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
     _FTS_CJK_TRIGGERS,
+    _FTS_SESSION_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
@@ -59,6 +60,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active_by_id,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
+    FTS_SESSION_CJK_STALE_KEY,
     FTS_SQL,
     FTS_SESSION_TRIGRAM_STALE_KEY,
     FTS_STORAGE_VERSION,
@@ -68,6 +70,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSIONS_FTS_CJK_TABLE_SQL,
+    SESSIONS_FTS_CJK_TRIGGER_SQL,
     SESSIONS_FTS_SQL,
     SESSIONS_FTS_TRIGRAM_SQL,
     _PREVIEW_CONTENT_SQL,
@@ -371,6 +375,12 @@ _SESSIONS_TRIGRAM_MODERN_TRIGGER_DDL = dict(
         _SESSIONS_TRIGRAM_MODERN_TRIGGER_NAMES,
         _SESSIONS_FTS_TRIGRAM_STATEMENTS[2:6],
     )
+)
+# The #26 sessions_fts_cjk DDL split into its five statements (external table
+# + three gated triggers, over the same canonical (title, id, display_name)
+# document), executed individually inside the CJK crash-atomic transition.
+_SESSIONS_FTS_CJK_STATEMENTS = _split_fts_sql_statements(
+    SESSIONS_FTS_CJK_TABLE_SQL + SESSIONS_FTS_CJK_TRIGGER_SQL
 )
 
 
@@ -2224,6 +2234,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Explicitly initialized so candidate/repair/optimize serving gates
         # (round-10 finding 4) can trust the flag before any ensure runs.
         self._sessions_trigram_available = False
+        # Session CJK metadata (issue #26): _sessions_cjk_worker_operable is
+        # whether THIS process can build/maintain the sessions_fts_cjk index
+        # (tokenizer loaded on this connection); _sessions_cjk_available is
+        # search-serving availability (index complete, non-stale, queryable).
+        # They are deliberately separate: a pending backfill is W=1/S=0 and
+        # the rebuild worker must still advance there.
+        self._sessions_cjk_worker_operable = False
+        self._sessions_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
         # Async token accounting (see queue_token_counts). The condition
@@ -2276,6 +2294,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                             is True
                         )
+                    # Session CJK metadata (issue #26): load the cjk_unicode61
+                    # tokenizer on THIS connection FIRST — custom FTS5
+                    # tokenizers are connection-local, and a vtable using one
+                    # cannot be instantiated before the tokenizer is
+                    # registered on that connection. Then check existence via
+                    # sqlite_master (no vtable instantiation) and the durable
+                    # pending/stale state. A failed connection-local load
+                    # degrades to fallback, never a crash or a false "CJK
+                    # available" claim.
+                    self._sessions_cjk_worker_operable = (
+                        load_fts5_cjk_extension(self._conn)
+                    )
+                    self._sessions_cjk_available = False
+                    if self._sessions_cjk_worker_operable and cursor.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'sessions_fts_cjk'"
+                    ).fetchone() is not None:
+                        pending = cursor.execute(
+                            "SELECT 1 FROM state_meta WHERE key IN "
+                            "('fts_session_cjk_rebuild_high_water', "
+                            f"'{FTS_SESSION_CJK_STALE_KEY}') LIMIT 1"
+                        ).fetchone()
+                        self._sessions_cjk_available = pending is None
                 except BaseException:
                     conn, self._conn = self._conn, None
                     try:
@@ -2567,23 +2608,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return "tool_name" not in sql
 
     @staticmethod
-    def _db_has_internal_content_sessions_fts(cursor: sqlite3.Cursor) -> bool:
-        """True when sessions_fts is the pre-#25 internal-content shape.
+    def _db_has_internal_content_fts(
+        cursor: sqlite3.Cursor, table: str
+    ) -> bool:
+        """True when the given sessions FTS table is an internal-content shape.
 
-        #25's sessions_fts is external-content over raw (title, id,
-        display_name). The pre-#25 shape stores its own copy (title-only).
-        Detected by the absence of ``content=`` in the stored CREATE.
-        Returns False when sessions_fts doesn't exist yet (fresh DB mid-init):
-        the ensure path creates the external shape directly.
+        The #25/#26 external-content shape declares ``content=`` over the
+        canonical ``sessions`` table; any internal-content shape stores its
+        own copy (title-only, pre-#25/#26). Detected by the absence of
+        ``content=`` in the stored CREATE. Returns False when the table
+        doesn't exist yet (fresh DB mid-init): the ensure path creates the
+        external shape directly.
         """
         row = cursor.execute(
             "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'sessions_fts'"
+            "WHERE type = 'table' AND name = ?",
+            (table,),
         ).fetchone()
         if row is None:
             return False
         sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
         return "content=" not in sql
+
+    @staticmethod
+    def _db_has_internal_content_sessions_fts(cursor: sqlite3.Cursor) -> bool:
+        """True when sessions_fts is the pre-#25 internal-content shape."""
+        return SessionDB._db_has_internal_content_fts(cursor, "sessions_fts")
+
+    @staticmethod
+    def _db_has_internal_content_sessions_fts_cjk(
+        cursor: sqlite3.Cursor,
+    ) -> bool:
+        """True when sessions_fts_cjk is the pre-#26 internal title-only shape."""
+        return SessionDB._db_has_internal_content_fts(cursor, "sessions_fts_cjk")
 
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
@@ -2613,42 +2670,257 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             exc,
         )
 
-    @staticmethod
-    def _backfill_sessions_fts_cjk(cursor) -> None:
-        """Backfill existing session titles into the legacy CJK table.
+    def _ensure_sessions_fts_cjk_schema(self, cursor) -> None:
+        """Create / repair / self-heal the session CJK metadata index (#26).
 
-        ``cursor`` may be a Cursor or a Connection (both expose ``execute``).
-        The Unicode sessions_fts is no longer backfilled here (issue #25): it
-        is external-content and rebuilt by the resumable H/P chunk engine
-        (``fts_session_rebuild_step``), with search supplementing the bounded
-        gap meanwhile. The cjk table stays internal-content and one-shot
-        backfilled (the CJK lifecycle is owned by #26); it runs in
-        progressive batches with a short breather so the gateway writer is
-        not starved.
+        ``cursor`` may be a Cursor or a Connection (both expose execute /
+        executescript). Called unconditionally from schema init on every
+        writable open — a tokenizer-less host must still be able to degrade
+        the session-CJK surface safely. Sets ``self._sessions_cjk_worker_operable``
+        (can this process build/maintain the CJK index) and
+        ``self._sessions_cjk_available`` (is the completed index search-
+        serving) — two separate facts: a pending backfill is worker-operable
+        while search-unavailable, and the worker must still advance there.
+        Never raises; every failure mode degrades to "no CJK session index"
+        (Unicode session search keeps working).
+
+        Cases:
+          tokenizer NOT loaded, table present with live triggers → drop the
+              session-CJK triggers so canonical session writes don't fail
+              inside them, and persist the durable stale breadcrumb (which
+              the Unicode surface ignores). Pending H/P is NEVER cleared
+              merely because this host cannot operate it.
+          tokenizer loaded, legacy internal table present → replace it with
+              the external shape, seeding CJK-session H/P for populated
+              canonical rows (an empty external index is never served as
+              complete).
+          tokenizer loaded, fresh table → create external table + gated
+              triggers. Empty DB: complete by construction. Populated DB:
+              seed CJK-session H/P so the resumable chunk engine backfills.
+          tokenizer loaded, table present with stale breadcrumb → do NOT
+              reinstall triggers (the post-stale gap is of unknown extent;
+              external-content deletes against never-indexed rowids are
+              unsafe). A later ``optimize-storage`` on a capable host resets
+              and rebuilds from a fresh high-water.
         """
-        conn = getattr(cursor, "connection", cursor)
-        cursor.execute(
-            "SELECT _rowid_ FROM sessions WHERE title IS NOT NULL "
-            "AND _rowid_ NOT IN (SELECT rowid FROM sessions_fts_cjk)"
-        )
-        missing = [row[0] for row in cursor.fetchall()]
-        if missing:
-            batch_sizes = [500, 200, 100, 50]
-            remaining = list(missing)
-            while remaining:
-                bs = batch_sizes.pop(0) if batch_sizes else 50
-                batch = remaining[:bs]
-                remaining = remaining[bs:]
-                placeholders = ",".join("?" for _ in batch)
-                cursor.execute(
-                    f"INSERT OR IGNORE INTO sessions_fts_cjk(rowid, title) "
-                    f"SELECT _rowid_, COALESCE(title, '') FROM sessions "
-                    f"WHERE _rowid_ IN ({placeholders})",
-                    batch,
+        cjk_present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'sessions_fts_cjk'"
+        ).fetchone())
+
+        if not self._fts_cjk_loaded:
+            self._sessions_cjk_worker_operable = False
+            if cjk_present:
+                live = [
+                    r[0] for r in cursor.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                        f"AND name IN ({','.join('?' for _ in _FTS_SESSION_CJK_TRIGGERS)})",
+                        _FTS_SESSION_CJK_TRIGGERS,
+                    ).fetchall()
+                ]
+                if live:
+                    # Self-heal: this process cannot tokenize, so every
+                    # session write would die inside the session-CJK trigger.
+                    # Breadcrumb FIRST (a crash between the two statements is
+                    # merely conservative), then drop. Missing local capability
+                    # is NEVER evidence that durable CJK work is complete —
+                    # pending H/P is left untouched.
+                    logger.warning(
+                        "sessions_fts_cjk triggers present but the "
+                        "cjk_unicode61 tokenizer is unavailable (%s) — "
+                        "dropping the session-CJK triggers so session writes "
+                        "keep working. CJK session search falls back to the "
+                        "Unicode/LIKE lane; run `hermes sessions "
+                        "optimize-storage` on a host with the extension to "
+                        "rebuild.",
+                        fts5_cjk_so_path(),
+                    )
+                    cursor.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                        (FTS_SESSION_CJK_STALE_KEY,),
+                    )
+                    for trig in live:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            self._sessions_cjk_available = False
+            return
+
+        # Capable host — ``_sessions_cjk_worker_operable`` is derived AFTER the
+        # schema is actually ensured below, so a soft-failed transition never
+        # leaves a worker flag that cannot really operate the target (that
+        # would make ``optimize_fts_storage``'s phase-1d loop retry forever).
+
+        # Detect / replace the pre-#26 internal title-only shape on a capable
+        # host. Staged in a write transaction: seed the durable CJK-session
+        # H/P claim (an empty external index is never served as complete),
+        # then tear down the old internal table + its triggers. The external
+        # schema ensure runs after (it uses executescript, which issues an
+        # implicit COMMIT).
+        if self._db_has_internal_content_sessions_fts_cjk(cursor):
+            def _stage(conn):
+                hw = int(conn.execute(
+                    "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+                ).fetchone()[0])
+                if hw > 0:
+                    for k, v in (
+                        ("fts_session_cjk_rebuild_high_water", str(hw)),
+                        ("fts_session_cjk_rebuild_progress", "0"),
+                    ):
+                        conn.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (k, v),
+                        )
+                else:
+                    # Zero sessions: complete by construction; clear any
+                    # stale markers left by an earlier interrupted open.
+                    conn.execute(
+                        "DELETE FROM state_meta WHERE key IN "
+                        "('fts_session_cjk_rebuild_high_water', "
+                        "'fts_session_cjk_rebuild_progress')"
+                    )
+                for trig in _FTS_SESSION_CJK_TRIGGERS:
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                for tbl in (
+                    "sessions_fts_cjk", "sessions_fts_cjk_data",
+                    "sessions_fts_cjk_idx", "sessions_fts_cjk_content",
+                    "sessions_fts_cjk_docsize", "sessions_fts_cjk_config",
+                ):
+                    conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+            self._execute_write(_stage)
+            logger.warning(
+                "Replacing legacy internal sessions_fts_cjk with the "
+                "external-content CJK metadata index (issue #26); historical "
+                "backfill staged with a durable high-water claim"
+            )
+
+        # Track whether the external table is being created NOW (fresh) vs
+        # already present (reopen). A fresh external table over a populated
+        # DB needs a durable CJK-session H/P claim; an existing table's rows
+        # were either live-indexed by the triggers or are already covered by
+        # durable markers — seeding again would duplicate documents on the
+        # next backfill.
+        existing = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sessions_fts_cjk'"
+        ).fetchone())
+
+        # Fresh-create path: stage the durable claim BEFORE the empty external
+        # table can exist (the #76832 invariant analog). A crash between the
+        # claim commit and the schema ensure leaves markers without a table;
+        # reopen re-ensures the schema and finds the claim already durable.
+        if not existing and self.get_meta(
+            "fts_session_cjk_rebuild_high_water"
+        ) is None:
+            self._seed_session_cjk_fts_rebuild_markers(cursor)
+
+        if not existing:
+            ok = self._fts_session_cjk_schema_transition(cursor)
+        else:
+            try:
+                cursor.executescript(SESSIONS_FTS_CJK_TABLE_SQL)
+                ok = True
+            except sqlite3.OperationalError:
+                logger.warning(
+                    "sessions_fts_cjk ensure failed; CJK session search "
+                    "stays on the Unicode/LIKE lane", exc_info=True,
                 )
-                conn.commit()
-                if remaining:
-                    time.sleep(0.05)  # 50ms breather for gateway writer
+                ok = False
+
+        if not ok:
+            self._sessions_cjk_worker_operable = False
+            self._sessions_cjk_available = False
+            return
+
+        # Stale breadcrumb: a tokenizer-less process dropped the triggers at
+        # an unknown point — the index has a gap of unknown extent. Do NOT
+        # reinstall triggers (an external-content 'delete' for an unindexed
+        # rowid corrupts the index), and the plain chunk worker must NOT
+        # operate a stale index either (its gap extends beyond any (P, H]).
+        # The next `optimize-storage` run on a capable host resets and
+        # rebuilds from scratch; the recreate re-derives worker operability.
+        stale = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?",
+            (FTS_SESSION_CJK_STALE_KEY,),
+        ).fetchone()
+        if stale:
+            self._sessions_cjk_worker_operable = False
+            self._sessions_cjk_available = False
+            return
+
+        try:
+            cursor.executescript(SESSIONS_FTS_CJK_TRIGGER_SQL)
+        except sqlite3.OperationalError:
+            logger.warning(
+                "sessions_fts_cjk trigger ensure failed; CJK session search "
+                "stays on the Unicode/LIKE lane", exc_info=True,
+            )
+            self._sessions_cjk_worker_operable = False
+            self._sessions_cjk_available = False
+            return
+
+        # Schema + triggers are in place — this worker can genuinely operate
+        # the target now.
+        self._sessions_cjk_worker_operable = True
+        backfill_pending = cursor.execute(
+            "SELECT 1 FROM state_meta "
+            "WHERE key = 'fts_session_cjk_rebuild_high_water' LIMIT 1"
+        ).fetchone()
+        self._sessions_cjk_available = not backfill_pending
+
+    def _fts_session_cjk_schema_transition(self, cursor) -> bool:
+        """Crash-atomic install of the #26 external sessions_fts_cjk schema AND
+        the trigger-owned-region catch-up, in one ``BEGIN IMMEDIATE``.
+
+        Mirrors ``_fts_session_schema_transition`` (#25) for the CJK surface:
+        the DDL (external table + the three CJK-session gated triggers) and
+        the catch-up INSERT land in ONE write transaction. The catch-up
+        indexes any row committed by another connection in the trigger-free
+        window after the H/P claim was staged but before the triggers existed
+        — rows ``> H`` (live-owned) or ``<= P`` (already backfilled) that the
+        index is missing. This is what makes the external-content DELETE
+        trigger safe: a row can never be deleted later for a rowid the index
+        never held. DDL runs via individual ``execute`` (not executescript,
+        whose implicit COMMIT would break the transaction).
+        """
+        def _do(conn):
+            for stmt in _SESSIONS_FTS_CJK_STATEMENTS:
+                conn.execute(stmt)
+            conn.execute(
+                "INSERT INTO sessions_fts_cjk(rowid, title, id, display_name) "
+                "SELECT s.row_id, s.title, s.id, s.display_name "
+                "FROM sessions s "
+                "WHERE (s.row_id > COALESCE("
+                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                "     WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)"
+                "   OR s.row_id <= COALESCE("
+                "    (SELECT CAST(value AS INTEGER) FROM state_meta "
+                "     WHERE key = 'fts_session_cjk_rebuild_progress'), -1))"
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM sessions_fts_cjk_docsize d WHERE d.id = s.row_id"
+                "  )"
+            )
+        # Schema-init bookkeeping must not advance the routine-write merge
+        # cadence (the write-path cadence test asserts exact boundaries).
+        before = self._write_count
+        try:
+            self._execute_write(_do)
+        except sqlite3.OperationalError as exc:
+            if "no such module" in str(exc).lower() and "fts5" in str(exc).lower():
+                self._warn_fts5_unavailable(exc)
+                return False
+            # Any other failure (most commonly "no such tokenizer:
+            # cjk_unicode61" when the extension loaded but registration
+            # failed) degrades ONLY the optional CJK surface — never disable
+            # the whole FTS path for an optional tokenizer.
+            logger.warning(
+                "sessions_fts_cjk transition failed; CJK session search stays "
+                "on the Unicode/LIKE lane", exc_info=True,
+            )
+            return False
+        finally:
+            self._write_count = before
+        return True
 
     def _ensure_sessions_fts_schema(self, cursor: sqlite3.Cursor) -> bool:
         """Migrate / self-heal the session Unicode metadata FTS surface (#25).
@@ -6823,6 +7095,111 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             by_row_id.values(), key=lambda c: c["started_at"], reverse=True
         )
 
+    def _fts_cjk_metadata_candidates(
+        self, raw_query: str
+    ) -> Tuple[bool, Optional[List[Dict[str, Any]]]]:
+        """CJK session-metadata candidates over raw (title, id, display_name).
+
+        Optional CJK specialization of ``_fts_metadata_candidates`` (#26) over
+        the external-content ``sessions_fts_cjk``. Executes through
+        ``_read_ctx()`` — never the writer lock (the accepted read-path split).
+        Returns ``(servable, candidates)``:
+
+        - ``(False, None)`` — the CJK lane must NOT serve: the query is a lone
+          single CJK character (the bigram index's useful lower bound is two
+          CJK chars), the query cannot be sanitized, the index is pending or
+          stale, or the tokenizer is unavailable on this connection. Callers
+          route to the canonical Unicode/LIKE lane — a partial CJK index is
+          never served.
+        - ``(True, [])`` — servable, valid zero matches.
+        - ``(True, [...]``) — servable matches (``id`` / ``title`` /
+          ``display_name`` / ``started_at`` / ``row_id``, ``started_at DESC``).
+
+        The servable-vs-zero distinction is what lets #14 route ordinary CJK
+        picker queries without owning lifecycle state.
+
+        The durable guard checks and the MATCH run inside ONE explicit read
+        transaction, so ``(servable=True, ...)`` always reflects a single
+        consistent SQLite snapshot — never a torn read of a partially-mutated
+        index that a concurrent writer landed between a standalone guard
+        statement and the MATCH.
+        """
+        # A lone single CJK character cannot match inside longer runs in the
+        # bigram index — classify as fallback-only before touching the index.
+        if self._has_lone_cjk_run(raw_query):
+            return False, None
+        sanitized = self._sanitize_fts5_query(raw_query)
+        if not sanitized:
+            return False, None
+        if not getattr(self, "_sessions_cjk_available", False):
+            # Process-local hint: this process knows the index is not servable.
+            return False, None
+        with self._read_ctx() as conn:
+            # ONE SQLite snapshot for the durable guard reads AND the MATCH.
+            # ``_read_ctx()`` connections are autocommit (isolation_level
+            # = None), so each SELECT would otherwise open a FRESH read
+            # transaction — a concurrent writer could land stale/drop/mutate
+            # between the guard and the MATCH, and the lane would serve a
+            # partial index. An explicit deferred read transaction fixes the
+            # guard+MATCH to a single snapshot: under WAL it is snapshot-only
+            # (never blocks the writer) and costs nothing on the hot path.
+            began = False
+            if not conn.in_transaction:
+                try:
+                    conn.execute("BEGIN")
+                    began = True
+                except sqlite3.OperationalError:
+                    # Already inside a transaction (or cannot begin here):
+                    # the reads still share whatever snapshot already exists.
+                    began = False
+            try:
+                if self._cjk_lane_durable_guarded(conn):
+                    return False, None
+                try:
+                    cursor = conn.execute(
+                        "SELECT s.id AS id, s.title, s.display_name, "
+                        "       s.started_at, s.row_id AS row_id "
+                        "FROM sessions_fts_cjk f "
+                        "JOIN sessions s ON s.row_id = f.rowid "
+                        "WHERE sessions_fts_cjk MATCH ? "
+                        "ORDER BY s.started_at DESC",
+                        (sanitized,),
+                    )
+                    candidates = [dict(row) for row in cursor]
+                except sqlite3.OperationalError:
+                    # CJK lane unavailable/corrupt on this connection (e.g.
+                    # the tokenizer did not load on this read connection):
+                    # signal fallback, never trust a partial result.
+                    logging.debug(
+                        "sessions_fts_cjk MATCH failed for %r, falling back",
+                        raw_query, exc_info=True,
+                    )
+                    return False, None
+            finally:
+                if began:
+                    conn.execute("COMMIT")
+        return True, candidates
+
+    def _cjk_lane_durable_guarded(self, conn) -> bool:
+        """True when a durable CJK guard is present on ``conn``'s snapshot.
+
+        Either the stale breadcrumb (a tokenizer-less sibling dropped the CJK
+        triggers over an index gap of unknown extent) or a pending high-water
+        claim (a rebuild in flight) makes the CJK lane unservable — a partial
+        index is never served. Must be evaluated on the SAME connection /
+        snapshot that runs the MATCH (see ``_fts_cjk_metadata_candidates``).
+        """
+        return (
+            conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (FTS_SESSION_CJK_STALE_KEY,),
+            ).fetchone() is not None
+            or conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                ("fts_session_cjk_rebuild_high_water",),
+            ).fetchone() is not None
+        )
+
     def _fts_numbered_variants(
         self, title: str
     ) -> Optional[List[Dict[str, Any]]]:
@@ -6833,15 +7210,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         id / display_name and supplements the bounded ``(P, H]`` rebuild gap —
         title resolution therefore never returns incomplete results
         mid-backfill and the gap logic lives in exactly one place. CJK titles
-        keep their dedicated ``sessions_fts_cjk`` lane + gap supplement (the
-        CJK lifecycle is owned by #26).
+        delegate to the dedicated ``sessions_fts_cjk`` lane
+        (``_fts_cjk_metadata_candidates``), which owns the pending / stale /
+        unavailable / lone-char fallback decision; it never serves a partial
+        CJK index.
 
         Returns None to signal fallback to LIKE (e.g. FTS5 runtime error or
-        the target table unavailable). Returns empty list when no matches.
+        the target table unavailable / pending / stale). Returns empty list
+        when no matches.
         """
         is_cjk = self._contains_cjk(title)
-        if is_cjk and not getattr(self, "_sessions_cjk_available", False):
-            return None
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
         # An unsanitizable query must signal "use the LIKE fallback" (None),
@@ -6850,55 +7228,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
 
         if is_cjk:
-            fts_table = "sessions_fts_cjk"
-            sanitized = self._sanitize_fts5_query(title)
-            if not sanitized:
-                return None
-            with self._lock:
-                try:
-                    cursor = self._conn.execute(
-                        f"SELECT s.id AS id, s.title, s.started_at "
-                        f"FROM {fts_table} f "
-                        f"JOIN sessions s ON s.row_id = f.rowid "
-                        f"WHERE {fts_table} MATCH ? "
-                        f"ORDER BY s.started_at DESC",
-                        (sanitized,),
-                    )
-                    candidates = list(cursor)
-                except sqlite3.OperationalError:
-                    logging.debug(
-                        "%s MATCH failed for %r, falling back to LIKE",
-                        fts_table, sanitized, exc_info=True,
-                    )
-                    return None
-            filtered = [
+            servable, candidates = self._fts_cjk_metadata_candidates(title)
+            if not servable:
+                return None  # canonical LIKE fallback
+            return [
                 c for c in candidates
                 if c["title"] and c["title"].startswith(f"{escaped} #")
             ]
-            # Bounded-gap supplement (same rule as the Unicode lane, kept local
-            # for the CJK table which #26 will take over).
-            gap = self._session_fts_rebuild_gap()
-            if gap is not None:
-                progress, high_water = gap
-                with self._read_ctx() as conn:
-                    gap_rows = conn.execute(
-                        "SELECT id, title, started_at FROM sessions "
-                        "WHERE title LIKE ? ESCAPE '\\' "
-                        "AND row_id > ? AND row_id <= ? "
-                        "ORDER BY started_at DESC",
-                        (f"{escaped} #%", progress, high_water),
-                    ).fetchall()
-                gap_filtered = [
-                    c for c in gap_rows
-                    if c["title"] and c["title"].startswith(f"{escaped} #")
-                ]
-                by_id = {c["id"]: c for c in filtered}
-                for c in gap_filtered:
-                    by_id.setdefault(c["id"], c)
-                filtered = sorted(
-                    by_id.values(), key=lambda c: c["started_at"], reverse=True
-                )
-            return filtered
 
         # Non-CJK: the shared raw Unicode lane already merges the FTS
         # candidates with the bounded (P, H] gap, dedupes by row_id, and sorts

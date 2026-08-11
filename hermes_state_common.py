@@ -855,29 +855,81 @@ END;
 """
 
 
-# CJK title search — cjk_unicode61 loadable tokenizer, mirroring
-# messages_fts_cjk. Requires libfts5_cjk.so (native/fts5_cjk/build.sh);
-# callers gate table creation on the extension being loaded and fall back
-# to LIKE when it is absent.
-SESSIONS_FTS_CJK_SQL = """
+# ── Sessions CJK metadata FTS (issue #26) ──────────────────────────────
+# Optional CJK specialization of the #25 Unicode session architecture: the
+# SAME external-content raw ``(title, id, display_name)`` document keyed by
+# the SAME named ``sessions.row_id``, but tokenized with the loadable
+# cjk_unicode61 bigram tokenizer. It has its own durable H/P marker pair
+# (``fts_session_cjk_rebuild_high_water`` / ``fts_session_cjk_rebuild_progress``)
+# and its own stale key (``fts_session_cjk_stale``) so optional tokenizer
+# availability can never gate or corrupt the complete Unicode index. Split
+# table/trigger DDL so a stale optional index can exist while unsafe triggers
+# remain absent. The trigger predicates mirror #25 with the CJK-session
+# marker names, and the UPDATE trigger fires only on title/id/display_name
+# changes (AFTER UPDATE OF plus a value-change guard).
+SESSIONS_FTS_CJK_TABLE_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_cjk USING fts5(
     title,
+    id,
+    display_name,
+    content='sessions',
+    content_rowid='row_id',
     tokenize='cjk_unicode61'
 );
+"""
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_insert AFTER INSERT ON sessions BEGIN
-    INSERT INTO sessions_fts_cjk(rowid, title) VALUES (new.rowid, new.title);
+SESSIONS_FTS_CJK_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
 END;
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_delete AFTER DELETE ON sessions BEGIN
-    DELETE FROM sessions_fts_cjk WHERE rowid = old.rowid;
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(sessions_fts_cjk, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
 END;
 
-CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_update AFTER UPDATE ON sessions BEGIN
-    DELETE FROM sessions_fts_cjk WHERE rowid = old.rowid;
-    INSERT INTO sessions_fts_cjk(rowid, title) VALUES (new.rowid, new.title);
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_update
+AFTER UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(sessions_fts_cjk, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+    INSERT INTO sessions_fts_cjk(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
 END;
 """
+
+
+_FTS_SESSION_CJK_TRIGGERS = (
+    "sessions_fts_cjk_insert",
+    "sessions_fts_cjk_delete",
+    "sessions_fts_cjk_update",
+)
+
+
+# state_meta breadcrumb set when a tokenizer-less process had to drop the
+# session-CJK triggers to keep canonical session writes alive: rows written
+# from that moment on are missing from the CJK index, so it must not serve
+# reads until a capable host resets and rebuilds. Distinct from the message
+# ``FTS_CJK_STALE_KEY`` and from the Unicode-session markers.
+FTS_SESSION_CJK_STALE_KEY = "fts_session_cjk_stale"
 
 LEGACY_FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
