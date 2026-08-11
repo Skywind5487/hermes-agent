@@ -1532,6 +1532,72 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
+def _owned_fts_object_names(conn: sqlite3.Connection) -> List[str]:
+    """Every ``sqlite_master`` object name Hermes owns for the six modern FTS
+    indexes (issue #27): the virtual tables, their FTS5 shadow tables, their
+    owned triggers, and owned derived source VIEWs.
+
+    Used by destructive derived-index repair (strategy 2). Ownership is
+    registry-driven for five members; for ``sessions_fts_trigram`` the #30
+    same-name rule applies — the trigram namespace is removed ONLY when the
+    stored root declaration positively matches the canonical modern trigram
+    shape, otherwise it is left untouched (fail closed). ``conn`` must be
+    open and readable.
+    """
+    names: List[str] = []
+    for desc in FTS_INDEXES:
+        names.append(desc.table)
+        names.extend(
+            f"{desc.table}_{shadow}"
+            for shadow in ("data", "idx", "content", "docsize", "config")
+        )
+        names.extend(desc.trigger_names)
+        names.extend(obj_name for _obj_type, obj_name in desc.derived_objects)
+    # #30 fail-closed: an unknown same-name trigram object is NOT owned — it
+    # must never be removed by the destructive path (or its source VIEW).
+    trigram = _fts_descriptor("sessions_fts_trigram")
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = ?",
+        (trigram.table,),
+    ).fetchone()
+    owned_trigram = (
+        row is not None
+        and SessionDB._sessions_trigram_modern_definition_matches(
+            row[0] if not isinstance(row, sqlite3.Row) else row["sql"]
+        )
+    )
+    if not owned_trigram:
+        names = [n for n in names if not n.startswith("sessions_fts_trigram")]
+    return names
+
+
+def _drop_owned_fts_derived_schema(conn: sqlite3.Connection) -> None:
+    """Destructive derived-index repair for the six modern FTS indexes.
+
+    Removes every owned derived FTS object (virtual tables, FTS5 shadow
+    tables, owned triggers, and owned source VIEWs) for ALL six members while
+    leaving canonical ``sessions`` / ``messages`` untouched. Reopen recreates
+    the supported derived schema. An unknown #30 same-name
+    ``sessions_fts_trigram`` object is positively classified and left
+    untouched (``_owned_fts_object_names``). Intended as the last-resort
+    escalation after least-destructive repair failed; normal startup /
+    quarantine remains stricter than this explicit command.
+    """
+    names = _owned_fts_object_names(conn)
+    placeholders = ", ".join("?" for _ in names)
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute(
+        "DELETE FROM sqlite_master "
+        "WHERE type IN ('table', 'view', 'trigger', 'index') "
+        f"AND name IN ({placeholders})",
+        names,
+    )
+    conn.execute("PRAGMA writable_schema=OFF")
+    conn.commit()
+    conn.execute("VACUUM")
+
+
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
@@ -1539,19 +1605,25 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     Handles two corruption classes: the "duplicate object definition" /
     malformed-schema class where even ``PRAGMA`` statements fail, and the FTS
     write-corruption class (#50502) where base tables read fine and
-    ``integrity_check`` passes but writes fail through the ``messages_fts*``
+    ``integrity_check`` passes but writes fail through the ``*_fts*``
     triggers. Tries least-destructive recovery first and escalates:
 
       1. **Rebuild FTS indexes in place** via the FTS5 ``'rebuild'`` command,
          which rewrites the internal b-tree segments from the canonical
-         ``messages`` rows without dropping or recreating anything. Fixes the
-         FTS write-corruption class while preserving the schema intact.
+         content rows without dropping or recreating anything. Iterates the
+         authoritative six-index registry (issue #27), so corrupt session
+         Unicode/CJK/trigram metadata indexes are repaired alongside the
+         message indexes. Fixes the FTS write-corruption class while
+         preserving the schema intact.
       2. **De-duplicate** ``sqlite_master`` (keep the lowest rowid per
          ``type``/``name``). Fixes the canonical "table X already exists"
          case and PRESERVES the existing FTS index intact.
-      3. **Drop the FTS schema** (every ``messages_fts*`` object) + ``VACUUM``.
-         The next ``SessionDB()`` open rebuilds the FTS indexes from the
-         canonical ``messages`` table.
+      3. **Drop the owned FTS schema** (every owned modern FTS table, shadow
+         table, trigger, and source VIEW across all six indexes — never
+         canonical ``sessions``/``messages``) + ``VACUUM``. The next
+         ``SessionDB()`` open rebuilds the FTS indexes from canonical data.
+         An unknown #30 same-name ``sessions_fts_trigram`` object is
+         positively classified and left untouched (fail closed).
 
     Canonical ``sessions`` / ``messages`` rows are never modified. A
     timestamped raw backup is taken first unless ``backup=False``.
@@ -1584,22 +1656,26 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     # The FTS5 'rebuild' command rewrites the internal index from the canonical
     # content table. This is the recommended, least-destructive recovery for a
     # corrupt FTS index that rejects message writes while reads still succeed.
+    # Iterates the authoritative six-index registry (issue #27), so corrupt
+    # session Unicode/CJK/trigram indexes are repaired by the same path;
+    # 'rebuild' reads through each table's declared content source (the
+    # session trigram rebuilds through its derived compact VIEW — no compact
+    # SQL duplicated here). Optional tokenizer-gated indexes skip when their
+    # tokenizer is unavailable — capability degradation, not corruption.
     try:
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
-            # The cjk index can only be rebuilt with its tokenizer loaded;
-            # best-effort (a tokenizer-less host skips it at the probe below).
+            # The cjk indexes can only be rebuilt with their tokenizer loaded;
+            # best-effort (a tokenizer-less host skips them at the probe below).
             load_fts5_cjk_extension(conn)
-            for table_name in (
-                "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
-            ):
+            for desc in FTS_INDEXES:
                 try:
                     conn.execute(
-                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
+                        f"INSERT INTO {desc.table}({desc.table}) VALUES('rebuild')"
                     )
                 except sqlite3.OperationalError:
-                    # Table absent (FTS disabled / trigram off / cjk not
-                    # present or tokenizer unavailable) — skip it.
+                    # Table absent (FTS disabled / tokenizer unavailable /
+                    # not yet created) — skip it.
                     continue
         finally:
             conn.close()
@@ -1667,15 +1743,17 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     except sqlite3.DatabaseError as exc:
         logger.warning("state.db dedup repair pass failed: %s", exc)
 
-    # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
+    # ── Strategy 2: drop owned FTS schema, VACUUM, rebuild on next open ──
+    # Removes the owned derived FTS objects for ALL six modern indexes —
+    # virtual tables, shadow tables, owned triggers, and owned source VIEWs —
+    # while canonical sessions/messages rows are untouched. Reopen recreates
+    # the supported derived schema. An unknown #30 same-name
+    # sessions_fts_trigram object is positively classified and left untouched
+    # (fail closed), per _owned_fts_object_names.
     try:
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
-            conn.execute("PRAGMA writable_schema=ON")
-            conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
-            conn.execute("PRAGMA writable_schema=OFF")
-            conn.commit()
-            conn.execute("VACUUM")
+            _drop_owned_fts_derived_schema(conn)
         finally:
             conn.close()
         reason = _db_opens_cleanly(db_path)
@@ -1683,8 +1761,9 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
             logger.warning(
-                "state.db schema repaired by dropping FTS schema; indexes "
-                "will rebuild from messages on next open: %s", db_path
+                "state.db schema repaired by dropping owned FTS schema; "
+                "indexes will rebuild from canonical data on next open: %s",
+                db_path,
             )
             return report
         report["error"] = reason

@@ -498,3 +498,148 @@ def test_migrate_leaves_trigram_update_triggers_under_30_identity(db):
         assert "UPDATE OF title, id, display_name" in sql
     # Migration is a no-op on an already-converged DB.
     assert db._migrate_broad_fts_update_triggers(db._conn) == 0
+
+
+# ── Offline / destructive repair covers the session indexes (issue #27) ───
+
+def test_offline_repair_rebuilds_corrupt_session_unicode_index(tmp_path):
+    from hermes_state import _db_opens_cleanly, repair_state_db_schema
+
+    db_path = _build_db_with_session(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE sessions_fts_data SET block = X'BADC0FFEE0DDF00D'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert _db_opens_cleanly(db_path) is not None
+    report = repair_state_db_schema(db_path, backup=False)
+    assert report["repaired"] is True
+    assert report["strategy"] == "rebuild_fts"
+    assert _db_opens_cleanly(db_path) is None
+    # Canonical rows unchanged.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        titles = [
+            r[0]
+            for r in conn.execute(
+                "SELECT title FROM sessions WHERE id = 's1'"
+            )
+        ]
+    finally:
+        conn.close()
+    assert titles == ["pizzaparty"]
+    # Session search works again through the rebuilt index.
+    reopened = SessionDB(db_path=db_path)
+    try:
+        assert reopened.resolve_session_by_title("pizzaparty") == "s1"
+    finally:
+        reopened.close()
+
+
+def test_offline_repair_rebuilds_corrupt_session_trigram_index(tmp_path):
+    from hermes_state import _db_opens_cleanly, repair_state_db_schema
+
+    db_path = _build_db_with_session(tmp_path, title="pizza pie party")
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE sessions_fts_trigram_data SET block = X'BADC0FFEE0DDF00D'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert _db_opens_cleanly(db_path) is not None
+    report = repair_state_db_schema(db_path, backup=False)
+    assert report["repaired"] is True
+    assert report["strategy"] == "rebuild_fts"
+    assert _db_opens_cleanly(db_path) is None
+
+
+def test_owned_fts_object_names_covers_six_indexes(db):
+    from hermes_state import _owned_fts_object_names
+
+    names = _owned_fts_object_names(db._conn)
+    for desc in FTS_INDEXES:
+        assert desc.table in names
+        for shadow in ("data", "idx", "content", "docsize", "config"):
+            assert f"{desc.table}_{shadow}" in names
+        for trig in desc.trigger_names:
+            assert trig in names
+        for _obj_type, obj_name in desc.derived_objects:
+            assert obj_name in names
+    assert len(names) == len(set(names))  # no duplicates
+
+
+def test_owned_fts_object_names_fail_closed_for_foreign_trigram(db, monkeypatch):
+    """An unknown same-name sessions_fts_trigram is positively classified and
+    left untouched by destructive repair (#30 fail-closed)."""
+    from hermes_state import _owned_fts_object_names
+
+    monkeypatch.setattr(
+        SessionDB,
+        "_sessions_trigram_modern_definition_matches",
+        staticmethod(lambda sql: False),
+    )
+    names = _owned_fts_object_names(db._conn)
+    assert not any(n.startswith("sessions_fts_trigram") for n in names)
+    # The other five members are still owned.
+    for table in (
+        "messages_fts",
+        "messages_fts_trigram",
+        "messages_fts_cjk",
+        "sessions_fts",
+        "sessions_fts_cjk",
+    ):
+        assert table in names
+
+
+def test_destructive_repair_removes_owned_objects_preserves_canonical(tmp_path):
+    from hermes_state import _drop_owned_fts_derived_schema
+
+    db_path = tmp_path / "state.db"
+    session_db = SessionDB(db_path=db_path)
+    session_db.create_session(session_id="s1", source="cli")
+    session_db.set_session_title("s1", "pizzaparty")
+    session_db.append_message("s1", role="user", content="hello world")
+    session_db.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        before_sessions = conn.execute(
+            "SELECT row_id, id, title FROM sessions ORDER BY row_id"
+        ).fetchall()
+        before_messages = conn.execute(
+            "SELECT id, content FROM messages ORDER BY id"
+        ).fetchall()
+        assert before_sessions and before_messages
+        _drop_owned_fts_derived_schema(conn)
+        remaining = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type IN ('table','view','trigger','index') "
+                "AND (name LIKE 'messages_fts%' OR name LIKE 'sessions_fts%')"
+            ).fetchall()
+        ]
+        assert remaining == []
+        after_sessions = conn.execute(
+            "SELECT row_id, id, title FROM sessions ORDER BY row_id"
+        ).fetchall()
+        after_messages = conn.execute(
+            "SELECT id, content FROM messages ORDER BY id"
+        ).fetchall()
+        assert after_sessions == before_sessions
+        assert after_messages == before_messages
+    finally:
+        conn.close()
+
+    # Reopen recreates the supported derived schema; canonical search works.
+    reopened = SessionDB(db_path=db_path)
+    try:
+        assert len(reopened.search_messages("hello")) == 1
+        assert reopened.resolve_session_by_title("pizzaparty") == "s1"
+    finally:
+        reopened.close()
