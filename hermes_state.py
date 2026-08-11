@@ -1434,7 +1434,15 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # Catch the full sqlite3 exception hierarchy (not just
         # OperationalError) so the malformed-shadow-table class is reported
         # rather than letting it crash the caller.
-        for fts_table in (desc.table for desc in FTS_INDEXES):
+        for desc in FTS_INDEXES:
+            fts_table = desc.table
+            # #30 fail-closed (issue #27 review R2 P1): an unknown same-name
+            # ``sessions_fts_trigram`` is outside owned repair — never probe
+            # it (or its corrupt data) as an owned candidate.
+            if fts_table == "sessions_fts_trigram" and not (
+                SessionDB._sessions_trigram_owned(conn)
+            ):
+                continue
             try:
                 # No-op queries against the actual FTS5 APIs the search
                 # tools use. The session indexes are included because they
@@ -1552,21 +1560,13 @@ def _owned_fts_object_names(conn: sqlite3.Connection) -> List[str]:
         )
         names.extend(desc.trigger_names)
         names.extend(obj_name for _obj_type, obj_name in desc.derived_objects)
-    # #30 fail-closed: an unknown same-name trigram object is NOT owned — it
-    # must never be removed by the destructive path (or its source VIEW).
-    trigram = _fts_descriptor("sessions_fts_trigram")
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master "
-        "WHERE type = 'table' AND name = ?",
-        (trigram.table,),
-    ).fetchone()
-    owned_trigram = (
-        row is not None
-        and SessionDB._sessions_trigram_modern_definition_matches(
-            row[0] if not isinstance(row, sqlite3.Row) else row["sql"]
-        )
-    )
-    if not owned_trigram:
+    # #30 fail-closed (issue #27 review R2 P1): an unknown same-name trigram
+    # object is NOT owned — the destructive path must never remove it (or its
+    # source VIEW / shadow / trigger namespace). Reuses the full #30
+    # classifier (root + source VIEW + trigger namespace), not root DDL alone,
+    # so a canonical root with a foreign source VIEW or foreign trigger is
+    # also left untouched.
+    if not SessionDB._sessions_trigram_owned(conn):
         names = [n for n in names if not n.startswith("sessions_fts_trigram")]
     return names
 
@@ -1668,6 +1668,14 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             # best-effort (a tokenizer-less host skips them at the probe below).
             load_fts5_cjk_extension(conn)
             for desc in FTS_INDEXES:
+                # #30 fail-closed (issue #27 review R2 P1): a foreign same-name
+                # sessions_fts_trigram can legally accept the 'rebuild' command
+                # — never mutate it through the registry. Only a positively
+                # owned namespace is rebuilt.
+                if desc.table == "sessions_fts_trigram" and not (
+                    SessionDB._sessions_trigram_owned(conn)
+                ):
+                    continue
                 try:
                     conn.execute(
                         f"INSERT INTO {desc.table}({desc.table}) VALUES('rebuild')"
@@ -2429,11 +2437,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # pending/stale state. A failed connection-local load
                     # degrades to fallback, never a crash or a false "CJK
                     # available" claim.
-                    self._sessions_cjk_worker_operable = (
-                        load_fts5_cjk_extension(self._conn)
-                    )
+                    #
+                    # The loaded flag is a LOCAL for read-only discovery only:
+                    # a mode=ro connection must never publish itself as a
+                    # mutating CJK worker just because it can load the
+                    # tokenizer (#35 handoff P2) — only search-serving
+                    # availability is derived here.
+                    cjk_loaded = load_fts5_cjk_extension(self._conn)
+                    self._sessions_cjk_worker_operable = False
                     self._sessions_cjk_available = False
-                    if self._sessions_cjk_worker_operable and cursor.execute(
+                    if cjk_loaded and cursor.execute(
                         "SELECT 1 FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'sessions_fts_cjk'"
                     ).fetchone() is not None:
@@ -3358,6 +3371,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return (not foreign), foreign, []
 
     @staticmethod
+    def _sessions_trigram_owned(cursor) -> bool:
+        """True when the same-name ``sessions_fts_trigram`` namespace is
+        positively Hermes-owned (#30, issue #27 review R2 P1).
+
+        Reuses the existing #30 classifiers rather than re-implementing a
+        weaker root-DDL-only check: the root must classify as the canonical
+        modern trigram (which itself requires the canonical derived source
+        VIEW) AND the trigger namespace must have no foreign occupant. A
+        missing owned trigger does not disqualify — the namespace is still
+        ours to probe/maintain/delete. ``cursor`` may be a Cursor or a
+        Connection (SELECT-only).
+        """
+        classification = SessionDB._classify_sessions_fts_trigram(cursor)
+        if classification != "modern_trigram":
+            return False
+        _owned, foreign, _missing = SessionDB._sessions_trigram_namespace_owned(
+            cursor, classification
+        )
+        return not foreign
+
+    @staticmethod
     def _classify_sessions_fts_trigram(cursor) -> str:
         """Classify the same-name ``sessions_fts_trigram`` object by schema
         identity (normalized stored ``sqlite_master.sql`` comparisons), NEVER
@@ -3896,7 +3930,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 for desc in FTS_INDEXES
                 for trigger in desc.trigger_names
             )
+        # #30 fail-closed (issue #27 review R2 P1): the whole-FTS5-unavailable
+        # teardown must not drop a foreign occupant of a
+        # ``sessions_fts_trigram_*`` trigger name — only the exact owned
+        # modern declaration is dropped (absent = nothing to drop).
+        trigram_status = SessionDB._sessions_trigram_trigger_status(cursor)
         for trigger in names:
+            if (
+                trigger.startswith("sessions_fts_trigram")
+                and trigram_status.get(trigger) != "exact_modern"
+            ):
+                continue
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:

@@ -573,16 +573,42 @@ def test_owned_fts_object_names_covers_six_indexes(db):
     assert len(names) == len(set(names))  # no duplicates
 
 
-def test_owned_fts_object_names_fail_closed_for_foreign_trigram(db, monkeypatch):
-    """An unknown same-name sessions_fts_trigram is positively classified and
-    left untouched by destructive repair (#30 fail-closed)."""
+def _install_foreign_trigram_source(conn):
+    """Replace the canonical derived VIEW with a raw (uncompacted) foreign
+    one — real mixed DDL, the state #30's ownership classifier must reject."""
+    conn.execute("DROP VIEW IF EXISTS sessions_fts_trigram_src")
+    conn.execute(
+        "CREATE VIEW sessions_fts_trigram_src AS "
+        "SELECT row_id, title, id, display_name FROM sessions"
+    )
+    conn.commit()
+
+
+def _install_foreign_trigram_triggers(conn, names=None):
+    """Replace the named canonical trigram triggers with foreign inert
+    same-name occupants (``AFTER UPDATE ON sessions ... SELECT 1``)."""
+    names = names or (
+        "sessions_fts_trigram_insert",
+        "sessions_fts_trigram_delete",
+        "sessions_fts_trigram_update_before",
+        "sessions_fts_trigram_update_after",
+    )
+    for name in names:
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute(
+            f"CREATE TRIGGER {name} AFTER UPDATE ON sessions "
+            "BEGIN SELECT 1; END"
+        )
+    conn.commit()
+
+
+def test_owned_objects_fail_closed_for_foreign_trigram_source(db):
+    """Canonical root + foreign (mismatched) source VIEW is NOT owned — the
+    destructive namespace list must exclude the trigram (real mixed DDL, not
+    a mock)."""
     from hermes_state import _owned_fts_object_names
 
-    monkeypatch.setattr(
-        SessionDB,
-        "_sessions_trigram_modern_definition_matches",
-        staticmethod(lambda sql: False),
-    )
+    _install_foreign_trigram_source(db._conn)
     names = _owned_fts_object_names(db._conn)
     assert not any(n.startswith("sessions_fts_trigram") for n in names)
     # The other five members are still owned.
@@ -594,6 +620,181 @@ def test_owned_fts_object_names_fail_closed_for_foreign_trigram(db, monkeypatch)
         "sessions_fts_cjk",
     ):
         assert table in names
+
+
+def test_owned_objects_fail_closed_for_foreign_trigram_trigger(db):
+    """Canonical root/source + foreign same-name trigger occupant is NOT
+    owned — destructive namespace list excludes the trigram."""
+    from hermes_state import _owned_fts_object_names
+
+    _install_foreign_trigram_triggers(
+        db._conn, names=("sessions_fts_trigram_update_before",)
+    )
+    names = _owned_fts_object_names(db._conn)
+    assert not any(n.startswith("sessions_fts_trigram") for n in names)
+
+
+def test_destructive_repair_leaves_foreign_trigram_source_untouched(tmp_path):
+    """Strategy 2 must not delete a canonical root whose source VIEW is
+    foreign — the foreign VIEW stays byte/DDL-identical."""
+    from hermes_state import _drop_owned_fts_derived_schema
+
+    db_path = _build_db_with_session(tmp_path, title="pizza pie party")
+    conn = sqlite3.connect(str(db_path))
+    _install_foreign_trigram_source(conn)
+    before_sql = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE name = 'sessions_fts_trigram_src'"
+    ).fetchone()[0]
+    _drop_owned_fts_derived_schema(conn)
+    after_sql = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE name = 'sessions_fts_trigram_src'"
+    ).fetchone()[0]
+    assert after_sql == before_sql
+    conn.close()
+
+
+def test_destructive_repair_leaves_foreign_trigram_trigger_untouched(tmp_path):
+    """Strategy 2 must not delete a canonical root/source namespace that has
+    a foreign same-name trigger occupant — the foreign trigger stays
+    byte/DDL-identical and the (unowned) trigram root survives."""
+    from hermes_state import _drop_owned_fts_derived_schema
+
+    db_path = _build_db_with_session(tmp_path, title="pizza pie party")
+    conn = sqlite3.connect(str(db_path))
+    _install_foreign_trigram_triggers(
+        conn, names=("sessions_fts_trigram_update_before",)
+    )
+    before_sql = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
+    ).fetchone()[0]
+    _drop_owned_fts_derived_schema(conn)
+    after_sql = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
+    ).fetchone()[0]
+    assert after_sql == before_sql
+    # The excluded (unowned) trigram root survives too.
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'sessions_fts_trigram'"
+    ).fetchone() is not None
+    conn.close()
+
+
+def test_drop_fts_triggers_leaves_foreign_trigram_trigger_untouched(db):
+    """The whole-FTS5-unavailable teardown drops canonical triggers but never
+    a foreign occupant of a sessions_fts_trigram_* name (#30 preflight)."""
+    _install_foreign_trigram_triggers(
+        db._conn, names=("sessions_fts_trigram_update_before",)
+    )
+    before_sql = db._conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
+    ).fetchone()[0]
+    db._drop_fts_triggers(db._conn)
+    db._conn.commit()
+    after_sql = db._conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
+    ).fetchone()[0]
+    assert after_sql == before_sql  # foreign occupant survives
+    # Canonical message/session triggers were still dropped.
+    left = db._conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type = 'trigger' AND name IN "
+        "('messages_fts_insert', 'sessions_fts_insert')"
+    ).fetchone()[0]
+    assert left == 0
+
+
+def test_offline_repair_leaves_foreign_trigram_untouched(tmp_path):
+    """Strategy 0 rebuilds owned indexes but never 'rebuild' a foreign
+    same-name sessions_fts_trigram (which can legally accept the command).
+    The corrupt foreign data is outside owned repair, so auto-recovery fails
+    closed (never reports success while corruption survives) and the foreign
+    objects stay byte/DDL-identical."""
+    from hermes_state import repair_state_db_schema
+
+    db_path = _build_db_with_session(tmp_path, title="pizza pie party")
+    conn = sqlite3.connect(str(db_path))
+    # Foreign occupants across the whole trigram trigger namespace.
+    _install_foreign_trigram_triggers(conn)
+    # Corrupt an OWNED index (sessions_fts) so repair actually runs...
+    conn.execute("UPDATE sessions_fts_data SET block = X'BADC0FFEE0DDF00D'")
+    # ...and corrupt the foreign-gated trigram data too (repair must not
+    # clear it, and must not report success while it survives).
+    conn.execute(
+        "UPDATE sessions_fts_trigram_data SET block = X'BADC0FFEE0DDF00D'"
+    )
+    conn.commit()
+    before_trigger = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
+    ).fetchone()[0]
+    conn.close()
+
+    report = repair_state_db_schema(db_path, backup=False)
+    # Fail closed: a foreign-gated corrupt index cannot be cleared, so repair
+    # must not report success (it must never delete/rebuild the foreign
+    # object to make the DB "healthy").
+    assert report["repaired"] is False
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        after_trigger = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
+        ).fetchone()[0]
+        assert after_trigger == before_trigger  # foreign occupant untouched
+        # The corrupt foreign trigram data was NOT rebuilt (untouched).
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM sessions_fts_trigram_data "
+            "WHERE block = X'BADC0FFEE0DDF00D'"
+        ).fetchone()[0]
+        assert bad >= 1
+    finally:
+        conn.close()
+
+
+def test_health_probe_never_reports_foreign_trigram_as_owned_repair(tmp_path):
+    """A corrupt foreign-gated sessions_fts_trigram is outside owned repair:
+    the health check still surfaces real corruption (PRAGMA integrity_check
+    is detection, not mutation), but repair must fail closed and leave the
+    foreign objects byte/DDL-identical. This pins the read-probe ownership
+    gate end-to-end via the repair path."""
+    from hermes_state import _db_opens_cleanly, repair_state_db_schema
+
+    db_path = _build_db_with_session(tmp_path, title="pizza pie party")
+    conn = sqlite3.connect(str(db_path))
+    _install_foreign_trigram_triggers(conn)
+    conn.execute(
+        "UPDATE sessions_fts_trigram_data SET block = X'BADC0FFEE0DDF00D'"
+    )
+    conn.commit()
+    before_trigger = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
+    ).fetchone()[0]
+    conn.close()
+
+    # Detection is fine (integrity_check reports the corruption), but repair
+    # must not claim success over a foreign object it refuses to touch.
+    assert _db_opens_cleanly(db_path) is not None
+    report = repair_state_db_schema(db_path, backup=False)
+    assert report["repaired"] is False
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        after_trigger = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
+        ).fetchone()[0]
+        assert after_trigger == before_trigger  # foreign occupant untouched
+    finally:
+        conn.close()
 
 
 def test_destructive_repair_removes_owned_objects_preserves_canonical(tmp_path):
