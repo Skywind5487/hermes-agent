@@ -719,3 +719,65 @@ def test_fts_optimize_available_is_lane_driven(db):
     db.set_meta("fts_session_rebuild_high_water", "1")
     db.set_meta("fts_session_rebuild_progress", "0")
     assert db.fts_optimize_available() is True
+
+
+# ── Six-index regression matrix (issue #27 commit 5) ──────────────────────
+
+def test_vacuum_reaches_session_indexes_and_preserves_row_ids(db):
+    """VACUUM reaches session FTS only through the shared optimize path (no
+    session-specific VACUUM hook) and preserves sessions.row_id."""
+    db.create_session(session_id="s1", source="cli")
+    db.set_session_title("s1", "vacuum title")
+    db.append_message("s1", role="user", content="vacuum needle")
+    before = db._conn.execute(
+        "SELECT row_id FROM sessions WHERE id = 's1'"
+    ).fetchone()[0]
+    db.vacuum()
+    after = db._conn.execute(
+        "SELECT row_id FROM sessions WHERE id = 's1'"
+    ).fetchone()[0]
+    assert after == before
+    assert len(db.search_messages("vacuum")) == 1
+    assert _session_fts_matches(db, "vacuum")
+
+
+def test_rebuild_session_trigram_through_derived_compact_view(db):
+    """Session trigram rebuild consumes the #30 derived compact VIEW — not
+    raw metadata — so separator-bearing titles stay searchable by their
+    compact form after repair."""
+    db.create_session(session_id="s1", source="cli")
+    db.set_session_title("s1", "AN-94 Rifle")
+    # The trigger indexed the COMPACTED "AN94Rifle" (hyphen/space removed).
+    assert _trigram_fts_matches(db, "an94")
+    _corrupt_shadow(db, "sessions_fts_trigram_data")
+    with pytest.raises(sqlite3.DatabaseError):
+        _trigram_fts_matches(db, "an94")
+    db.rebuild_fts()
+    # A naive rebuild from raw "AN-94 Rifle" would NOT contain the substring
+    # "an94"; reading through the derived VIEW restores the compact form.
+    assert _trigram_fts_matches(db, "an94")
+
+
+def test_runtime_recovery_repairs_corrupt_session_fts_write(db):
+    """A session-metadata write hitting corrupt session FTS invokes the
+    existing one-shot rebuild/retry and succeeds; canonical rows preserved.
+
+    Uses the session INSERT path (``create_session``), whose trigger drives
+    the real sessions_fts write. (A session-metadata UPDATE that fires the
+    ``sessions_fts_update`` 'delete' half hits an FTS5 in-transaction
+    connection-state quirk that blocks an in-place rebuild on the SAME
+    connection; that path degrades to the registry-driven offline repair /
+    startup auto-heal, which fixes it on a fresh connection.)
+    """
+    db.create_session(session_id="s1", source="cli")
+    db.set_session_title("s1", "original title")
+    # Write-class corruption: base tables read fine, session FTS writes fail.
+    db._conn.execute(
+        "UPDATE sessions_fts_data SET block = X'DEADBEEFDEADBEEF'"
+    )
+    db._conn.commit()
+    ok = db.create_session(session_id="s2", source="cli")
+    assert ok == "s2"
+    assert db._fts_runtime_rebuild_attempted is True
+    # The rebuilt session index serves both rows.
+    assert _session_fts_matches(db, "s2")
