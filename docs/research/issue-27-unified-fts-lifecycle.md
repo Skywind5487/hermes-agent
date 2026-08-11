@@ -10,6 +10,21 @@ Research artifact: `docs/research/issue-35-unified-fts-lifecycle.md` (PR #75)
 > search-routing or migration-state framework, and storage-v2 settlement
 > stays with #31 (no `FTS_STORAGE_VERSION` change here).
 
+> **Review round 1 (2026-08-11, ponytail + code-review, issue comment
+> `5253715082`, fixed in `0400c66f0`).** All over-engineering/standards
+> findings were within #27 scope and implemented: removed the never-read
+> `"name"` key from `_FTS_REBUILD_LANES`; merged `_drop_fts_triggers` /
+> `_drop_message_fts_triggers` into `_drop_fts_triggers(cursor, names=None)`
+> (demote passes the message subset); parameterized the message/session CJK
+> UPDATE-narrowing + quarantine helpers by `(trigger_name, stale_key)`
+> (caller clears its own availability flag); deleted the now-dead
+> `_FTS_TRIGGERS` membership tuple (+ its back-compat re-export) per research
+> §4.1 Q2. Net −35 lines. Kept (spec-required, not a finding to fix): the
+> spec `"descriptor"` / `"trigram_descriptor"` keys — they are the explicit
+> "specs reference authoritative descriptors" seam from the research and the
+> drift-prevention test anchor. Validation after the round: 149 + 187 focused
+> tests green, ruff clean.
+
 ## The six authoritative members
 
 1. `messages_fts`
