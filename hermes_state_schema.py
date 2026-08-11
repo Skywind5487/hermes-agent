@@ -1198,6 +1198,16 @@ class SessionSchemaMixin:
             # completed index search-serving) as separate facts.
             self._ensure_sessions_fts_cjk_schema(cursor)
 
+            # ── Sessions normalized trigram FTS5 (#30) ──────────────
+            # External-content trigram over the derived compact/raw VIEW,
+            # with its own resumable H/P lane. Runs independently of the
+            # Unicode sessions_fts above; an unknown same-name object fails
+            # closed (never deleted).
+            sessions_trigram_ok = self._ensure_sessions_trigram_fts_schema(
+                cursor
+            )
+            self._sessions_trigram_available = sessions_trigram_ok
+
             # Replace any pre-existing broad AFTER UPDATE triggers with
             # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
             if getattr(self, "_fts_enabled", False):
