@@ -25,6 +25,44 @@ Research artifact: `docs/research/issue-35-unified-fts-lifecycle.md` (PR #75)
 > drift-prevention test anchor. Validation after the round: 149 + 187 focused
 > tests green, ruff clean.
 
+> **Review round 2 (2026-08-11, issue comment `5254482988`, fixed in
+> `933a2ce86`).** One P1 (merge blocker), one P2, one S1.
+>
+> **P1 — registry membership ≠ ownership in offline/global paths.** The
+> module-level health read probe (`_db_opens_cleanly`), repair strategy 0,
+> `_owned_fts_object_names`, and `_drop_fts_triggers` all touched
+> `sessions_fts_trigram` without #30 classification. A foreign same-name FTS5
+> table can legally accept `'rebuild'`, so this was a real mutation — #30
+> explicitly requires leaving foreign same-name schema untouched. Fix: reuse
+> the existing #30 classifiers via a thin composition
+> `SessionDB._sessions_trigram_owned` (root must classify as canonical modern
+> trigram **and** the trigger namespace must have no foreign occupant; a
+> missing owned trigger does not disqualify). Applied as the gate in all four
+> paths; `_drop_fts_triggers` additionally gates per-name via
+> `_sessions_trigram_trigger_status` (only `exact_modern` trigram triggers are
+> ever dropped). No new abstraction, no new state.
+>
+> **P2 — read-only CJK worker flag.** The mode=ro `SessionDB` set
+> `_sessions_cjk_worker_operable = load_fts5_cjk_extension(...)`, publishing a
+> read-only connection as a mutating worker. The load result is now a local
+> used only for search-serving availability; the worker flag stays `False` on
+> read-only.
+>
+> **S1 — real mixed-DDL ownership fixtures.** The ownership-boundary test
+> monkeypatched `_sessions_trigram_modern_definition_matches = False` (only
+> covered "root is foreign"). Replaced with real DDL fixtures: a foreign
+> (uncompacted) `sessions_fts_trigram_src` VIEW and foreign same-name trigger
+> occupants on a canonical root/source namespace. New tests assert foreign
+> objects stay byte/DDL-identical through `_drop_owned_fts_derived_schema` and
+> `_drop_fts_triggers`, and that offline repair **fails closed** — it never
+> reports success while foreign-gated corruption survives (a
+> `PRAGMA integrity_check` premise correction: the read probe cannot be
+> isolated via `_db_opens_cleanly is None` because integrity_check already
+> catches corrupt `_data`; the gate is pinned end-to-end via the repair
+> path). Validation after the round: registry + trigram/CJK + repair +
+> narrowing suites 116 passed / 29 skipped, `test_hermes_state.py` 178 passed,
+> ruff clean.
+
 ## The six authoritative members
 
 1. `messages_fts`
