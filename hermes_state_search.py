@@ -24,10 +24,12 @@ from hermes_state_common import (
     FTS_SESSION_TRIGRAM_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
+    FTS_INDEXES,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
     _FTS_SESSION_CJK_TRIGGERS,
+    _fts_descriptor,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -141,19 +143,37 @@ class _LineageResolutionState:
 # table, row key, and marker names differ. ``available`` /
 # ``trigram_available`` are callables taking the SessionDB host (the mixin
 # methods cannot read ``self._fts_enabled`` at import time).
+#
+# Static identity (table / source / row key / columns) is derived from the
+# authoritative ``FTS_INDEXES`` registry (issue #27) instead of being
+# repeated here, so membership can never drift from the lifecycle consumers;
+# lane-specific state (H/P marker keys, availability callbacks, reset
+# targets, finish hooks) stays in the specs.
+_MESSAGES_FTS_DESC = _fts_descriptor("messages_fts")
+_MESSAGES_TRIGRAM_DESC = _fts_descriptor("messages_fts_trigram")
+_MESSAGES_CJK_DESC = _fts_descriptor("messages_fts_cjk")
+_SESSIONS_FTS_DESC = _fts_descriptor("sessions_fts")
+_SESSIONS_CJK_DESC = _fts_descriptor("sessions_fts_cjk")
+_SESSIONS_TRIGRAM_DESC = _fts_descriptor("sessions_fts_trigram")
+
 _FTS_MESSAGE_SPEC = {
     "name": "messages",
     "high_water_key": "fts_rebuild_high_water",
     "progress_key": "fts_rebuild_progress",
-    "fts_table": "messages_fts",
-    "fts_columns": ("content", "tool_name", "tool_calls"),
-    "source_table": "messages",
-    "source_columns": ("content", "tool_name", "tool_calls"),
-    "row_key": "id",
-    "trigram_fts": "messages_fts_trigram",
-    "trigram_columns": ("content", "tool_name", "tool_calls"),
+    "descriptor": _MESSAGES_FTS_DESC,
+    "trigram_descriptor": _MESSAGES_TRIGRAM_DESC,
+    "fts_table": _MESSAGES_FTS_DESC.table,
+    "fts_columns": _MESSAGES_FTS_DESC.columns,
+    "source_table": _MESSAGES_FTS_DESC.source,
+    "source_columns": _MESSAGES_FTS_DESC.columns,
+    "row_key": _MESSAGES_FTS_DESC.row_key,
+    "trigram_fts": _MESSAGES_TRIGRAM_DESC.table,
+    "trigram_columns": _MESSAGES_TRIGRAM_DESC.columns,
     "trigram_where": "role <> 'tool'",
-    "reset_tables": ("messages_fts", "messages_fts_trigram"),
+    "reset_tables": (
+        _MESSAGES_FTS_DESC.table,
+        _MESSAGES_TRIGRAM_DESC.table,
+    ),
     "available": lambda self: self._fts_enabled,
     "trigram_available": lambda self: self._trigram_available,
 }
@@ -162,17 +182,18 @@ _FTS_SESSION_SPEC = {
     "name": "sessions",
     "high_water_key": "fts_session_rebuild_high_water",
     "progress_key": "fts_session_rebuild_progress",
-    "fts_table": "sessions_fts",
+    "descriptor": _SESSIONS_FTS_DESC,
+    "fts_table": _SESSIONS_FTS_DESC.table,
     # Raw canonical values only — no normalization / synthetic concatenation
     # (normalized arbitrary infix belongs to #30).
-    "fts_columns": ("title", "id", "display_name"),
-    "source_table": "sessions",
-    "source_columns": ("title", "id", "display_name"),
-    "row_key": "row_id",
+    "fts_columns": _SESSIONS_FTS_DESC.columns,
+    "source_table": _SESSIONS_FTS_DESC.source,
+    "source_columns": _SESSIONS_FTS_DESC.columns,
+    "row_key": _SESSIONS_FTS_DESC.row_key,
     "trigram_fts": None,
     "trigram_columns": (),
     "trigram_where": None,
-    "reset_tables": ("sessions_fts",),
+    "reset_tables": (_SESSIONS_FTS_DESC.table,),
     "available": lambda self: getattr(self, "_sessions_fts_available", False),
     "trigram_available": lambda self: False,
 }
@@ -189,15 +210,16 @@ _FTS_SESSION_TRIGRAM_SPEC = {
     "name": "sessions_trigram",
     "high_water_key": "fts_session_trigram_rebuild_high_water",
     "progress_key": "fts_session_trigram_rebuild_progress",
-    "fts_table": "sessions_fts_trigram",
-    "fts_columns": ("title", "id", "display_name"),
-    "source_table": "sessions_fts_trigram_src",
-    "source_columns": ("title", "id", "display_name"),
-    "row_key": "row_id",
+    "descriptor": _SESSIONS_TRIGRAM_DESC,
+    "fts_table": _SESSIONS_TRIGRAM_DESC.table,
+    "fts_columns": _SESSIONS_TRIGRAM_DESC.columns,
+    "source_table": _SESSIONS_TRIGRAM_DESC.source,
+    "source_columns": _SESSIONS_TRIGRAM_DESC.columns,
+    "row_key": _SESSIONS_TRIGRAM_DESC.row_key,
     "trigram_fts": None,
     "trigram_columns": (),
     "trigram_where": None,
-    "reset_tables": ("sessions_fts_trigram",),
+    "reset_tables": (_SESSIONS_TRIGRAM_DESC.table,),
     "available": lambda self: getattr(
         self, "_sessions_trigram_available", False
     ),
@@ -222,18 +244,47 @@ _FTS_SESSION_CJK_SPEC = {
     "name": "sessions_cjk",
     "high_water_key": "fts_session_cjk_rebuild_high_water",
     "progress_key": "fts_session_cjk_rebuild_progress",
-    "fts_table": "sessions_fts_cjk",
-    "fts_columns": ("title", "id", "display_name"),
-    "source_table": "sessions",
-    "source_columns": ("title", "id", "display_name"),
-    "row_key": "row_id",
+    "descriptor": _SESSIONS_CJK_DESC,
+    "fts_table": _SESSIONS_CJK_DESC.table,
+    "fts_columns": _SESSIONS_CJK_DESC.columns,
+    "source_table": _SESSIONS_CJK_DESC.source,
+    "source_columns": _SESSIONS_CJK_DESC.columns,
+    "row_key": _SESSIONS_CJK_DESC.row_key,
     "trigram_fts": None,
     "trigram_columns": (),
     "trigram_where": None,
-    "reset_tables": ("sessions_fts_cjk",),
+    "reset_tables": (_SESSIONS_CJK_DESC.table,),
     "available": lambda self: getattr(self, "_sessions_cjk_worker_operable", False),
     "trigram_available": lambda self: False,
     "finish_hook": lambda self: self._fts_session_cjk_finish_set_serving(),
+}
+
+# Optional message-CJK rebuild lane, folded onto the SAME generic engine as
+# every other lane (issue #27). Its OWN marker pair (``fts_cjk_rebuild_*`` —
+# never the message Unicode pair) and its own stale breadcrumb
+# (``FTS_CJK_STALE_KEY``) are preserved; only the bespoke status/step/finish
+# implementations are replaced by the shared engine. The worker gate is
+# ``_fts_cjk_loaded`` (this process can tokenize), and finish flips
+# search-serving exactly as the pre-#27 bespoke ``_fts_cjk_rebuild_finish``
+# did. The backfill reads through the ``messages_fts_cjk_src`` VIEW (the
+# descriptor's canonical derived source) which already excludes tool rows.
+_FTS_MESSAGE_CJK_SPEC = {
+    "name": "messages_cjk",
+    "high_water_key": "fts_cjk_rebuild_high_water",
+    "progress_key": "fts_cjk_rebuild_progress",
+    "descriptor": _MESSAGES_CJK_DESC,
+    "fts_table": _MESSAGES_CJK_DESC.table,
+    "fts_columns": _MESSAGES_CJK_DESC.columns,
+    "source_table": _MESSAGES_CJK_DESC.source,
+    "source_columns": _MESSAGES_CJK_DESC.columns,
+    "row_key": _MESSAGES_CJK_DESC.row_key,
+    "trigram_fts": None,
+    "trigram_columns": (),
+    "trigram_where": None,
+    "reset_tables": (_MESSAGES_CJK_DESC.table,),
+    "available": lambda self: self._fts_enabled and self._fts_cjk_loaded,
+    "trigram_available": lambda self: False,
+    "finish_hook": lambda self: setattr(self, "_fts_cjk_available", True),
 }
 
 
@@ -614,94 +665,32 @@ class SessionSearchMixin:
         self._sessions_cjk_available = stale is None
 
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
-        """CJK-index backfill progress, or None when none is pending."""
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
-                ("fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress"),
-            ).fetchall()
-        meta = {r["key"]: r["value"] for r in row}
-        high_water = meta.get("fts_cjk_rebuild_high_water")
-        if high_water is None:
-            return None
-        progress = int(meta.get("fts_cjk_rebuild_progress") or 0)
-        total = int(high_water)
-        if total <= 0:
-            return None
-        pct = min(100, int(100 * progress / total))
-        return {"pending": True, "total": total, "indexed": progress, "percent": pct}
+        """CJK-index backfill progress, or None when none is pending.
+
+        Delegates to the shared deferred-rebuild engine (issue #27) with the
+        message-CJK lane spec; the H/P marker pair and status shape are
+        unchanged.
+        """
+        return self.fts_rebuild_status(spec=_FTS_MESSAGE_CJK_SPEC)
 
     def fts_cjk_rebuild_step(self) -> bool:
-        """Backfill one chunk of the CJK index. True while work remains."""
-        if not self._fts_enabled or not self._fts_cjk_loaded:
-            return False
-        high_water_raw = self.get_meta("fts_cjk_rebuild_high_water")
-        if high_water_raw is None:
-            return False
-        high_water = int(high_water_raw)
-        chunk = self._FTS_REBUILD_CHUNK_ROWS
+        """Backfill one chunk of the CJK index. True while work remains.
 
-        def _do(conn):
-            row = conn.execute(
-                "SELECT value FROM state_meta "
-                "WHERE key = 'fts_cjk_rebuild_progress'"
-            ).fetchone()
-            if row is None:
-                return False  # finished (or cleared) by another process
-            progress = int(row[0])
-            if progress >= high_water:
-                return False
-            upper = min(progress + chunk, high_water)
-            conn.execute(
-                "INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls) "
-                "SELECT id, content, tool_name, tool_calls FROM messages "
-                "WHERE id > ? AND id <= ? AND role <> 'tool'",
-                (progress, upper),
-            )
-            conn.execute(
-                "UPDATE state_meta SET value = ? "
-                "WHERE key = 'fts_cjk_rebuild_progress'",
-                (str(upper),),
-            )
-            return upper < high_water
-
-        try:
-            more = self._execute_write(_do)
-        except sqlite3.OperationalError as exc:
-            logger.debug("CJK FTS rebuild chunk failed (will retry): %s", exc)
-            return True
-        if more is False:
-            status = self.fts_cjk_rebuild_status()
-            if status is not None and status["indexed"] >= status["total"]:
-                self._fts_cjk_rebuild_finish()
-            return False
-        return bool(more)
+        Delegates to the shared deferred-rebuild engine (issue #27); the
+        message-CJK H/P marker pair, id-gated chunk SQL, and crash-safe claim
+        semantics are unchanged (the chunk now reads through the
+        ``messages_fts_cjk_src`` VIEW, which already excludes tool rows).
+        """
+        return self.fts_rebuild_step(spec=_FTS_MESSAGE_CJK_SPEC)
 
     def _fts_cjk_rebuild_finish(self) -> None:
-        """Boundary sweep + clear the cjk markers; index becomes servable."""
-        def _do(conn):
-            hw_row = conn.execute(
-                "SELECT value FROM state_meta "
-                "WHERE key = 'fts_cjk_rebuild_high_water'"
-            ).fetchone()
-            if hw_row is not None:
-                hw = int(hw_row[0])
-                lo, hi = hw - 1000, hw + 1000
-                conn.execute(
-                    "INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls) "
-                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
-                    "FROM messages m "
-                    "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
-                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_cjk_docsize d WHERE d.id = m.id)",
-                    (lo, hi),
-                )
-            conn.execute(
-                "DELETE FROM state_meta WHERE key IN "
-                "('fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress')"
-            )
-        self._execute_write(_do)
-        self._fts_cjk_available = True
-        logger.info("CJK FTS index backfill complete — serving CJK search.")
+        """Boundary sweep + clear the cjk markers; index becomes servable.
+
+        Delegates to the shared deferred-rebuild finish (issue #27); the
+        finish hook flips ``_fts_cjk_available`` exactly as the pre-#27
+        bespoke implementation did.
+        """
+        self._fts_rebuild_finish(spec=_FTS_MESSAGE_CJK_SPEC)
 
     def _fts_reset_stale_cjk_surface(
         self,
@@ -3450,6 +3439,52 @@ class SessionSearchMixin:
             # teardown) — in every case the table is not queryable.
             return False
 
+    def _fts_maintenance_tables(self) -> Tuple[str, ...]:
+        """Ordered FTS tables applicable to ordinary maintenance (optimize /
+        bounded merge / explicit rebuild) on THIS host, derived from the
+        authoritative ``FTS_INDEXES`` registry (issue #27).
+
+        Required Unicode indexes (``messages_fts``, ``sessions_fts``)
+        participate whenever FTS5 is enabled. Optional tokenizer-gated
+        indexes participate only when this process can operate them AND they
+        are not quarantined/stale:
+
+        - ``messages_fts_trigram`` — ``self._trigram_available``;
+        - ``messages_fts_cjk`` — ``self._fts_cjk_loaded``;
+        - ``sessions_fts_cjk`` — ``self._sessions_cjk_worker_operable``
+          (worker operability, never search-serving availability);
+        - ``sessions_fts_trigram`` — ``self._sessions_trigram_available``.
+
+        The #30 ownership classifier leaves ``_sessions_trigram_available``
+        False for an unknown same-name object, so a foreign target is never
+        touched by ordinary maintenance. Callers keep the per-table existence
+        probe as a safety net for tables absent from the schema.
+        """
+        if not self._fts_enabled:
+            return ()
+        sessions_fts_ok = getattr(self, "_sessions_fts_available", False)
+        sessions_trigram_ok = getattr(self, "_sessions_trigram_available", False)
+        sessions_cjk_ok = getattr(self, "_sessions_cjk_worker_operable", False)
+        tables: List[str] = []
+        for desc in FTS_INDEXES:
+            if desc.capability == "fts5":
+                if desc.table == "sessions_fts" and not sessions_fts_ok:
+                    continue
+                tables.append(desc.table)
+            elif desc.capability == "trigram":
+                if desc.table == "sessions_fts_trigram":
+                    if sessions_trigram_ok:
+                        tables.append(desc.table)
+                elif self._trigram_available:
+                    tables.append(desc.table)
+            else:  # cjk
+                if desc.table == "sessions_fts_cjk":
+                    if sessions_cjk_ok:
+                        tables.append(desc.table)
+                elif self._fts_cjk_loaded:
+                    tables.append(desc.table)
+        return tuple(tables)
+
     def optimize_fts(self) -> int:
         """Merge fragmented FTS5 b-tree segments into one per index.
 
@@ -3465,15 +3500,20 @@ class SessionSearchMixin:
         speed. It is complementary to VACUUM: ``optimize`` compacts the FTS
         index internally, then VACUUM returns the freed pages to the OS.
 
-        Skips any FTS table that does not exist (e.g. the trigram index when
-        disabled via ``HERMES_DISABLE_FTS_TRIGRAM`` or not yet created), so
-        it is safe to call unconditionally.
+        Iterates the authoritative ``FTS_INDEXES`` registry (issue #27):
+        every owned applicable modern index — the three message indexes AND
+        the session Unicode/CJK/trigram metadata indexes — participates
+        through the shared applicability path. Optional tokenizer-gated
+        indexes participate only when this host can operate them; an unknown
+        #30 same-name ``sessions_fts_trigram`` is never touched. Skips any
+        FTS table that does not exist, so it is safe to call
+        unconditionally.
 
         Returns the number of FTS indexes that were optimized.
         """
         optimized = 0
         with self._lock:
-            for tbl in self._FTS_TABLES:
+            for tbl in self._fts_maintenance_tables():
                 if not self._fts_table_exists(tbl):
                     continue
                 try:
@@ -3490,21 +3530,32 @@ class SessionSearchMixin:
         return optimized
 
     def rebuild_fts(self) -> int:
-        """Rebuild FTS5 indexes from the canonical ``messages`` table.
+        """Rebuild FTS5 indexes from their canonical content sources.
 
         Uses the FTS5 ``'rebuild'`` command, which rewrites the internal
-        b-tree segments from the content rows. This is the documented
-        recovery for a corrupt FTS index that rejects message writes while
-        reads still succeed (issue #50502). Unlike ``optimize_fts`` (which
-        merges existing segments), ``rebuild`` discards and recreates the
-        index data entirely.
+        b-tree segments from each table's declared content source. This is
+        the documented recovery for a corrupt FTS index that rejects writes
+        while reads still succeed (issue #50502). Unlike ``optimize_fts``
+        (which merges existing segments), ``rebuild`` discards and recreates
+        the index data entirely.
+
+        Iterates the authoritative ``FTS_INDEXES`` registry (issue #27):
+        every owned applicable modern index is rebuilt, so a corrupt session
+        Unicode/CJK/trigram index is recovered by the same runtime seam that
+        already covers the message indexes. FTS5's ``rebuild`` command reads
+        through each table's declared ``content=`` source, so
+        ``sessions_fts_trigram`` naturally rebuilds through the derived
+        compact ``sessions_fts_trigram_src`` VIEW — no compact SQL is
+        duplicated here. Optional tokenizer-gated indexes participate only
+        when this host can operate them; an unknown #30 same-name
+        ``sessions_fts_trigram`` is never touched.
 
         Safe to call when FTS tables don't exist (skips them).
         Returns the number of FTS indexes that were rebuilt.
         """
         rebuilt = 0
         with self._lock:
-            for tbl in self._FTS_TABLES:
+            for tbl in self._fts_maintenance_tables():
                 if not self._fts_table_exists(tbl):
                     continue
                 try:
@@ -3547,7 +3598,11 @@ class SessionSearchMixin:
         Each command is its own implicit transaction (the connection runs
         with ``isolation_level=None``), so the SQLite write lock is released
         between commands and competing processes can interleave writes
-        mid-pass. Missing tables are valid schema variants (FTS variants are
+        mid-pass. The applicable index set comes from the authoritative
+        ``FTS_INDEXES`` registry (issue #27), so the bounded merge reaches
+        the session Unicode/CJK/trigram metadata indexes through the same
+        shared applicability path — no session-specific cadence. Missing
+        tables are valid schema variants (FTS variants are
         optional, and ``optimize_fts_storage`` legitimately drops + backfills
         these tables while writers keep running) and are skipped, mirroring
         ``optimize_fts``. Other SQLite errors propagate to the caller.
@@ -3567,7 +3622,7 @@ class SessionSearchMixin:
 
         executed = 0
         with self._lock:
-            for tbl in self._FTS_TABLES:
+            for tbl in self._fts_maintenance_tables():
                 if not self._fts_table_exists(tbl):
                     continue
                 # One-time (per instance) usermerge floor; the value is

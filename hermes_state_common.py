@@ -6,7 +6,8 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
@@ -930,6 +931,140 @@ _FTS_SESSION_CJK_TRIGGERS = (
 # reads until a capable host resets and rebuilds. Distinct from the message
 # ``FTS_CJK_STALE_KEY`` and from the Unicode-session markers.
 FTS_SESSION_CJK_STALE_KEY = "fts_session_cjk_stale"
+
+
+# ── Authoritative FTS index registry (issue #27) ─────────────────────────
+# One data-only, module-level descriptor per modern external-content FTS
+# index, so module-level/offline repair code AND the SessionDB mixins can
+# consume the same membership source without importing ``hermes_state``
+# (which would be a cycle). The registry owns ONLY static index identity:
+# table, canonical/derived content source, row key, indexed columns, owned
+# modern trigger names, required capability class, and owned derived objects
+# (source VIEWs) needed by destructive derived-index repair.
+#
+# Deliberately NOT a search-routing or migration-state framework. Dynamic
+# concerns stay in their existing owners: H/P rebuild claims and stale
+# breadcrumbs (rebuild lanes / state_meta), worker-operable vs search-serving
+# state, #30 exact same-name root/source/trigger ownership classification,
+# search routing/ranking/fallback, and final storage-layout settlement.
+# In particular, the table name being present here is NOT authorization to
+# mutate ``sessions_fts_trigram`` — #30's ownership classifier remains the
+# gate and ``unknown_same_name`` stays fail-closed.
+#
+# The six authoritative modern members (the five-index list in old #12 prose
+# predates #30 and is historical only):
+#   1. messages_fts
+#   2. messages_fts_trigram
+#   3. messages_fts_cjk
+#   4. sessions_fts
+#   5. sessions_fts_cjk
+#   6. sessions_fts_trigram
+
+
+@dataclass(frozen=True)
+class FtsIndexDescriptor:
+    """Static identity for one modern external-content FTS index.
+
+    ``table`` is the FTS5 virtual table name; ``source`` the canonical or
+    derived content table/VIEW it reads through; ``row_key`` the named rowid
+    column; ``columns`` the indexed document columns (same order in FTS and
+    source); ``trigger_names`` the owned modern triggers that keep the index
+    live; ``capability`` the required tokenizer class (``fts5`` = built-in
+    base, ``trigram`` / ``cjk`` = optional/tokenizer-gated); and
+    ``derived_objects`` any owned derived schema (e.g. ``("view",
+    "sessions_fts_trigram_src")``) that destructive derived-index repair must
+    remove alongside the index.
+    """
+
+    table: str
+    source: str
+    row_key: str
+    columns: Tuple[str, ...]
+    trigger_names: Tuple[str, ...]
+    capability: Literal["fts5", "trigram", "cjk"]
+    derived_objects: Tuple[Tuple[str, str], ...] = ()
+
+
+# Ordered as the six authoritative modern members above.
+FTS_INDEXES: Tuple[FtsIndexDescriptor, ...] = (
+    FtsIndexDescriptor(
+        table="messages_fts",
+        source="messages",
+        row_key="id",
+        columns=("content", "tool_name", "tool_calls"),
+        trigger_names=(
+            "messages_fts_insert",
+            "messages_fts_delete",
+            "messages_fts_update",
+        ),
+        capability="fts5",
+    ),
+    FtsIndexDescriptor(
+        table="messages_fts_trigram",
+        source="messages_fts_trigram_src",
+        row_key="id",
+        columns=("content", "tool_name", "tool_calls"),
+        trigger_names=(
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+        ),
+        capability="trigram",
+        derived_objects=(("view", "messages_fts_trigram_src"),),
+    ),
+    FtsIndexDescriptor(
+        table="messages_fts_cjk",
+        source="messages_fts_cjk_src",
+        row_key="id",
+        columns=("content", "tool_name", "tool_calls"),
+        trigger_names=_FTS_CJK_TRIGGERS,
+        capability="cjk",
+        derived_objects=(("view", "messages_fts_cjk_src"),),
+    ),
+    FtsIndexDescriptor(
+        table="sessions_fts",
+        source="sessions",
+        row_key="row_id",
+        columns=("title", "id", "display_name"),
+        trigger_names=(
+            "sessions_fts_insert",
+            "sessions_fts_delete",
+            "sessions_fts_update",
+        ),
+        capability="fts5",
+    ),
+    FtsIndexDescriptor(
+        table="sessions_fts_cjk",
+        source="sessions",
+        row_key="row_id",
+        columns=("title", "id", "display_name"),
+        trigger_names=_FTS_SESSION_CJK_TRIGGERS,
+        capability="cjk",
+    ),
+    FtsIndexDescriptor(
+        table="sessions_fts_trigram",
+        source="sessions_fts_trigram_src",
+        row_key="row_id",
+        columns=("title", "id", "display_name"),
+        trigger_names=(
+            "sessions_fts_trigram_insert",
+            "sessions_fts_trigram_delete",
+            "sessions_fts_trigram_update_before",
+            "sessions_fts_trigram_update_after",
+        ),
+        capability="trigram",
+        derived_objects=(("view", "sessions_fts_trigram_src"),),
+    ),
+)
+
+
+def _fts_descriptor(table: str) -> FtsIndexDescriptor:
+    """Look up the authoritative descriptor for *table* (issue #27)."""
+    for descriptor in FTS_INDEXES:
+        if descriptor.table == table:
+            return descriptor
+    raise KeyError(f"no FTS index descriptor registered for {table!r}")
+
 
 LEGACY_FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(

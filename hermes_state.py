@@ -55,11 +55,14 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
     _ephemeral_child_sql,
+    _fts_descriptor,
     _shape_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
+    FTS_INDEXES,
+    FtsIndexDescriptor,
     FTS_SESSION_CJK_STALE_KEY,
     FTS_SQL,
     FTS_SESSION_TRIGRAM_STALE_KEY,
@@ -10787,12 +10790,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return sessions
 
     # ── Space reclamation ──
-
-    # FTS5 virtual tables whose b-tree segments we merge on optimize. The
-    # trigram table is created lazily / may be disabled, and the cjk-bigram
-    # table only exists (and is only queryable) when the loadable tokenizer
-    # is present — so we probe each before touching it (see optimize_fts).
-    _FTS_TABLES = ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
 
     def logical_size_bytes(self) -> Optional[int]:
         """Database size in bytes as SQLite itself accounts for it.

@@ -2173,20 +2173,30 @@ class TestVacuum:
 
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
-        """A fresh DB has both FTS indexes; optimize merges both."""
+        """A fresh DB has four owned FTS indexes (message Unicode/trigram +
+        session Unicode/trigram; CJK members are gated off without a
+        loadable tokenizer); optimize merges all of them (issue #27)."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hello world")
         statements = []
         db._conn.set_trace_callback(statements.append)
         try:
-            assert db.optimize_fts() == 2
+            assert db.optimize_fts() == 4
         finally:
             db._conn.set_trace_callback(None)
         optimize_sql = [sql for sql in statements if "'optimize'" in sql]
-        assert len(optimize_sql) == 2
+        assert len(optimize_sql) == 4
         assert not any("'merge'" in sql for sql in optimize_sql)
-
-
+        optimized = {
+            sql.split("INSERT INTO ", 1)[1].split("(", 1)[0].strip()
+            for sql in optimize_sql
+        }
+        assert optimized == {
+            "messages_fts",
+            "messages_fts_trigram",
+            "sessions_fts",
+            "sessions_fts_trigram",
+        }
 
 
     def test_incremental_merge_bounded_commands_per_present_index(self, db):
@@ -2201,9 +2211,11 @@ class TestOptimizeFts:
             db._conn.set_trace_callback(None)
 
         # At least one merge command per present FTS index, and never more
-        # than the per-pass command cap per index.
-        present = [t for t in db._FTS_TABLES if db._fts_table_exists(t)]
-        assert len(present) >= 2  # messages_fts + trigram on a fresh DB
+        # than the per-pass command cap per index. The applicable index set
+        # derives from the authoritative FTS_INDEXES registry (issue #27),
+        # so the session Unicode/trigram members participate too.
+        present = list(db._fts_maintenance_tables())
+        assert len(present) >= 4  # messages + session Unicode/trigram
         merge_sql = [sql for sql in statements if "VALUES('merge', 37)" in sql]
         assert len(merge_sql) == executed
         assert len(present) <= executed <= (
@@ -2883,8 +2895,10 @@ class TestFTSExternalContentMigration:
             db.set_meta("fts_rebuild_progress", "0")
             # The public contract: optimize returns ok=False when still
             # pending. Simulate an unfinishable backfill by stubbing the
-            # chunk step to a no-op while markers stay.
-            db.fts_rebuild_step = lambda: False  # type: ignore[method-assign]
+            # shared chunk step (message AND message-CJK lanes both enter
+            # through fts_rebuild_step since #27 folded CJK onto the shared
+            # engine) to a no-op while markers stay.
+            db.fts_rebuild_step = lambda spec=None: False  # type: ignore[method-assign]
             result = db.optimize_fts_storage(vacuum=False)
             assert result["ok"] is False
             assert result.get("reason") == "backfill_incomplete"
