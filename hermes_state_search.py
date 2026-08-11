@@ -288,6 +288,54 @@ _FTS_MESSAGE_CJK_SPEC = {
 }
 
 
+# ── Shared deferred-rebuild lane iteration (issue #27) ────────────────────
+# The status emitter and foreground worker loop in ``optimize_fts_storage``
+# used to probe/execute each rebuild lane one-by-one (message, message-CJK,
+# session Unicode, session trigram, session CJK). This ordered lane surface
+# centralizes that sequencing so the loops are data-driven. It is SEPARATE
+# from the ``FTS_INDEXES`` registry: H/P markers and stale breadcrumbs are
+# lane-specific state that lives in the rebuild specs, not in the index
+# descriptor. ``stale_key`` (when present) names the lane's durable stale
+# breadcrumb for the pending-work probe.
+_FTS_REBUILD_LANES: Tuple[Dict[str, Any], ...] = (
+    {
+        "name": "messages",
+        "spec": _FTS_MESSAGE_SPEC,
+        "stale_key": None,
+        "status": lambda self: self.fts_rebuild_status(),
+        "step": lambda self: self.fts_rebuild_step(),
+    },
+    {
+        "name": "messages_cjk",
+        "spec": _FTS_MESSAGE_CJK_SPEC,
+        "stale_key": FTS_CJK_STALE_KEY,
+        "status": lambda self: self.fts_cjk_rebuild_status(),
+        "step": lambda self: self.fts_cjk_rebuild_step(),
+    },
+    {
+        "name": "sessions",
+        "spec": _FTS_SESSION_SPEC,
+        "stale_key": None,
+        "status": lambda self: self.fts_session_rebuild_status(),
+        "step": lambda self: self.fts_session_rebuild_step(),
+    },
+    {
+        "name": "sessions_trigram",
+        "spec": _FTS_SESSION_TRIGRAM_SPEC,
+        "stale_key": FTS_SESSION_TRIGRAM_STALE_KEY,
+        "status": lambda self: self.fts_session_trigram_rebuild_status(),
+        "step": lambda self: self.fts_session_trigram_rebuild_step(),
+    },
+    {
+        "name": "sessions_cjk",
+        "spec": _FTS_SESSION_CJK_SPEC,
+        "stale_key": FTS_SESSION_CJK_STALE_KEY,
+        "status": lambda self: self.fts_session_cjk_rebuild_status(),
+        "step": lambda self: self.fts_session_cjk_rebuild_step(),
+    },
+)
+
+
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
 
@@ -384,6 +432,67 @@ class SessionSearchMixin:
             return None
         pct = min(100, int(100 * progress / total))
         return {"pending": True, "total": total, "indexed": progress, "percent": pct}
+
+    def _fts_lane_pending(self, lane: Dict[str, Any], conn) -> bool:
+        """True when a deferred-rebuild lane has durable pending work (an H
+        marker and/or its stale breadcrumb) that THIS process can operate
+        (issue #27).
+
+        SELECT-only — no schema mutation, so it is safe for read-only opens
+        and status surfaces. The operability gate is the lane spec's
+        ``available`` callback (e.g. ``_sessions_trigram_available`` for the
+        #30 trigram lane), preserving the worker-vs-serving distinction.
+        ``conn`` must be a connection the caller already holds under a
+        suitable lock/read context (this helper does NOT take ``self._lock``,
+        which is non-reentrant).
+        """
+        spec = lane["spec"]
+        if not spec["available"](self):
+            return False
+        keys = [spec["high_water_key"]]
+        stale = lane.get("stale_key")
+        if stale:
+            keys.append(stale)
+        placeholders = ", ".join("?" for _ in keys)
+        row = conn.execute(
+            f"SELECT 1 FROM state_meta WHERE key IN ({placeholders}) LIMIT 1",
+            keys,
+        ).fetchone()
+        return row is not None
+
+    def _fts_first_pending_lane_status(self) -> Optional[Dict[str, Any]]:
+        """First non-None deferred-rebuild status across the ordered lanes
+        (issue #27) — the shared surface for progress/status emission, so the
+        emitter no longer hard-codes each lane one-by-one."""
+        for lane in _FTS_REBUILD_LANES:
+            status = lane["status"](self)
+            if status is not None:
+                return status
+        return None
+
+    def _fts_run_pending_lane_steps(
+        self, on_chunk: Optional[Callable[[], None]] = None
+    ) -> None:
+        """Run one full pass of every deferred-rebuild lane with pending work
+        (issue #27), using the shared inter-chunk pacing.
+
+        Replaces the hard-coded per-lane phase ladders in
+        ``optimize_fts_storage``; each lane's step loop only starts when its
+        status reports pending work, so a DB with no work for a lane never
+        enters (and never trips a monkeypatched step). ``on_chunk`` (if any)
+        is invoked after each chunk so progress emission is preserved. H/P
+        state stays lane-specific — this surface only sequences the lanes.
+        """
+        for lane in _FTS_REBUILD_LANES:
+            if lane["status"](self) is None:
+                continue
+            while True:
+                _t0 = time.monotonic()
+                if not lane["step"](self):
+                    break
+                if on_chunk is not None:
+                    on_chunk()
+                self._fts_rebuild_pause(time.monotonic() - _t0)
 
     def _fts_rebuild_finish(self, spec: Optional[Dict[str, Any]] = None) -> None:
         """Finalize a deferred rebuild: boundary sweep + clear markers.
@@ -1146,46 +1255,14 @@ class SessionSearchMixin:
             # unfinished until the backfill markers are cleared and the
             # demoted trash tables are torn down. Search stays complete
             # through the gap supplement meanwhile; re-running resumes.
-            if self._conn.execute(
-                "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
-            ).fetchone():
-                return True
-            # Session Unicode metadata rebuild pending (issue #25): the
-            # external index was staged at open with a durable H/P claim and
-            # the historical backfill is not complete yet.
-            if self._conn.execute(
-                "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_session_rebuild_high_water' LIMIT 1"
-            ).fetchone():
-                return True
-            # Session normalized trigram rebuild pending (issue #30): its own
-            # durable H/P claim, independent of the Unicode lane. Only
-            # advertised when THIS runtime owns+serves the lane — an
-            # incapable host must not advertise trigram work it can never
-            # complete (finding 1 point 4), and an unknown / quarantined
-            # target must not be advertised for mutation (finding 4).
-            if self._sessions_trigram_available and self._conn.execute(
-                "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_session_trigram_rebuild_high_water' LIMIT 1"
-            ).fetchone():
-                return True
-            # CJK-bigram index work — only offerable when THIS process can
-            # tokenize: a pending backfill (markers set at creation on a
-            # populated DB) or a stale index awaiting a from-scratch rebuild.
-            if self._fts_cjk_loaded and self._conn.execute(
-                "SELECT 1 FROM state_meta WHERE key IN "
-                f"('fts_cjk_rebuild_high_water', '{FTS_CJK_STALE_KEY}') LIMIT 1"
-            ).fetchone():
-                return True
-            # Session CJK metadata rebuild pending or stale (issue #26) —
-            # same tokenizer-capability gate as the message CJK index.
-            if self._fts_cjk_loaded and self._conn.execute(
-                "SELECT 1 FROM state_meta WHERE key IN "
-                "('fts_session_cjk_rebuild_high_water', "
-                f"'{FTS_SESSION_CJK_STALE_KEY}') LIMIT 1"
-            ).fetchone():
-                return True
+            # Every deferred-rebuild lane with durable pending work
+            # (H marker and/or stale breadcrumb) that THIS process can
+            # operate advertises work through the shared lane surface
+            # (issue #27): message, message-CJK, session Unicode, session
+            # trigram, and session CJK.
+            for lane in _FTS_REBUILD_LANES:
+                if self._fts_lane_pending(lane, self._conn):
+                    return True
             if self._has_fts_trash(self._conn):
                 return True
             # Pre-fix crash window: empty external-content index with
@@ -1374,15 +1451,7 @@ class SessionSearchMixin:
         def _emit(phase: str) -> None:
             if progress_cb is None:
                 return
-            st = self.fts_rebuild_status()
-            if st is None:
-                st = self.fts_cjk_rebuild_status()
-            if st is None:
-                st = self.fts_session_rebuild_status()
-            if st is None:
-                st = self.fts_session_trigram_rebuild_status()
-            if st is None:
-                st = self.fts_session_cjk_rebuild_status()
+            st = self._fts_first_pending_lane_status()
             progress_cb({
                 "phase": phase,
                 "percent": st["percent"] if st else 100,
@@ -1390,58 +1459,14 @@ class SessionSearchMixin:
                 "total": st["total"] if st else 0,
             })
 
-        # Phase 1: backfill (foreground, throttled between chunks so a live
-        # gateway sharing the DB stays responsive).
+        # Phase 1: backfill every deferred-rebuild lane with pending work,
+        # foreground and throttled between chunks so a live gateway sharing
+        # the DB stays responsive. The shared lane surface (issue #27)
+        # sequences the message / message-CJK / session Unicode / session
+        # trigram / session CJK lanes instead of a hard-coded ladder.
         _emit("backfill")
-        while True:
-            _t0 = time.monotonic()
-            if not self.fts_rebuild_step():
-                break
-            _emit("backfill")
-            self._fts_rebuild_pause(time.monotonic() - _t0)
+        self._fts_run_pending_lane_steps(on_chunk=lambda: _emit("backfill"))
         _emit("backfill")
-
-        # Phase 1b: backfill the CJK-bigram index (its own marker pair; a
-        # no-op when the tokenizer isn't loadable or nothing is pending).
-        while True:
-            _t0 = time.monotonic()
-            if not self.fts_cjk_rebuild_step():
-                break
-            _emit("backfill")
-            self._fts_rebuild_pause(time.monotonic() - _t0)
-
-        # Phase 1c: backfill the session Unicode metadata index (issue #25)
-        # — same shared chunk engine and pacing as the message rebuild. Gated
-        # on pending markers so a DB with no session work never enters the
-        # loop (and never trips a monkeypatched message ``fts_rebuild_step``).
-        if self.fts_session_rebuild_status() is not None:
-            while True:
-                _t0 = time.monotonic()
-                if not self.fts_session_rebuild_step():
-                    break
-                _emit("backfill")
-                self._fts_rebuild_pause(time.monotonic() - _t0)
-
-        # Phase 1d: backfill the session normalized trigram index (issue #30)
-        # — same shared chunk engine and pacing, its own pending markers.
-        if self.fts_session_trigram_rebuild_status() is not None:
-            while True:
-                _t0 = time.monotonic()
-                if not self.fts_session_trigram_rebuild_step():
-                    break
-                _emit("backfill")
-                self._fts_rebuild_pause(time.monotonic() - _t0)
-
-        # Phase 1e: backfill the session CJK metadata index (issue #26) — the
-        # same shared chunk engine and pacing, gated on the independent
-        # CJK-session markers (worker operability, never search availability).
-        if self.fts_session_cjk_rebuild_status() is not None:
-            while True:
-                _t0 = time.monotonic()
-                if not self.fts_session_cjk_rebuild_step():
-                    break
-                _emit("backfill")
-                self._fts_rebuild_pause(time.monotonic() - _t0)
 
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
         _emit("teardown")

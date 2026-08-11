@@ -643,3 +643,79 @@ def test_destructive_repair_removes_owned_objects_preserves_canonical(tmp_path):
         assert reopened.resolve_session_by_title("pizzaparty") == "s1"
     finally:
         reopened.close()
+
+
+# ── Read-only capability discovery + shared lane surface (issue #27) ──────
+
+def test_read_only_discovers_session_unicode_and_trigram(tmp_path):
+    """A read-only open discovers the existing session Unicode/trigram
+    capabilities with SELECTs only (no DDL / mutation), and can serve them."""
+    db_path = _build_db_with_session(tmp_path, title="pizza pie party")
+    ro = SessionDB(db_path=db_path, read_only=True)
+    try:
+        assert ro._sessions_fts_available is True
+        assert ro._sessions_trigram_available is True
+        # Read-only session search can use the discovered lanes.
+        fts_ok, candidates = ro._fts_metadata_candidates("pizza")
+        assert fts_ok is True
+        assert any(c["id"] == "s1" for c in candidates)
+        servable, trigram_candidates = ro._fts_session_trigram_candidates("pizza")
+        assert servable is True
+        assert any(c["id"] == "s1" for c in trigram_candidates)
+    finally:
+        ro.close()
+
+
+def test_read_only_unknown_trigram_fail_closed(tmp_path, monkeypatch):
+    """A read-only open never serves an unknown same-name sessions_fts_trigram
+    (#30 fail-closed, SELECT-only classification)."""
+    db_path = _build_db_with_session(tmp_path)
+    monkeypatch.setattr(
+        SessionDB,
+        "_classify_sessions_fts_trigram",
+        staticmethod(lambda cursor: "unknown_same_name"),
+    )
+    ro = SessionDB(db_path=db_path, read_only=True)
+    try:
+        assert ro._sessions_trigram_available is False
+    finally:
+        ro.close()
+
+
+def test_lane_surface_sequences_pending_lanes(db, monkeypatch):
+    """The shared deferred-rebuild lane surface runs every lane with pending
+    work and skips lanes without it (issue #27)."""
+    calls = []
+    pending = {"pending": True, "total": 1, "indexed": 0, "percent": 0}
+    monkeypatch.setattr(db, "fts_rebuild_status", lambda: pending)
+    monkeypatch.setattr(db, "fts_cjk_rebuild_status", lambda: None)
+    monkeypatch.setattr(db, "fts_session_rebuild_status", lambda: pending)
+    monkeypatch.setattr(db, "fts_session_trigram_rebuild_status", lambda: None)
+    monkeypatch.setattr(db, "fts_session_cjk_rebuild_status", lambda: None)
+    monkeypatch.setattr(
+        db, "fts_rebuild_step",
+        lambda: calls.append("messages") or False,
+    )
+    monkeypatch.setattr(
+        db, "fts_session_rebuild_step",
+        lambda: calls.append("sessions") or False,
+    )
+    # A lane with no pending work must never be stepped.
+    monkeypatch.setattr(
+        db, "fts_cjk_rebuild_step",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("cjk lane must not run without pending work")
+        ),
+    )
+
+    db._fts_run_pending_lane_steps()
+    assert calls == ["messages", "sessions"]
+
+
+def test_fts_optimize_available_is_lane_driven(db):
+    """fts_optimize_available advertises work through the shared lane surface
+    — a session Unicode H marker is enough, and a healthy DB reports False."""
+    assert db.fts_optimize_available() is False
+    db.set_meta("fts_session_rebuild_high_water", "1")
+    db.set_meta("fts_session_rebuild_progress", "0")
+    assert db.fts_optimize_available() is True

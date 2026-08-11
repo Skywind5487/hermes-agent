@@ -2390,6 +2390,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                             is True
                         )
+                    # Session Unicode metadata index (issue #25): SELECT-only
+                    # capability discovery — a read-only connection must be
+                    # able to serve session-title search through the raw
+                    # Unicode sessions_fts lane without any schema init.
+                    self._sessions_fts_available = (
+                        self._fts_table_probe(cursor, "sessions_fts") is True
+                    )
+                    # Session normalized trigram (issue #30): SELECT-only
+                    # discovery with #30 ownership classification. The lane is
+                    # served only when the root is positively a canonical
+                    # modern trigram object, this connection can tokenize it,
+                    # and it is not durably stale — an unknown same-name
+                    # object is never served (fail closed), and a pending/
+                    # stale lane never serves (worker-vs-serving distinction
+                    # preserved). No DDL / stale mutation / trigger repair
+                    # from a read-only open.
+                    self._sessions_trigram_available = False
+                    if (
+                        SessionDB._classify_sessions_fts_trigram(cursor)
+                        == "modern_trigram"
+                        and self._fts_table_probe(
+                            cursor, "sessions_fts_trigram"
+                        )
+                        is True
+                    ):
+                        stale = cursor.execute(
+                            "SELECT 1 FROM state_meta "
+                            "WHERE key = ? LIMIT 1",
+                            (FTS_SESSION_TRIGRAM_STALE_KEY,),
+                        ).fetchone()
+                        self._sessions_trigram_available = stale is None
                     # Session CJK metadata (issue #26): load the cjk_unicode61
                     # tokenizer on THIS connection FIRST — custom FTS5
                     # tokenizers are connection-local, and a vtable using one
