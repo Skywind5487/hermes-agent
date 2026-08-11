@@ -1227,7 +1227,11 @@ class SessionSearchMixin:
         window where trash + empty v23 tables exist with no backfill claim.
         """
         def _stage(conn):
-            self._drop_fts_triggers(conn)
+            # Message-scoped teardown: the demote re-creates the message
+            # schema immediately, so only the message triggers are dropped
+            # here — session metadata triggers keep live-indexing during the
+            # message-layout migration (issue #27).
+            self._drop_message_fts_triggers(conn)
             conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
             had = bool(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "

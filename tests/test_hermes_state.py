@@ -2602,7 +2602,10 @@ class TestFTSExternalContentMigration:
         from hermes_state import FTS_SQL, FTS_TRIGRAM_SQL
 
         conn = db._conn
-        db._drop_fts_triggers(conn)
+        # The demote path now tears down only the message triggers (issue #27)
+        # — session metadata triggers keep live-indexing during the message
+        # layout migration, so the crash-window simulation mirrors that.
+        db._drop_message_fts_triggers(conn)
         conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
         had = bool(conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "

@@ -302,3 +302,199 @@ def test_message_cjk_rebuild_finish_delegates_to_shared_engine(db, monkeypatch):
     )
     db._fts_cjk_rebuild_finish()
     assert calls == [_FTS_MESSAGE_CJK_SPEC]
+
+
+# ── Health probes cover the session indexes (issue #27) ───────────────────
+
+def _build_db_with_session(tmp_path, title="pizzaparty"):
+    db_path = tmp_path / "state.db"
+    session_db = SessionDB(db_path=db_path)
+    session_db.create_session(session_id="s1", source="cli")
+    session_db.set_session_title("s1", title)
+    session_db.close()
+    return db_path
+
+
+def test_health_read_probe_detects_corrupt_session_unicode_index(tmp_path):
+    from hermes_state import _db_opens_cleanly
+
+    db_path = _build_db_with_session(tmp_path)
+    assert _db_opens_cleanly(db_path) is None  # healthy before
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE sessions_fts_data SET block = X'BADC0FFEE0DDF00D'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    reason = _db_opens_cleanly(db_path)
+    assert reason is not None
+    assert "sessions_fts" in reason
+
+
+def test_health_read_probe_detects_corrupt_session_trigram_index(tmp_path):
+    from hermes_state import _db_opens_cleanly
+
+    db_path = _build_db_with_session(tmp_path, title="pizza pie party")
+    assert _db_opens_cleanly(db_path) is None
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE sessions_fts_trigram_data SET block = X'BADC0FFEE0DDF00D'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    reason = _db_opens_cleanly(db_path)
+    assert reason is not None
+    assert "sessions_fts_trigram" in reason
+
+
+def test_health_write_probe_detects_corrupt_session_fts_write(tmp_path):
+    """The rollback-only write probe inserts non-null session metadata, so a
+    broken session FTS write path is detected without persisting probe data."""
+    from hermes_state import _db_opens_cleanly
+
+    db_path = _build_db_with_session(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Write-class corruption: base reads fine, session FTS writes fail.
+        conn.execute(
+            "UPDATE sessions_fts_data SET block = X'DEADBEEFDEADBEEF'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    reason = _db_opens_cleanly(db_path)
+    assert reason is not None
+
+
+def test_health_write_probe_persists_no_rows(tmp_path):
+    from hermes_state import _db_opens_cleanly
+
+    db_path = _build_db_with_session(tmp_path)
+    assert _db_opens_cleanly(db_path) is None
+    conn = sqlite3.connect(str(db_path))
+    try:
+        probe_rows = conn.execute(
+            "SELECT COUNT(*) FROM sessions "
+            "WHERE id LIKE '_hermes_fts_health_probe_%'"
+        ).fetchone()[0]
+        messages = conn.execute(
+            "SELECT COUNT(*) FROM messages "
+            "WHERE session_id LIKE '_hermes_fts_health_probe_%'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert probe_rows == 0
+    assert messages == 0
+
+
+# ── Trigger inventory / convergence derives from the registry ─────────────
+
+def test_drop_fts_triggers_covers_all_owned_session_triggers(db):
+    # Message + session Unicode + session trigram triggers exist on a default
+    # host (the optional CJK members are gated off without a tokenizer).
+    expected_present = (
+        _fts_descriptor("messages_fts").trigger_names
+        + _fts_descriptor("messages_fts_trigram").trigger_names
+        + _fts_descriptor("sessions_fts").trigger_names
+        + _fts_descriptor("sessions_fts_trigram").trigger_names
+    )
+    for name in expected_present:
+        row = db._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        assert row is not None, f"expected owned trigger {name}"
+    # _drop_fts_triggers removes every owned registry trigger name (message
+    # AND session), including the #30 trigram ones.
+    db._drop_fts_triggers(db._conn)
+    db._conn.commit()
+    all_owned = [n for d in FTS_INDEXES for n in d.trigger_names]
+    placeholders = ", ".join("?" for _ in all_owned)
+    remaining = [
+        r[0]
+        for r in db._conn.execute(
+            "SELECT name FROM sqlite_master "
+            f"WHERE type = 'trigger' AND name IN ({placeholders})",
+            all_owned,
+        ).fetchall()
+    ]
+    assert remaining == []
+
+
+def test_migrate_converges_broad_session_unicode_update_trigger(db):
+    """A broad dev-era sessions_fts_update converges to the canonical narrow
+    AFTER UPDATE OF title, id, display_name (issue #27)."""
+    db._conn.execute("DROP TRIGGER IF EXISTS sessions_fts_update")
+    db._conn.execute(
+        """
+        CREATE TRIGGER sessions_fts_update AFTER UPDATE ON sessions
+        BEGIN
+            SELECT 1;
+        END
+        """
+    )
+    db._conn.commit()
+    before = db._conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_update'"
+    ).fetchone()[0]
+    assert "AFTER UPDATE OF" not in " ".join(before.split()).upper()
+
+    dropped = db._migrate_broad_fts_update_triggers(db._conn)
+    db._conn.commit()
+    assert dropped >= 1
+    after = db._conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_update'"
+    ).fetchone()[0]
+    assert "AFTER UPDATE OF title, id, display_name" in after
+
+
+def test_migrate_converges_broad_session_cjk_update_trigger(db):
+    """A broad sessions_fts_cjk_update converges to the canonical narrow DDL
+    on a tokenizer-capable host (issue #27/#26)."""
+    if not db._sessions_cjk_worker_operable:
+        pytest.skip("no loadable CJK tokenizer on this host")
+    db._conn.execute("DROP TRIGGER IF EXISTS sessions_fts_cjk_update")
+    db._conn.execute(
+        """
+        CREATE TRIGGER sessions_fts_cjk_update AFTER UPDATE ON sessions
+        BEGIN
+            SELECT 1;
+        END
+        """
+    )
+    db._conn.commit()
+    dropped = db._migrate_broad_fts_update_triggers(db._conn)
+    db._conn.commit()
+    assert dropped >= 1
+    after = db._conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = 'sessions_fts_cjk_update'"
+    ).fetchone()[0]
+    assert "AFTER UPDATE OF title, id, display_name" in after
+
+
+def test_migrate_leaves_trigram_update_triggers_under_30_identity(db):
+    """sessions_fts_trigram_update_before/_after are canonical narrow #30
+    triggers (BEFORE/AFTER UPDATE OF title, id, display_name) and must never
+    be rewritten by the broad→narrow migration."""
+    for name in (
+        "sessions_fts_trigram_update_before",
+        "sessions_fts_trigram_update_after",
+    ):
+        row = db._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        assert row is not None
+        sql = row[0]
+        assert "UPDATE OF title, id, display_name" in sql
+    # Migration is a no-op on an already-converged DB.
+    assert db._migrate_broad_fts_update_triggers(db._conn) == 0

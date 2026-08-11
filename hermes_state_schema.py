@@ -17,6 +17,7 @@ from hermes_constants import get_hermes_home
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
+    FTS_SESSION_CJK_STALE_KEY,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
@@ -24,11 +25,22 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSIONS_FTS_CJK_TRIGGER_SQL,
     SESSIONS_FTS_SQL,
     SESSION_INDEX_SQL_STATEMENTS,
     SESSION_TABLE_REBUILD_SQL,
-    _FTS_TRIGGERS,
     _ephemeral_child_sql,
+    _fts_descriptor,
+)
+
+# Message-lane owned trigger names, derived from the authoritative six-index
+# registry (issue #27). Used by the message trigger-repair detection and the
+# UPDATE-OF convergence migration; session triggers are handled separately
+# (session CJK through its own lifecycle, session trigram through #30 exact
+# identity).
+_MESSAGE_FTS_TRIGGERS = (
+    _fts_descriptor("messages_fts").trigger_names
+    + _fts_descriptor("messages_fts_trigram").trigger_names
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -73,11 +85,11 @@ class SessionSchemaMixin:
 
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+        placeholders = ",".join("?" for _ in _MESSAGE_FTS_TRIGGERS)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            _MESSAGE_FTS_TRIGGERS,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
@@ -104,6 +116,15 @@ class SessionSchemaMixin:
         writes included). Inspect ``sqlite_master``, drop any still-broad
         UPDATE triggers, and re-apply the current DDL constants.
 
+        Since #27 the convergence covers the owned session-metadata UPDATE
+        triggers too: ``sessions_fts_update`` and (on a tokenizer-capable
+        host) ``sessions_fts_cjk_update`` converge from the broad dev-era
+        ``AFTER UPDATE ON sessions`` to the canonical narrow
+        ``AFTER UPDATE OF title, id, display_name``. The modern trigram
+        ``sessions_fts_trigram_update_before/_after`` are already canonical
+        narrow triggers and remain under #30's exact identity — never blindly
+        rewritten here.
+
         No FTS rebuild: content correctness was already gated by WHEN clauses
         on modern installs; OF only skips unnecessary trigger evaluation.
 
@@ -116,9 +137,13 @@ class SessionSchemaMixin:
         update_names = (
             "messages_fts_update",
             "messages_fts_trigram_update",
+            # Recognized/owned session Unicode metadata index (issue #25).
+            "sessions_fts_update",
         )
         if not legacy_layout and hasattr(self, "_ensure_fts_cjk_schema"):
             update_names += ("messages_fts_cjk_update",)
+        if not legacy_layout and hasattr(self, "_ensure_sessions_fts_cjk_schema"):
+            update_names += ("sessions_fts_cjk_update",)
         placeholders = ", ".join("?" for _ in update_names)
         rows = cursor.execute(
             "SELECT name, sql FROM sqlite_master "
@@ -173,6 +198,24 @@ class SessionSchemaMixin:
                         "UPDATE OF migration; marked stale and unavailable"
                     )
 
+        # Session Unicode metadata index (issue #25) is independent of the
+        # message layout, so re-apply its canonical narrow DDL whether or not
+        # the message layout is legacy.
+        if "sessions_fts_update" in to_drop:
+            self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
+        # Session CJK metadata index (issue #26): re-ensure the surface (never
+        # raises; soft-fails to unavailable). If the narrow UPDATE trigger is
+        # still missing/broad afterwards, quarantine durably (stale breadcrumb
+        # + unavailable) so the index is never served over a trigger gap.
+        if "sessions_fts_cjk_update" in to_drop:
+            self._ensure_sessions_fts_cjk_schema(cursor)
+            if not self._sessions_cjk_update_trigger_is_narrowed(cursor):
+                self._quarantine_session_cjk_after_update_of_migration(cursor)
+                logger.warning(
+                    "Session CJK FTS UPDATE trigger missing or still broad "
+                    "after UPDATE OF migration; marked stale and unavailable"
+                )
+
         logger.info(
             "Migrated %d broad FTS UPDATE trigger(s) to AFTER UPDATE OF "
             "(no rebuild required)",
@@ -214,6 +257,48 @@ class SessionSchemaMixin:
         except Exception:
             logger.debug(
                 "Could not drop residual CJK UPDATE trigger after quarantine",
+                exc_info=True,
+            )
+
+    def _sessions_cjk_update_trigger_is_narrowed(
+        self, cursor: sqlite3.Cursor
+    ) -> bool:
+        """True when sessions_fts_cjk_update exists with AFTER UPDATE OF."""
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = ?",
+            ("sessions_fts_cjk_update",),
+        ).fetchone()
+        if not row:
+            return False
+        sql = row[0] if not isinstance(row, sqlite3.Row) else row["sql"]
+        return not self._fts_update_trigger_needs_narrowing(sql)
+
+    def _quarantine_session_cjk_after_update_of_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Fail-closed after dropping the session-CJK UPDATE during OF
+        migration (issue #26).
+
+        Clears search-serving availability, persists the session-CJK stale
+        breadcrumb, and drops any residual broad/partial session-CJK UPDATE
+        trigger so a later capable open cannot ``CREATE TRIGGER IF NOT
+        EXISTS`` a gap without a from-scratch rebuild.
+        """
+        self._sessions_cjk_available = False
+        try:
+            self.set_meta(FTS_SESSION_CJK_STALE_KEY, "1", cursor=cursor)
+        except Exception:
+            logger.debug(
+                "Could not persist session CJK FTS stale breadcrumb",
+                exc_info=True,
+            )
+        try:
+            cursor.execute("DROP TRIGGER IF EXISTS sessions_fts_cjk_update")
+        except Exception:
+            logger.debug(
+                "Could not drop residual session-CJK UPDATE trigger after "
+                "quarantine",
                 exc_info=True,
             )
 
@@ -1130,7 +1215,7 @@ class SessionSchemaMixin:
             # DBs have no legacy inline FTS, so they get the v23 DDL.
             if self._db_has_legacy_inline_fts(cursor):
                 triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                    self._fts_trigger_count(cursor) < len(_MESSAGE_FTS_TRIGGERS)
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", LEGACY_FTS_SQL
@@ -1146,7 +1231,7 @@ class SessionSchemaMixin:
                         )
             else:
                 triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                    self._fts_trigger_count(cursor) < len(_MESSAGE_FTS_TRIGGERS)
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", FTS_SQL

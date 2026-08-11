@@ -1419,10 +1419,12 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             return "; ".join(problems[:3])
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
 
-        # FTS5 read probe: run a representative MATCH query against the
-        # messages_fts* virtual tables. The FTS *write* probe below catches
-        # the corruption class where base tables read fine but writes fail
-        # through the triggers (#50502). It does NOT catch partial FTS5
+        # FTS5 read probe: run a representative MATCH query against every
+        # owned modern FTS index derived from the authoritative ``FTS_INDEXES``
+        # registry (issue #27) — the three message indexes AND the session
+        # Unicode/CJK/trigram metadata indexes. The FTS *write* probe below
+        # catches the corruption class where base tables read fine but writes
+        # fail through the triggers (#50502). It does NOT catch partial FTS5
         # index corruption — bad shadow-table segments where reads still
         # parse but MATCH / snippet / rank queries error out with
         # "database disk image is malformed" (a `sqlite3.DatabaseError`,
@@ -1433,16 +1435,16 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # Catch the full sqlite3 exception hierarchy (not just
         # OperationalError) so the malformed-shadow-table class is reported
         # rather than letting it crash the caller.
-        for fts_table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
+        for fts_table in (desc.table for desc in FTS_INDEXES):
             try:
                 # No-op queries against the actual FTS5 APIs the search
-                # tools use. The trigram table is included because it backs
-                # the title-resolution path; either corruption mode would
-                # break session recall without this probe. MATCH '""' is
-                # the empty phrase-token probe — FTS5 rejects MATCH ''
-                # outright ("fts5: syntax error"), but a quoted empty
-                # phrase parses, scans zero rows, and exercises the same
-                # shadow-table read path the search tools use.
+                # tools use. The session indexes are included because they
+                # back the title-resolution / session-search paths; either
+                # corruption mode would break session recall without this
+                # probe. MATCH '""' is the empty phrase-token probe — FTS5
+                # rejects MATCH '' outright ("fts5: syntax error"), but a
+                # quoted empty phrase parses, scans zero rows, and exercises
+                # the same shadow-table read path the search tools use.
                 conn.execute(
                     f"SELECT 1 FROM {fts_table} WHERE {fts_table} MATCH '\"\"' LIMIT 1"
                 ).fetchone()
@@ -1476,18 +1478,30 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # while reads of the FTS5 table itself parse fine.
                 return f"fts5 read probe failed on {fts_table}: {exc}"
 
-        # FTS write probe: drive a row through the messages_fts* triggers in a
-        # transaction that is always rolled back, so a corrupt FTS index that
-        # rejects writes is caught even though reads look healthy. The probe is
-        # best-effort — if the messages/sessions tables don't exist yet (brand
-        # new file mid-init) the OperationalError is treated as "not yet a
-        # populated DB", not corruption.
+        # FTS write probe: drive a row through the messages_fts* AND
+        # sessions_fts* triggers in a transaction that is always rolled back,
+        # so a corrupt FTS index that rejects writes is caught even though
+        # reads look healthy. The probe is best-effort — if the
+        # messages/sessions tables don't exist yet (brand new file mid-init)
+        # the OperationalError is treated as "not yet a populated DB", not
+        # corruption. Since #27, the probe session carries non-null
+        # ``title`` / ``display_name`` so the session Unicode/CJK/trigram
+        # INSERT triggers execute their REAL projection (a broken
+        # session-title trigger / session FTS write is detected without
+        # persisting probe data).
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
-                (probe_session_id, "_health_probe", time.time()),
+                "INSERT INTO sessions (id, source, started_at, title, "
+                "display_name) VALUES (?, ?, ?, ?, ?)",
+                (
+                    probe_session_id,
+                    "_health_probe",
+                    time.time(),
+                    "_fts_health_title_probe",
+                    "_fts_health_display_probe",
+                ),
             )
             conn.execute(
                 "INSERT INTO messages (session_id, role, content, timestamp) "
@@ -3751,7 +3765,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
-        for trigger in _FTS_TRIGGERS:
+        """Drop every owned modern FTS trigger (whole-FTS5-unavailable
+        teardown).
+
+        Derives the trigger inventory from the authoritative ``FTS_INDEXES``
+        registry (issue #27), so the degraded-runtime teardown knows about the
+        session-title triggers too — not just the message ones (pitfall 6).
+        Drop is by exact owned trigger name; the dedicated CJK/trigram
+        tokenizer-loss quarantine paths remain separate and preserve stale
+        ordering / #30 exact ownership — registry membership is not permission
+        to touch those here.
+        """
+        for desc in FTS_INDEXES:
+            for trigger in desc.trigger_names:
+                try:
+                    cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                except sqlite3.OperationalError:
+                    pass
+
+    @staticmethod
+    def _drop_message_fts_triggers(cursor: sqlite3.Cursor) -> None:
+        """Drop the MESSAGE FTS triggers only (v22→v23 demote path).
+
+        The demote re-creates the message schema immediately, so only the
+        message Unicode/trigram triggers are torn down there; session
+        metadata triggers stay live during the message-layout migration.
+        Names derive from the authoritative registry (issue #27).
+        """
+        names = (
+            _fts_descriptor("messages_fts").trigger_names
+            + _fts_descriptor("messages_fts_trigram").trigger_names
+        )
+        for trigger in names:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
