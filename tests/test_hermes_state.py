@@ -2599,13 +2599,19 @@ class TestFTSExternalContentMigration:
         Mirrors what happened when ``_ensure_fts_schema`` ran inside
         ``_execute_write`` and the process died before the marker writes.
         """
-        from hermes_state import FTS_SQL, FTS_TRIGRAM_SQL
+        from hermes_state import FTS_SQL, FTS_TRIGRAM_SQL, _fts_descriptor
 
         conn = db._conn
         # The demote path now tears down only the message triggers (issue #27)
         # — session metadata triggers keep live-indexing during the message
         # layout migration, so the crash-window simulation mirrors that.
-        db._drop_message_fts_triggers(conn)
+        db._drop_fts_triggers(
+            conn,
+            names=(
+                _fts_descriptor("messages_fts").trigger_names
+                + _fts_descriptor("messages_fts_trigram").trigger_names
+            ),
+        )
         conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
         had = bool(conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "

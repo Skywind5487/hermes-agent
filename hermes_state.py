@@ -44,14 +44,13 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_SESSION_CJK_TRIGGERS,
-    _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
     _ephemeral_child_sql,
@@ -3874,38 +3873,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._fts_cjk_available = False
 
     @staticmethod
-    def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
-        """Drop every owned modern FTS trigger (whole-FTS5-unavailable
-        teardown).
+    def _drop_fts_triggers(
+        cursor: sqlite3.Cursor,
+        names: Optional[Collection[str]] = None,
+    ) -> None:
+        """Drop owned modern FTS triggers.
 
-        Derives the trigger inventory from the authoritative ``FTS_INDEXES``
-        registry (issue #27), so the degraded-runtime teardown knows about the
-        session-title triggers too — not just the message ones (pitfall 6).
-        Drop is by exact owned trigger name; the dedicated CJK/trigram
-        tokenizer-loss quarantine paths remain separate and preserve stale
-        ordering / #30 exact ownership — registry membership is not permission
-        to touch those here.
+        Defaults to every owned modern trigger across the six-index registry
+        (whole-FTS5-unavailable teardown), so the degraded-runtime teardown
+        knows about the session-title triggers too — not just the message ones
+        (pitfall 6). ``names`` narrows the drop to an explicit subset — e.g.
+        the message Unicode/trigram triggers during the v22→v23 demote, which
+        re-creates the message schema immediately and must leave session
+        metadata triggers live. Drop is by exact owned trigger name; the
+        dedicated CJK/trigram tokenizer-loss quarantine paths remain separate
+        and preserve stale ordering / #30 exact ownership — registry
+        membership is not permission to touch those here.
         """
-        for desc in FTS_INDEXES:
-            for trigger in desc.trigger_names:
-                try:
-                    cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-                except sqlite3.OperationalError:
-                    pass
-
-    @staticmethod
-    def _drop_message_fts_triggers(cursor: sqlite3.Cursor) -> None:
-        """Drop the MESSAGE FTS triggers only (v22→v23 demote path).
-
-        The demote re-creates the message schema immediately, so only the
-        message Unicode/trigram triggers are torn down there; session
-        metadata triggers stay live during the message-layout migration.
-        Names derive from the authoritative registry (issue #27).
-        """
-        names = (
-            _fts_descriptor("messages_fts").trigger_names
-            + _fts_descriptor("messages_fts_trigram").trigger_names
-        )
+        if names is None:
+            names = (
+                trigger
+                for desc in FTS_INDEXES
+                for trigger in desc.trigger_names
+            )
         for trigger in names:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")

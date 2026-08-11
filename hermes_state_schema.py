@@ -186,12 +186,14 @@ class SessionSchemaMixin:
                 try:
                     self._ensure_fts_cjk_schema(cursor)
                 except Exception:
+                    self._fts_cjk_available = False
                     self._quarantine_cjk_after_update_of_migration(cursor)
                     logger.exception(
                         "CJK FTS re-ensure after UPDATE OF migration failed"
                     )
                     raise
                 if not self._cjk_update_trigger_is_narrowed(cursor):
+                    self._fts_cjk_available = False
                     self._quarantine_cjk_after_update_of_migration(cursor)
                     logger.warning(
                         "CJK FTS UPDATE trigger missing or still broad after "
@@ -209,8 +211,15 @@ class SessionSchemaMixin:
         # + unavailable) so the index is never served over a trigger gap.
         if "sessions_fts_cjk_update" in to_drop:
             self._ensure_sessions_fts_cjk_schema(cursor)
-            if not self._sessions_cjk_update_trigger_is_narrowed(cursor):
-                self._quarantine_session_cjk_after_update_of_migration(cursor)
+            if not self._cjk_update_trigger_is_narrowed(
+                cursor, "sessions_fts_cjk_update"
+            ):
+                self._sessions_cjk_available = False
+                self._quarantine_cjk_after_update_of_migration(
+                    cursor,
+                    trigger_name="sessions_fts_cjk_update",
+                    stale_key=FTS_SESSION_CJK_STALE_KEY,
+                )
                 logger.warning(
                     "Session CJK FTS UPDATE trigger missing or still broad "
                     "after UPDATE OF migration; marked stale and unavailable"
@@ -223,12 +232,18 @@ class SessionSchemaMixin:
         )
         return len(to_drop)
 
-    def _cjk_update_trigger_is_narrowed(self, cursor: sqlite3.Cursor) -> bool:
-        """True when messages_fts_cjk_update exists with AFTER UPDATE OF."""
+    def _cjk_update_trigger_is_narrowed(
+        self,
+        cursor: sqlite3.Cursor,
+        trigger_name: str = "messages_fts_cjk_update",
+    ) -> bool:
+        """True when the named CJK UPDATE trigger exists with AFTER UPDATE OF
+        (message ``messages_fts_cjk_update`` by default, or the session
+        ``sessions_fts_cjk_update``)."""
         row = cursor.execute(
             "SELECT sql FROM sqlite_master "
             "WHERE type = 'trigger' AND name = ?",
-            ("messages_fts_cjk_update",),
+            (trigger_name,),
         ).fetchone()
         if not row:
             return False
@@ -236,69 +251,32 @@ class SessionSchemaMixin:
         return not self._fts_update_trigger_needs_narrowing(sql)
 
     def _quarantine_cjk_after_update_of_migration(
-        self, cursor: sqlite3.Cursor
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        trigger_name: str = "messages_fts_cjk_update",
+        stale_key: str = FTS_CJK_STALE_KEY,
     ) -> None:
-        """Fail-closed after dropping CJK UPDATE during OF migration.
+        """Fail-closed after dropping a CJK UPDATE during OF migration.
 
-        Clears availability, persists ``fts_cjk_stale``, and drops any
-        residual broad/partial CJK UPDATE trigger so a later open cannot
-        ``CREATE TRIGGER IF NOT EXISTS`` a gap without rebuild.
+        Persists the named stale breadcrumb and drops any residual
+        broad/partial CJK UPDATE trigger so a later capable open cannot
+        ``CREATE TRIGGER IF NOT EXISTS`` a gap without a from-scratch rebuild.
+        The caller clears its own search-serving availability flag (message
+        ``_fts_cjk_available`` / session ``_sessions_cjk_available``).
         """
-        self._fts_cjk_available = False
         try:
-            self.set_meta(FTS_CJK_STALE_KEY, "1", cursor=cursor)
+            self.set_meta(stale_key, "1", cursor=cursor)
         except Exception:
             logger.debug(
                 "Could not persist CJK FTS stale breadcrumb",
                 exc_info=True,
             )
         try:
-            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_cjk_update")
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
         except Exception:
             logger.debug(
                 "Could not drop residual CJK UPDATE trigger after quarantine",
-                exc_info=True,
-            )
-
-    def _sessions_cjk_update_trigger_is_narrowed(
-        self, cursor: sqlite3.Cursor
-    ) -> bool:
-        """True when sessions_fts_cjk_update exists with AFTER UPDATE OF."""
-        row = cursor.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'trigger' AND name = ?",
-            ("sessions_fts_cjk_update",),
-        ).fetchone()
-        if not row:
-            return False
-        sql = row[0] if not isinstance(row, sqlite3.Row) else row["sql"]
-        return not self._fts_update_trigger_needs_narrowing(sql)
-
-    def _quarantine_session_cjk_after_update_of_migration(
-        self, cursor: sqlite3.Cursor
-    ) -> None:
-        """Fail-closed after dropping the session-CJK UPDATE during OF
-        migration (issue #26).
-
-        Clears search-serving availability, persists the session-CJK stale
-        breadcrumb, and drops any residual broad/partial session-CJK UPDATE
-        trigger so a later capable open cannot ``CREATE TRIGGER IF NOT
-        EXISTS`` a gap without a from-scratch rebuild.
-        """
-        self._sessions_cjk_available = False
-        try:
-            self.set_meta(FTS_SESSION_CJK_STALE_KEY, "1", cursor=cursor)
-        except Exception:
-            logger.debug(
-                "Could not persist session CJK FTS stale breadcrumb",
-                exc_info=True,
-            )
-        try:
-            cursor.execute("DROP TRIGGER IF EXISTS sessions_fts_cjk_update")
-        except Exception:
-            logger.debug(
-                "Could not drop residual session-CJK UPDATE trigger after "
-                "quarantine",
                 exc_info=True,
             )
 

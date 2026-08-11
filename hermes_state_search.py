@@ -299,35 +299,30 @@ _FTS_MESSAGE_CJK_SPEC = {
 # breadcrumb for the pending-work probe.
 _FTS_REBUILD_LANES: Tuple[Dict[str, Any], ...] = (
     {
-        "name": "messages",
         "spec": _FTS_MESSAGE_SPEC,
         "stale_key": None,
         "status": lambda self: self.fts_rebuild_status(),
         "step": lambda self: self.fts_rebuild_step(),
     },
     {
-        "name": "messages_cjk",
         "spec": _FTS_MESSAGE_CJK_SPEC,
         "stale_key": FTS_CJK_STALE_KEY,
         "status": lambda self: self.fts_cjk_rebuild_status(),
         "step": lambda self: self.fts_cjk_rebuild_step(),
     },
     {
-        "name": "sessions",
         "spec": _FTS_SESSION_SPEC,
         "stale_key": None,
         "status": lambda self: self.fts_session_rebuild_status(),
         "step": lambda self: self.fts_session_rebuild_step(),
     },
     {
-        "name": "sessions_trigram",
         "spec": _FTS_SESSION_TRIGRAM_SPEC,
         "stale_key": FTS_SESSION_TRIGRAM_STALE_KEY,
         "status": lambda self: self.fts_session_trigram_rebuild_status(),
         "step": lambda self: self.fts_session_trigram_rebuild_step(),
     },
     {
-        "name": "sessions_cjk",
         "spec": _FTS_SESSION_CJK_SPEC,
         "stale_key": FTS_SESSION_CJK_STALE_KEY,
         "status": lambda self: self.fts_session_cjk_rebuild_status(),
@@ -1305,10 +1300,16 @@ class SessionSearchMixin:
         """
         def _stage(conn):
             # Message-scoped teardown: the demote re-creates the message
-            # schema immediately, so only the message triggers are dropped
-            # here — session metadata triggers keep live-indexing during the
-            # message-layout migration (issue #27).
-            self._drop_message_fts_triggers(conn)
+            # schema immediately, so only the message Unicode/trigram triggers
+            # are dropped here — session metadata triggers keep live-indexing
+            # during the message-layout migration (issue #27).
+            self._drop_fts_triggers(
+                conn,
+                names=(
+                    _fts_descriptor("messages_fts").trigger_names
+                    + _fts_descriptor("messages_fts_trigram").trigger_names
+                ),
+            )
             conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
             had = bool(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
