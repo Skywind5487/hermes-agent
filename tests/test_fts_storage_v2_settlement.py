@@ -24,6 +24,7 @@ from hermes_state_common import (
     FTS_CJK_STALE_KEY,
     FTS_SESSION_CJK_STALE_KEY,
     FTS_SESSION_TRIGRAM_STALE_KEY,
+    SESSIONS_FTS_TRIGRAM_SQL,
 )
 
 
@@ -84,6 +85,17 @@ def _build_unknown_same_name_trigram_db(db_path):
         "CREATE VIRTUAL TABLE sessions_fts_trigram USING fts5(x, "
         "tokenize='unicode61')"
     )
+    conn.commit()
+    conn.close()
+
+
+def _build_legacy_internal_db(db_path, table_ddl):
+    """DB with an internal-content (no ``content=``) FTS virtual table over
+    an EMPTY canonical ``sessions`` table (so no lane stages markers)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    conn.execute(table_ddl)
     conn.commit()
     conn.close()
 
@@ -518,4 +530,219 @@ def test_reintroduced_blocker_withdraws_stale_v2_claim(tmp_path):
         assert d2.fts_optimize_available() is False
     finally:
         d2.close()
+
+
+# ── Structural refusal branches (review-round pin) ────────────────────────
+# The refusal table's schema-identity branches — legacy/internal shapes,
+# orphan-empty targets, and #30 fail-closed trigram ownership — were
+# implemented but not directly pinned. Each test below constructs the
+# minimal durable/schema state and asserts the evaluator's exact blocker.
+
+def _clear_session_metadata_markers(d):
+    """Drop the Unicode + trigram session H/P markers so earlier marker-loop
+    blockers cannot shadow a structural branch under test."""
+    d._conn.execute(
+        "DELETE FROM state_meta WHERE key IN "
+        "('fts_session_rebuild_high_water', 'fts_session_rebuild_progress', "
+        " 'fts_session_trigram_rebuild_high_water', "
+        " 'fts_session_trigram_rebuild_progress')"
+    )
+    d._conn.commit()
+
+
+def test_session_unicode_legacy_blocks(tmp_path, monkeypatch):
+    """Pre-#25 internal-content ``sessions_fts`` fails closed: v2 refused."""
+    db_path = tmp_path / "legacy.db"
+    _build_legacy_internal_db(
+        db_path, "CREATE VIRTUAL TABLE sessions_fts USING fts5(title)"
+    )
+    # Preserve the legacy shape: the normal ensure path would convert it.
+    monkeypatch.setattr(
+        SessionDB, "_ensure_sessions_fts_schema", lambda self, cursor: False
+    )
+    d = SessionDB(db_path=db_path)
+    try:
+        assert _blocker(d) == ("session_unicode_legacy", True)
+        assert d.get_meta("fts_storage_version") is None
+    finally:
+        d.close()
+
+
+def test_session_unicode_orphan_empty_blocks(tmp_path):
+    """External ``sessions_fts`` empty over populated sessions with no claim
+    (crash window) blocks v2."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=4)
+    d = SessionDB(db_path=db_path)
+    try:
+        _clear_session_metadata_markers(d)
+        assert _blocker(d) == ("session_unicode_orphan_empty", True)
+    finally:
+        d.close()
+
+
+def test_session_cjk_legacy_blocks(tmp_path, monkeypatch):
+    """Pre-#26 internal-content ``sessions_fts_cjk`` fails closed even when
+    this host cannot load the cjk tokenizer."""
+    db_path = tmp_path / "legacy-cjk.db"
+    _build_legacy_internal_db(
+        db_path, "CREATE VIRTUAL TABLE sessions_fts_cjk USING fts5(title)"
+    )
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "absent-cjk.so"))
+    d = SessionDB(db_path=db_path)
+    try:
+        assert not d._fts_cjk_loaded
+        assert _blocker(d) == ("session_cjk_legacy", False)
+    finally:
+        d.close()
+
+
+def test_session_cjk_orphan_empty_blocks(tmp_path, monkeypatch):
+    """External ``sessions_fts_cjk`` empty over populated sessions, no claim
+    — blocks even on a cjk-incapable host."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=4)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE VIRTUAL TABLE sessions_fts_cjk USING fts5("
+        "title, id, display_name, content='sessions', content_rowid='row_id')"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "absent-cjk.so"))
+    d = SessionDB(db_path=db_path)
+    try:
+        # Backfill the Unicode lane so it cannot orphan-block first, then
+        # drop the trigram markers so the marker loop cannot block first.
+        while d.fts_session_rebuild_step():
+            pass
+        _clear_session_metadata_markers(d)
+        assert _blocker(d) == ("session_cjk_orphan_empty", False)
+    finally:
+        d.close()
+
+
+def test_message_cjk_orphan_empty_blocks(tmp_path, monkeypatch):
+    """External ``messages_fts_cjk`` empty over populated non-tool messages
+    with no claim blocks v2 even on a cjk-incapable host."""
+    db_path = tmp_path / "s.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 's1', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "INSERT INTO messages (session_id, timestamp, role, content) "
+        "VALUES ('s1', ?, 'user', 'hello')",
+        (t0 + 1,),
+    )
+    conn.executescript("""
+        CREATE VIEW messages_fts_cjk_src AS
+        SELECT id, role, content, tool_name, tool_calls FROM messages
+        WHERE role <> 'tool';
+        CREATE VIRTUAL TABLE messages_fts_cjk USING fts5(
+            content, tool_name, tool_calls,
+            content='messages_fts_cjk_src', content_rowid='id'
+        );
+    """)
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "absent-cjk.so"))
+    d = SessionDB(db_path=db_path)
+    try:
+        # The 1 session staged Unicode/trigram markers — clear them so the
+        # message-CJK structural branch is the first blocker.
+        _clear_session_metadata_markers(d)
+        assert _blocker(d) == ("message_cjk_orphan_empty", False)
+    finally:
+        d.close()
+
+
+def test_session_trigram_namespace_foreign_blocks(tmp_path):
+    """A foreign same-name trigger occupant fails closed (v2 refused, no
+    mutation)."""
+    db_path = tmp_path / "f.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    conn.executescript(SESSIONS_FTS_TRIGRAM_SQL)
+    for name in (
+        "sessions_fts_trigram_insert",
+        "sessions_fts_trigram_delete",
+        "sessions_fts_trigram_update_before",
+        "sessions_fts_trigram_update_after",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    conn.execute(
+        "CREATE TRIGGER sessions_fts_trigram_insert AFTER INSERT ON messages "
+        "BEGIN SELECT 1; END"
+    )
+    conn.commit()
+    conn.close()
+    d = SessionDB(db_path=db_path)
+    try:
+        assert _blocker(d) == ("session_trigram_namespace_foreign", False)
+        assert d.get_meta("fts_storage_version") is None
+    finally:
+        d.close()
+
+
+def test_session_trigram_source_collision_blocks(tmp_path):
+    """The derived source name occupied by a non-canonical object (a plain
+    table) with no root fails closed."""
+    db_path = tmp_path / "sc.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    conn.execute("CREATE TABLE sessions_fts_trigram_src (x)")
+    conn.commit()
+    conn.close()
+    d = SessionDB(db_path=db_path)
+    try:
+        assert _blocker(d) == ("session_trigram_source_collision", False)
+    finally:
+        d.close()
+
+
+def test_session_trigram_trigger_incomplete_blocks(tmp_path):
+    """A modern root with an incomplete exact trigger set (no stale breadcrumb)
+    fails closed — v2 refused, not silently repaired."""
+    db_path = tmp_path / "t.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    conn.executescript(SESSIONS_FTS_TRIGRAM_SQL)
+    for name in (
+        "sessions_fts_trigram_update_before",
+        "sessions_fts_trigram_update_after",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    conn.commit()
+    conn.close()
+    d = SessionDB(db_path=db_path)
+    try:
+        assert _blocker(d) == ("session_trigram_trigger_incomplete", False)
+    finally:
+        d.close()
+
+
+def test_session_trigram_orphan_empty_blocks(tmp_path):
+    """Modern session trigram target empty over populated derived source with
+    no claim (claim-loss crash window) blocks v2."""
+    db_path = tmp_path / "o.db"
+    _build_populated_sessions_db(db_path, n=6)
+    d = SessionDB(db_path=db_path)
+    try:
+        # Backfill the Unicode lane so it cannot orphan-block first, then
+        # drop the trigram claim over the empty trigram index (claim-loss).
+        while d.fts_session_rebuild_step():
+            pass
+        _clear_session_metadata_markers(d)
+        assert _blocker(d) == ("session_trigram_orphan_empty", True)
+    finally:
+        d.close()
 
