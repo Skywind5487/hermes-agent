@@ -79,10 +79,27 @@ Findings addressed from the first `/code-review`:
   capability attrs are read directly (they are always initialized in
   `SessionDB.__init__`).
 
+### Review round 3 (2026-08-12) — P2: actionability over the whole blocker set
+
+`fts_optimize_available()` must answer "is ANY blocker actionable on this
+host", not "is the FIRST blocker actionable": the shared worker skips lanes
+it cannot operate and keeps going, so an earlier incapable blocker (e.g.
+message-CJK on a cjk-less host) used to hide a later runnable lane. The
+evaluator is now a generator, `_fts_storage_v2_blockers(conn)`, that yields
+EVERY blocker in order; `_fts_storage_v2_blocker()` keeps its first-blocker
+contract for settlement/refusal, while `fts_optimize_available()` computes
+`ANY(actionable)` across the whole set. The refusal inventory stays
+single-source — no second hard-coded list was reintroduced. Two tests pin
+it: a mixed-capability case (non-actionable message-CJK first, actionable
+session-Unicode after -> `fts_optimize_available()` True, and optimize
+progresses the session lane while message-CJK stays) and an
+only-non-actionable case (-> False).
+
 ## Files
 
 - `hermes_state_common.py` — `FTS_STORAGE_VERSION = 2`.
-- `hermes_state_search.py` — `_fts_storage_v2_blocker`, lane helpers
+- `hermes_state_search.py` — `_fts_storage_v2_blockers` (all blockers),
+  `_fts_storage_v2_blocker` (first blocker), lane helpers
   (`_fts_lane_durable_keys` / `_fts_meta_has_any` / `_fts_lane_actionable`),
   `_fts_session_trigram_settlement_blocker`,
   `_fts_storage_v2_withdraw_claim`, and the three consumers
@@ -90,8 +107,8 @@ Findings addressed from the first `/code-review`:
 - `hermes_state_schema.py` — startup stamp moved after all FTS/session
   ensure paths; withdraws a stale claim when blocked.
 - `tests/test_fts_storage_v2_settlement.py` — refusal matrix, startup +
-  interruption/reopen, six-index acceptance matrix, structural-branch pins
-  (33 tests).
+  interruption/reopen, six-index acceptance matrix, structural-branch pins,
+  mixed-capability actionability (35 tests).
 
 ## Validation
 
@@ -107,7 +124,7 @@ uvx ruff check hermes_state_common.py hermes_state_schema.py \
   hermes_state_search.py tests/test_fts_storage_v2_settlement.py
 ```
 
-Focused suite: 369 passed / 43 skipped (CJK-tokenizer capability skips) on
+Focused suite: 371 passed / 43 skipped (CJK-tokenizer capability skips) on
 this host (incl. the 33-test settlement file). ruff clean.
 
 ## Boundary / non-goals

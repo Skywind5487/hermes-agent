@@ -14,7 +14,7 @@ import os
 import re
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, Iterator, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
@@ -462,40 +462,43 @@ class SessionSearchMixin:
         completeness (issue #31)."""
         return bool(lane["spec"]["available"](self))
 
-    def _fts_storage_v2_blocker(self, conn) -> Optional[Tuple[str, bool]]:
-        """Return the first storage-v2 settlement blocker ``(reason,
-        actionable_here)``, or None when the database is acceptance-complete
-        for ``fts_storage_version = 2`` (issue #31).
+    def _fts_storage_v2_blockers(self, conn) -> Iterator[Tuple[str, bool]]:
+        """Yield EVERY storage-v2 settlement blocker ``(reason,
+        actionable_here)`` in evaluation order (issue #31).
 
         SELECT-only and durable/schema-aware: every check reads
         ``sqlite_master`` or ``state_meta`` — never process-local serving
-        booleans as evidence of DB completeness. None is the single proof
-        that v2 may be claimed; the ``actionable_here`` flag only
-        distinguishes "work this process can finish via optimize-storage"
-        from "blocked until a capable/external resolution exists". The SAME
-        evaluator drives startup auto-settlement, ``fts_optimize_available()``,
-        the foreground pre-VACUUM refusal, and the final transactional
-        stamp, so no completion decision can diverge.
+        booleans as evidence of DB completeness. ``actionable_here`` says
+        whether THIS process can resolve that one blocker via
+        optimize-storage; because the shared worker skips lanes it cannot
+        operate and keeps going, the global "is there runnable work" question
+        is ANY(actionable) across the whole set — never the first blocker's
+        flag alone.
 
         ``conn`` must be a connection the caller already holds under a
         suitable lock/read context (this helper does NOT take ``self._lock``,
         which is non-reentrant).
         """
         if not getattr(self, "_fts_enabled", False):
-            return ("fts5_unavailable", False)
+            yield ("fts5_unavailable", False)
+            return
 
         # ── Required message base ──
         if self._db_has_legacy_inline_fts(conn):
-            return ("legacy_inline", True)
+            yield ("legacy_inline", True)
+            return
         if self._has_fts_trash(conn):
-            return ("teardown_incomplete", True)
+            yield ("teardown_incomplete", True)
+            return
         if self._fts_external_index_empty_with_messages(conn):
-            return ("backfill_incomplete", True)
+            yield ("backfill_incomplete", True)
+            return
         if self._fts_meta_has_any(
             conn,
             (_FTS_MESSAGE_SPEC["high_water_key"], _FTS_MESSAGE_SPEC["progress_key"]),
         ):
-            return ("backfill_incomplete", True)
+            yield ("backfill_incomplete", True)
+            return
 
         # ── Optional / session deferred lanes: durable H/P/stale state ──
         # Any H, P, or stale breadcrumb is non-settled durable state — even
@@ -503,7 +506,7 @@ class SessionSearchMixin:
         # evidence of completion). Membership is ``_FTS_REBUILD_LANES``.
         for lane in _FTS_REBUILD_LANES[1:]:
             if self._fts_meta_has_any(conn, self._fts_lane_durable_keys(lane)):
-                return (lane["settlement_reason"], self._fts_lane_actionable(lane))
+                yield (lane["settlement_reason"], self._fts_lane_actionable(lane))
 
         # ── Optional / session structural (schema-identity) states ──
         # message CJK orphan-empty (optional; an absent table is valid
@@ -511,22 +514,46 @@ class SessionSearchMixin:
         if self._fts_external_index_empty_with_source(
             conn, "messages_fts_cjk_src", "messages_fts_cjk"
         ):
-            return ("message_cjk_orphan_empty", self._fts_cjk_loaded)
+            yield ("message_cjk_orphan_empty", self._fts_cjk_loaded)
         # session Unicode legacy/internal shape or orphan-empty.
         if self._db_has_internal_content_sessions_fts(conn):
-            return ("session_unicode_legacy", True)
+            yield ("session_unicode_legacy", True)
         if self._fts_external_index_empty_with_source(
             conn, "sessions", "sessions_fts"
         ):
-            return ("session_unicode_orphan_empty", True)
+            yield ("session_unicode_orphan_empty", True)
         # session CJK legacy/internal shape or orphan-empty (optional).
         if self._db_has_internal_content_sessions_fts_cjk(conn):
-            return ("session_cjk_legacy", self._sessions_cjk_worker_operable)
+            yield ("session_cjk_legacy", self._sessions_cjk_worker_operable)
         if self._fts_external_index_empty_with_source(
             conn, "sessions", "sessions_fts_cjk"
         ):
-            return ("session_cjk_orphan_empty", self._sessions_cjk_worker_operable)
-        return self._fts_session_trigram_settlement_blocker(conn)
+            yield ("session_cjk_orphan_empty", self._sessions_cjk_worker_operable)
+        # session trigram structural (#30 fail-closed).
+        trigram = self._fts_session_trigram_settlement_blocker(conn)
+        if trigram is not None:
+            yield trigram
+
+    def _fts_storage_v2_blocker(self, conn) -> Optional[Tuple[str, bool]]:
+        """Return the FIRST storage-v2 settlement blocker ``(reason,
+        actionable_here)``, or None when the database is acceptance-complete
+        for ``fts_storage_version = 2`` (issue #31).
+
+        None is the single proof that v2 may be claimed. The returned
+        ``actionable_here`` describes ONLY this first blocker; callers that
+        need "is any work runnable on this host" must scan the whole blocker
+        set via ``_fts_storage_v2_blockers`` (e.g. ``fts_optimize_available``),
+        because an earlier incapable blocker can shadow a later actionable one
+        while the shared worker still makes progress. The SAME evaluator
+        drives startup auto-settlement, the foreground pre-VACUUM refusal,
+        and the final transactional stamp, so no completion decision can
+        diverge.
+
+        ``conn`` must be a connection the caller already holds under a
+        suitable lock/read context (this helper does NOT take ``self._lock``,
+        which is non-reentrant).
+        """
+        return next(self._fts_storage_v2_blockers(conn), None)
 
     def _fts_session_trigram_settlement_blocker(
         self, conn
@@ -1357,10 +1384,10 @@ class SessionSearchMixin:
         if not self._fts_enabled or self.read_only:
             return False
         with self._lock:
-            blocker = self._fts_storage_v2_blocker(self._conn)
-            if blocker is None:
-                return False
-            return blocker[1]
+            return any(
+                actionable
+                for _reason, actionable in self._fts_storage_v2_blockers(self._conn)
+            )
 
     def _demote_legacy_fts_to_trash(self) -> int:
         """Demote the legacy inline FTS vtables and stage their shadow tables
