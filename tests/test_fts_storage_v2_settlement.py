@@ -746,3 +746,52 @@ def test_session_trigram_orphan_empty_blocks(tmp_path):
     finally:
         d.close()
 
+
+# ── Mixed-capability actionability (review round 3 / P2) ──────────────────
+# ``fts_optimize_available()`` must answer "is ANY blocker actionable on this
+# host", not "is the FIRST blocker actionable": the shared worker skips lanes
+# it cannot operate and keeps going, so an earlier incapable blocker (e.g.
+# message-CJK on a cjk-less host) must not hide a later runnable lane.
+
+def test_mixed_blocker_optimize_available_sees_any_actionable(
+    tmp_path, monkeypatch
+):
+    """#31 P2 regression: a non-actionable message-CJK blocker first + an
+    actionable session-Unicode blocker after. Storage v2 stays blocked, but
+    ``fts_optimize_available()`` must report True because the worker can
+    progress the session lane."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=4)
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "absent-cjk.so"))
+    d = SessionDB(db_path=db_path)
+    try:
+        assert not d._fts_cjk_loaded
+        # Plant a non-actionable message-CJK claim ahead of the actionable
+        # session-Unicode claim that open already staged.
+        _plant(d, fts_cjk_rebuild_high_water=4, fts_cjk_rebuild_progress=0)
+        assert _blocker(d) == ("message_cjk_incomplete", False)
+        # v2 is still blocked, but SOME work is runnable on this host.
+        assert d.fts_optimize_available() is True
+        # The worker progresses the actionable session lane while the
+        # message-CJK lane stays pending on this incapable host.
+        result = d.optimize_fts_storage(vacuum=False)
+        assert result["ok"] is False
+        assert result.get("reason") == "message_cjk_incomplete"
+        assert d.get_meta("fts_session_rebuild_high_water") is None
+        assert d.get_meta("fts_cjk_rebuild_high_water") is not None
+    finally:
+        d.close()
+
+
+def test_only_non_actionable_blocker_reports_no_work(tmp_path, monkeypatch):
+    """With ONLY a non-actionable blocker (message-CJK on an incapable host),
+    ``fts_optimize_available()`` stays False — no runnable work exists."""
+    d = _cjk_incapable_db(tmp_path, monkeypatch)
+    try:
+        assert not d._fts_cjk_loaded
+        _plant(d, fts_cjk_rebuild_high_water=5, fts_cjk_rebuild_progress=0)
+        assert _blocker(d) == ("message_cjk_incomplete", False)
+        assert d.fts_optimize_available() is False
+    finally:
+        d.close()
+
