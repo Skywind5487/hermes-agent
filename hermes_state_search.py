@@ -296,7 +296,8 @@ _FTS_MESSAGE_CJK_SPEC = {
 # from the ``FTS_INDEXES`` registry: H/P markers and stale breadcrumbs are
 # lane-specific state that lives in the rebuild specs, not in the index
 # descriptor. ``stale_key`` (when present) names the lane's durable stale
-# breadcrumb for the pending-work probe.
+# breadcrumb for the pending-work probe; ``settlement_reason`` is the
+# storage-v2 refusal label for the lane (issue #31).
 _FTS_REBUILD_LANES: Tuple[Dict[str, Any], ...] = (
     {
         "spec": _FTS_MESSAGE_SPEC,
@@ -307,40 +308,32 @@ _FTS_REBUILD_LANES: Tuple[Dict[str, Any], ...] = (
     {
         "spec": _FTS_MESSAGE_CJK_SPEC,
         "stale_key": FTS_CJK_STALE_KEY,
+        "settlement_reason": "message_cjk_incomplete",
         "status": lambda self: self.fts_cjk_rebuild_status(),
         "step": lambda self: self.fts_cjk_rebuild_step(),
     },
     {
         "spec": _FTS_SESSION_SPEC,
         "stale_key": None,
+        "settlement_reason": "session_unicode_incomplete",
         "status": lambda self: self.fts_session_rebuild_status(),
         "step": lambda self: self.fts_session_rebuild_step(),
     },
     {
         "spec": _FTS_SESSION_TRIGRAM_SPEC,
         "stale_key": FTS_SESSION_TRIGRAM_STALE_KEY,
+        "settlement_reason": "session_trigram_incomplete",
         "status": lambda self: self.fts_session_trigram_rebuild_status(),
         "step": lambda self: self.fts_session_trigram_rebuild_step(),
     },
     {
         "spec": _FTS_SESSION_CJK_SPEC,
         "stale_key": FTS_SESSION_CJK_STALE_KEY,
+        "settlement_reason": "session_cjk_incomplete",
         "status": lambda self: self.fts_session_cjk_rebuild_status(),
         "step": lambda self: self.fts_session_cjk_rebuild_step(),
     },
 )
-
-
-# Storage-v2 settlement reason per deferred rebuild lane (issue #31). Lane
-# membership still comes from ``_FTS_REBUILD_LANES``; this only maps the
-# spec's internal name to the human/CLI reason label (the required message
-# lane is handled separately as ``backfill_incomplete``).
-_FTS_STORAGE_V2_LANE_REASONS = {
-    "messages_cjk": "message_cjk_incomplete",
-    "sessions": "session_unicode_incomplete",
-    "sessions_trigram": "session_trigram_incomplete",
-    "sessions_cjk": "session_cjk_incomplete",
-}
 
 
 class SessionSearchMixin:
@@ -499,7 +492,8 @@ class SessionSearchMixin:
         if self._fts_external_index_empty_with_messages(conn):
             return ("backfill_incomplete", True)
         if self._fts_meta_has_any(
-            conn, ("fts_rebuild_high_water", "fts_rebuild_progress")
+            conn,
+            (_FTS_MESSAGE_SPEC["high_water_key"], _FTS_MESSAGE_SPEC["progress_key"]),
         ):
             return ("backfill_incomplete", True)
 
@@ -508,12 +502,8 @@ class SessionSearchMixin:
         # on a host that cannot operate the lane (missing capability is never
         # evidence of completion). Membership is ``_FTS_REBUILD_LANES``.
         for lane in _FTS_REBUILD_LANES[1:]:
-            spec = lane["spec"]
             if self._fts_meta_has_any(conn, self._fts_lane_durable_keys(lane)):
-                return (
-                    _FTS_STORAGE_V2_LANE_REASONS[spec["name"]],
-                    self._fts_lane_actionable(lane),
-                )
+                return (lane["settlement_reason"], self._fts_lane_actionable(lane))
 
         # ── Optional / session structural (schema-identity) states ──
         # message CJK orphan-empty (optional; an absent table is valid
@@ -521,7 +511,7 @@ class SessionSearchMixin:
         if self._fts_external_index_empty_with_source(
             conn, "messages_fts_cjk_src", "messages_fts_cjk"
         ):
-            return ("message_cjk_orphan_empty", getattr(self, "_fts_cjk_loaded", False))
+            return ("message_cjk_orphan_empty", self._fts_cjk_loaded)
         # session Unicode legacy/internal shape or orphan-empty.
         if self._db_has_internal_content_sessions_fts(conn):
             return ("session_unicode_legacy", True)
@@ -531,17 +521,11 @@ class SessionSearchMixin:
             return ("session_unicode_orphan_empty", True)
         # session CJK legacy/internal shape or orphan-empty (optional).
         if self._db_has_internal_content_sessions_fts_cjk(conn):
-            return (
-                "session_cjk_legacy",
-                getattr(self, "_sessions_cjk_worker_operable", False),
-            )
+            return ("session_cjk_legacy", self._sessions_cjk_worker_operable)
         if self._fts_external_index_empty_with_source(
             conn, "sessions", "sessions_fts_cjk"
         ):
-            return (
-                "session_cjk_orphan_empty",
-                getattr(self, "_sessions_cjk_worker_operable", False),
-            )
+            return ("session_cjk_orphan_empty", self._sessions_cjk_worker_operable)
         return self._fts_session_trigram_settlement_blocker(conn)
 
     def _fts_session_trigram_settlement_blocker(
@@ -571,11 +555,16 @@ class SessionSearchMixin:
         if self._fts_external_index_empty_with_source(
             conn, "sessions_fts_trigram_src", "sessions_fts_trigram"
         ):
-            return (
-                "session_trigram_orphan_empty",
-                getattr(self, "_sessions_trigram_available", False),
-            )
+            return ("session_trigram_orphan_empty", self._sessions_trigram_available)
         return None
+
+    def _fts_storage_v2_withdraw_claim(self, conn) -> None:
+        """Withdraw any stale storage-layout claim (issue #31): a blocker
+        found by the settlement evaluator means the DB is not
+        acceptance-complete, so an existing ``fts_storage_version`` must not
+        keep advertising completion. DML on the caller's connection (a cursor
+        works too)."""
+        conn.execute("DELETE FROM state_meta WHERE key = 'fts_storage_version'")
 
     def _fts_first_pending_lane_status(self) -> Optional[Dict[str, Any]]:
         """First non-None deferred-rebuild status across the ordered lanes
@@ -1579,11 +1568,7 @@ class SessionSearchMixin:
         if blocker is not None:
             # Withdraw any stale layout claim — the DB is not
             # acceptance-complete (issue #31).
-            def _withdraw(conn):
-                conn.execute(
-                    "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
-                )
-            self._execute_write(_withdraw)
+            self._execute_write(self._fts_storage_v2_withdraw_claim)
             logger.warning(
                 "FTS storage optimization did not settle (%s, actionable=%s)",
                 blocker[0], blocker[1],
@@ -1636,9 +1621,7 @@ class SessionSearchMixin:
             if blocker is not None:
                 # Withdraw any stale claim in the same transaction that would
                 # have stamped it (issue #31).
-                conn.execute(
-                    "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
-                )
+                self._fts_storage_v2_withdraw_claim(conn)
                 return blocker[0]
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES ('fts_storage_version', ?) "

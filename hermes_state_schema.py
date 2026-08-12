@@ -1251,31 +1251,33 @@ class SessionSchemaMixin:
             if getattr(self, "_fts_enabled", False):
                 self._migrate_broad_fts_update_triggers(cursor)
 
-            # ── Storage-v2 auto-settlement (issue #31) ─────────────
-            # Runs AFTER every message/session FTS ensure path so the shared
-            # SELECT-only completion evaluator sees the full staged state. A
-            # populated DB's first open therefore does NOT stamp v2 (session
-            # Unicode/CJK/trigram ensure stages durable H/P claims that
-            # remain pending); a fresh/empty or already-settled DB may claim
-            # the current storage layout. The SAME evaluator drives
-            # fts_optimize_available(), the foreground pre-VACUUM refusal,
-            # and the final transactional stamp, so no completion decision
-            # can diverge. schema_version stays independent (decoupled), as
-            # in v23.
-            blocker = self._fts_storage_v2_blocker(cursor)
-            if blocker is None:
-                self.set_meta(
-                    "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
-                )
-            else:
-                # A previously stamped layout claim is now stale (new
-                # incomplete work appeared — e.g. an optional CJK/trigram
-                # index staged on a previously-settled DB). Withdraw it so
-                # no completion can be advertised while work remains
-                # (issue #31).
-                cursor.execute(
-                    "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
-                )
+        # ── Storage-v2 auto-settlement (issue #31) ─────────────────
+        # Runs AFTER every message/session FTS ensure path so the shared
+        # SELECT-only completion evaluator sees the full staged state. A
+        # populated DB's first open therefore does NOT stamp v2 (session
+        # Unicode/CJK/trigram ensure stages durable H/P claims that remain
+        # pending); a fresh/empty or already-settled DB may claim the current
+        # storage layout. The SAME evaluator drives fts_optimize_available(),
+        # the foreground pre-VACUUM refusal, and the final transactional
+        # stamp, so no completion decision can diverge. schema_version stays
+        # independent (decoupled), as in v23.
+        #
+        # Runs unconditionally (not only when FTS5 is available): the
+        # evaluator's own ``_fts_enabled`` guard refuses (and withdraws) a
+        # stale v2 claim on an FTS5-unavailable reopen too, so no layout
+        # claim survives on a host that cannot even run FTS.
+        blocker = self._fts_storage_v2_blocker(cursor)
+        if blocker is None:
+            self.set_meta(
+                "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
+            )
+        else:
+            # A previously stamped layout claim is now stale (new incomplete
+            # work appeared — e.g. an optional CJK/trigram index staged on a
+            # previously-settled DB, or FTS5 unavailable on reopen). Withdraw
+            # it so no completion can be advertised while work remains
+            # (issue #31).
+            self._fts_storage_v2_withdraw_claim(cursor)
 
         self._conn.commit()
 

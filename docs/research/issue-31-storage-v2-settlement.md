@@ -55,25 +55,43 @@ that later stages a new optional CJK/trigram index).
 
 ### Reuse, not reimplementation
 
-- `_FTS_REBUILD_LANES` is the marker/stale membership source for the
-  per-lane H/P/stale loop (one tiny reason-label map added).
+- `_FTS_REBUILD_LANES` is the marker/stale membership source; each lane also
+  carries its own `settlement_reason` label (no parallel reason map to drift
+  or KeyError on a future lane).
 - `_FTS_INDEXES` / #30 ownership classifiers / #76832 claim-before-empty +
   transactional re-check seams are all consumed unchanged.
 - `_fts_lane_pending()` was removed — its only consumer was
   `fts_optimize_available()`, and its combined operability gate is wrong for
   settlement (the evaluator splits "blocked" from "actionable here").
 
+### Review round (2026-08-12)
+
+Findings addressed from the first `/code-review`:
+- All nine structural refusal branches (`*_legacy`, `*_orphan_empty`, trigram
+  `namespace_foreign` / `source_collision` / `trigger_incomplete`) are now
+  directly pinned in `tests/test_fts_storage_v2_settlement.py`.
+- Stale-claim withdrawal extracted into one `_fts_storage_v2_withdraw_claim`
+  helper (three call sites, no scattered `DELETE` literals).
+- Startup settlement now runs unconditionally (outside the `if fts5_available:`
+  gate), so an FTS5-unavailable reopen also withdraws a stale v2 claim via the
+  evaluator's own `fts5_unavailable` guard.
+- Message-lane marker keys derive from `_FTS_MESSAGE_SPEC`; optional
+  capability attrs are read directly (they are always initialized in
+  `SessionDB.__init__`).
+
 ## Files
 
 - `hermes_state_common.py` — `FTS_STORAGE_VERSION = 2`.
 - `hermes_state_search.py` — `_fts_storage_v2_blocker`, lane helpers
   (`_fts_lane_durable_keys` / `_fts_meta_has_any` / `_fts_lane_actionable`),
-  `_fts_session_trigram_settlement_blocker`, and the three consumers
+  `_fts_session_trigram_settlement_blocker`,
+  `_fts_storage_v2_withdraw_claim`, and the three consumers
   (`fts_optimize_available`, pre-VACUUM refusal, `_settle`).
 - `hermes_state_schema.py` — startup stamp moved after all FTS/session
   ensure paths; withdraws a stale claim when blocked.
 - `tests/test_fts_storage_v2_settlement.py` — refusal matrix, startup +
-  interruption/reopen, six-index acceptance matrix (24 tests).
+  interruption/reopen, six-index acceptance matrix, structural-branch pins
+  (33 tests).
 
 ## Validation
 
@@ -89,8 +107,8 @@ uvx ruff check hermes_state_common.py hermes_state_schema.py \
   hermes_state_search.py tests/test_fts_storage_v2_settlement.py
 ```
 
-Focused suite: 375 passed / 43 skipped (CJK-tokenizer capability skips) on
-this host. ruff clean.
+Focused suite: 369 passed / 43 skipped (CJK-tokenizer capability skips) on
+this host (incl. the 33-test settlement file). ruff clean.
 
 ## Boundary / non-goals
 
