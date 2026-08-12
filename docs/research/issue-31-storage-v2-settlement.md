@@ -125,7 +125,7 @@ uvx ruff check hermes_state_common.py hermes_state_schema.py \
 ```
 
 Focused suite: 371 passed / 43 skipped (CJK-tokenizer capability skips) on
-this host (incl. the 33-test settlement file). ruff clean.
+this host (incl. the 35-test settlement file). ruff clean.
 
 ## Boundary / non-goals
 
