@@ -233,8 +233,289 @@ def test_trigram_unknown_same_name_blocks_and_survives_untouched(tmp_path):
     d = SessionDB(db_path=db_path)
     try:
         assert _blocker(d) == ("session_trigram_unknown_same_name", False)
+        assert d.get_meta("fts_storage_version") is None
         assert d.fts_optimize_available() is False
         # Byte/schema-identical: no destructive convergence.
         assert "tokenize='unicode61'" in _trigram_ddl(d)
     finally:
         d.close()
+
+
+# ── Startup auto-settlement + interruption / reopen (commit 3) ────────────
+
+def _build_claim_before_schema_db(db_path, n=3):
+    """DB with ``n`` sessions and a durable session-Unicode H/P claim but NO
+    external FTS table yet (the #76832 claim-before-schema crash window)."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.executemany(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (?, ?, 'cli', ?)",
+        [(i, f"s{i}", t0 + i) for i in range(1, n + 1)],
+    )
+    conn.execute(
+        "INSERT INTO state_meta (key, value) VALUES (?, ?), (?, ?)",
+        ("fts_session_rebuild_high_water", str(n),
+         "fts_session_rebuild_progress", "0"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_populated_first_open_does_not_stamp_v2(tmp_path):
+    """The core #31 startup rule: a populated DB's first open stages session
+    H/P claims and therefore does NOT stamp v2 (work remains)."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=12)
+    d = SessionDB(db_path=db_path)
+    try:
+        assert d.get_meta("fts_session_rebuild_high_water") == "12"
+        assert d.get_meta("fts_storage_version") is None
+        assert d.fts_optimize_available() is True
+    finally:
+        d.close()
+
+
+def test_claim_before_schema_reopen_preserves_claim_and_refuses_v2(tmp_path):
+    """#76832 claim-before-schema: a durable claim committed before the
+    external table existed survives reopen — the claim is preserved, the
+    schema is re-ensured, and v2 stays absent (work remains)."""
+    db_path = tmp_path / "s.db"
+    _build_claim_before_schema_db(db_path, n=3)
+    d = SessionDB(db_path=db_path)
+    try:
+        assert d.get_meta("fts_session_rebuild_high_water") == "3"
+        assert d.get_meta("fts_session_rebuild_progress") == "0"
+        assert d.get_meta("fts_storage_version") is None
+        assert d.fts_optimize_available() is True
+    finally:
+        d.close()
+
+
+def test_reopen_after_partial_backfill_resumes_and_does_not_stamp(tmp_path):
+    """A crash mid-backfill (H/P staged, backfill unfinished): reopen
+    preserves the claim, stays incomplete (no v2), and a re-run settles v2."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=12)
+    d1 = SessionDB(db_path=db_path)
+    try:
+        # Markers staged at open; the process "crashes" before any completion.
+        assert d1.get_meta("fts_session_rebuild_high_water") == "12"
+        assert d1.get_meta("fts_session_rebuild_progress") == "0"
+        assert d1.get_meta("fts_storage_version") is None
+    finally:
+        d1.close()
+
+    d2 = SessionDB(db_path=db_path)
+    try:
+        assert d2.get_meta("fts_session_rebuild_high_water") == "12"
+        assert d2.get_meta("fts_storage_version") is None
+        assert d2.fts_optimize_available() is True
+        result = d2.optimize_fts_storage(vacuum=False)
+        assert result["ok"] is True, result
+        assert d2.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
+    finally:
+        d2.close()
+
+
+def test_h_without_p_repair_keeps_v2_absent_until_rebuild(tmp_path):
+    """H-without-P is non-settled durable state: the shared repair restores
+    P only after a known-empty reset, and v2 stays absent until the rebuild
+    completes."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=5)
+    d = SessionDB(db_path=db_path)
+    try:
+        d.set_meta("fts_rebuild_high_water", "5")
+        assert d.get_meta("fts_rebuild_progress") is None
+        assert d.get_meta("fts_storage_version") is None
+        d._repair_optimize_bookkeeping()
+        assert d.get_meta("fts_rebuild_progress") == "0"
+        assert d.get_meta("fts_storage_version") is None
+        assert _blocker(d)[0] == "backfill_incomplete"
+        assert d.fts_optimize_available() is True
+    finally:
+        d.close()
+
+
+def test_stale_after_healthy_optional_target_blocks_reopen_v2(tmp_path):
+    """A formerly healthy modern trigram target quarantined (stale written,
+    owned triggers dropped) can never be served as complete: reopen refuses
+    v2 until a capable recovery re-establishes and backfills the lane."""
+    db_path = tmp_path / "p1.db"
+    _build_populated_sessions_db(db_path, n=2)
+    d1 = SessionDB(db_path=db_path)
+    try:
+        assert d1.get_meta("fts_session_trigram_rebuild_high_water") == "2"
+    finally:
+        d1.close()
+    # Simulate the tokenizer-less peer's quarantine side effects.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+        "ON CONFLICT(key) DO UPDATE SET value = '1'",
+        (FTS_SESSION_TRIGRAM_STALE_KEY,),
+    )
+    for name in (
+        "sessions_fts_trigram_insert",
+        "sessions_fts_trigram_delete",
+        "sessions_fts_trigram_update_before",
+        "sessions_fts_trigram_update_after",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    conn.commit()
+    conn.close()
+    # Capable reopen recovers the stale target from canonical rows — but the
+    # lane is still pending, so v2 must remain absent.
+    d2 = SessionDB(db_path=db_path)
+    try:
+        assert d2.get_meta("fts_storage_version") is None
+        assert d2.get_meta("fts_session_trigram_rebuild_high_water") == "2"
+        assert d2.fts_optimize_available() is True
+    finally:
+        d2.close()
+
+
+def test_final_transactional_recheck_refuses_race_before_stamp(
+    tmp_path, monkeypatch
+):
+    """#76832 race rule: a blocker that appears after the pre-VACUUM
+    preflight (a concurrent writer) must still refuse the stamp inside the
+    final write transaction that would have written it."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=3)
+    d = SessionDB(db_path=db_path)
+    # Keep a real durable blocker alive through the backfill pass (an
+    # unfinishable session lane — the same shape as the existing
+    # settle-refusal test), while the pre-VACUUM preflight pretends complete.
+    d.fts_session_rebuild_step = lambda: False  # type: ignore[method-assign]
+    calls = {"n": 0}
+    real = d._fts_storage_v2_blocker
+
+    def _race(conn):
+        calls["n"] += 1
+        # First call is the pre-VACUUM preflight — pretend it saw complete (a
+        # concurrent writer seeds work just afterwards). The final
+        # transactional re-check must still see the real durable state.
+        if calls["n"] == 1:
+            return None
+        return real(conn)
+
+    monkeypatch.setattr(d, "_fts_storage_v2_blocker", _race)
+    try:
+        result = d.optimize_fts_storage(vacuum=False)
+        assert result["ok"] is False
+        assert result.get("reason") == "session_unicode_incomplete"
+        assert d.get_meta("fts_storage_version") is None
+    finally:
+        d.close()
+
+
+def test_completed_v2_reopen_creates_no_new_work(tmp_path):
+    """A settled v2 DB reopened stays settled: no new H/P/stale markers, no
+    rebuild work advertised, and the claim persists."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=12)
+    d1 = SessionDB(db_path=db_path)
+    try:
+        result = d1.optimize_fts_storage(vacuum=False)
+        assert result["ok"] is True, result
+        assert d1.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
+    finally:
+        d1.close()
+
+    d2 = SessionDB(db_path=db_path)
+    try:
+        assert d2.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
+        assert d2.fts_optimize_available() is False
+        assert _blocker(d2) is None
+        # No durable markers were recreated on reopen.
+        for key in (
+            "fts_rebuild_high_water", "fts_rebuild_progress",
+            "fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress",
+            FTS_CJK_STALE_KEY,
+            "fts_session_rebuild_high_water", "fts_session_rebuild_progress",
+            "fts_session_trigram_rebuild_high_water",
+            "fts_session_trigram_rebuild_progress",
+            FTS_SESSION_TRIGRAM_STALE_KEY,
+            "fts_session_cjk_rebuild_high_water",
+            "fts_session_cjk_rebuild_progress",
+            FTS_SESSION_CJK_STALE_KEY,
+        ):
+            assert d2.get_meta(key) is None, key
+    finally:
+        d2.close()
+
+
+# ── Six-index acceptance matrix (commit 4) ────────────────────────────────
+
+def test_complete_six_index_settlement_stamps_v2(tmp_path):
+    """Full acceptance: with every required + applicable lane complete,
+    optimize stamps v2, no work remains, and search behavior is unchanged."""
+    db_path = tmp_path / "s.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(SCHEMA_SQL)
+    t0 = time.time()
+    conn.execute(
+        "INSERT INTO sessions (row_id, id, source, started_at) "
+        "VALUES (1, 's1', 'cli', ?)",
+        (t0,),
+    )
+    conn.execute(
+        "INSERT INTO messages (session_id, timestamp, role, content) "
+        "VALUES ('s1', ?, 'user', 'needle message')",
+        (t0 + 1,),
+    )
+    conn.commit()
+    conn.close()
+
+    d = SessionDB(db_path=db_path)
+    try:
+        # Populated first open: not stamped, work advertised.
+        assert d.get_meta("fts_storage_version") is None
+        assert d.fts_optimize_available() is True
+        result = d.optimize_fts_storage(vacuum=False)
+        assert result["ok"] is True, result
+        assert d.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
+        assert d.fts_optimize_available() is False
+        assert _blocker(d) is None
+        # No search behavior change.
+        assert len(d.search_messages("needle")) == 1
+    finally:
+        d.close()
+
+
+def test_reintroduced_blocker_withdraws_stale_v2_claim(tmp_path):
+    """#31 invariant: a v2 claim is never left stale — reintroducing a
+    blocker (a fresh session-lane claim on a settled DB) withdraws v2 on the
+    next settlement evaluation, and re-completing the lane re-earns it."""
+    db_path = tmp_path / "s.db"
+    _build_populated_sessions_db(db_path, n=4)
+    d1 = SessionDB(db_path=db_path)
+    try:
+        result = d1.optimize_fts_storage(vacuum=False)
+        assert result["ok"] is True, result
+        assert d1.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
+        # A concurrent writer seeds fresh trigram work on the settled DB.
+        d1.set_meta("fts_session_trigram_rebuild_high_water", "999")
+        d1.set_meta("fts_session_trigram_rebuild_progress", "0")
+        assert _blocker(d1) == ("session_trigram_incomplete", True)
+    finally:
+        d1.close()
+
+    d2 = SessionDB(db_path=db_path)
+    try:
+        # Reopen startup settlement withdrew the now-stale v2 claim.
+        assert d2.get_meta("fts_storage_version") is None
+        assert d2.fts_optimize_available() is True
+        # Re-completing the lane re-earns v2.
+        result = d2.optimize_fts_storage(vacuum=False)
+        assert result["ok"] is True, result
+        assert d2.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
+        assert d2.fts_optimize_available() is False
+    finally:
+        d2.close()
+
