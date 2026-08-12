@@ -10,76 +10,10 @@ Research artifact: `docs/research/issue-35-unified-fts-lifecycle.md` (PR #75)
 > search-routing or migration-state framework, and storage-v2 settlement
 > stays with #31 (no `FTS_STORAGE_VERSION` change here).
 
-> **Review round 1 (2026-08-11, ponytail + code-review, issue comment
-> `5253715082`, fixed in `0400c66f0`).** All over-engineering/standards
-> findings were within #27 scope and implemented: removed the never-read
-> `"name"` key from `_FTS_REBUILD_LANES`; merged `_drop_fts_triggers` /
-> `_drop_message_fts_triggers` into `_drop_fts_triggers(cursor, names=None)`
-> (demote passes the message subset); parameterized the message/session CJK
-> UPDATE-narrowing + quarantine helpers by `(trigger_name, stale_key)`
-> (caller clears its own availability flag); deleted the now-dead
-> `_FTS_TRIGGERS` membership tuple (+ its back-compat re-export) per research
-> §4.1 Q2. Net −35 lines. Kept (spec-required, not a finding to fix): the
-> spec `"descriptor"` / `"trigram_descriptor"` keys — they are the explicit
-> "specs reference authoritative descriptors" seam from the research and the
-> drift-prevention test anchor. Validation after the round: 149 + 187 focused
-> tests green, ruff clean.
-
-> **Review round 2 (2026-08-11, issue comment `5254482988`, fixed in
-> `933a2ce86`).** One P1 (merge blocker), one P2, one S1.
->
-> **P1 — registry membership ≠ ownership in offline/global paths.** The
-> module-level health read probe (`_db_opens_cleanly`), repair strategy 0,
-> `_owned_fts_object_names`, and `_drop_fts_triggers` all touched
-> `sessions_fts_trigram` without #30 classification. A foreign same-name FTS5
-> table can legally accept `'rebuild'`, so this was a real mutation — #30
-> explicitly requires leaving foreign same-name schema untouched. Fix: reuse
-> the existing #30 classifiers via a thin composition
-> `SessionDB._sessions_trigram_owned` (root must classify as canonical modern
-> trigram **and** the trigger namespace must have no foreign occupant; a
-> missing owned trigger does not disqualify). Applied as the gate in all four
-> paths; `_drop_fts_triggers` additionally gates per-name via
-> `_sessions_trigram_trigger_status` (only `exact_modern` trigram triggers are
-> ever dropped). No new abstraction, no new state.
->
-> **P2 — read-only CJK worker flag.** The mode=ro `SessionDB` set
-> `_sessions_cjk_worker_operable = load_fts5_cjk_extension(...)`, publishing a
-> read-only connection as a mutating worker. The load result is now a local
-> used only for search-serving availability; the worker flag stays `False` on
-> read-only.
->
-> **S1 — real mixed-DDL ownership fixtures.** The ownership-boundary test
-> monkeypatched `_sessions_trigram_modern_definition_matches = False` (only
-> covered "root is foreign"). Replaced with real DDL fixtures: a foreign
-> (uncompacted) `sessions_fts_trigram_src` VIEW and foreign same-name trigger
-> occupants on a canonical root/source namespace. New tests assert foreign
-> objects stay byte/DDL-identical through `_drop_owned_fts_derived_schema` and
-> `_drop_fts_triggers`, and that offline repair **fails closed** — it never
-> reports success while foreign-gated corruption survives (a
-> `PRAGMA integrity_check` premise correction: the read probe cannot be
-> isolated via `_db_opens_cleanly is None` because integrity_check already
-> catches corrupt `_data`; the gate is pinned end-to-end via the repair
-> path). Validation after the round: registry + trigram/CJK + repair +
-> narrowing suites 116 passed / 29 skipped, `test_hermes_state.py` 178 passed,
-> ruff clean.
-
-> **Review round 3 (2026-08-12, issue comment `5260385052`, fixed in
-> `ed5ab2e8e`).** One P1 — a sibling path of the R2 ownership gate.
-> Read-only discovery classified `sessions_fts_trigram` with
-> `_classify_sessions_fts_trigram == "modern_trigram"` only (root + derived
-> source VIEW), skipping the trigger namespace. A canonical root/source with a
-> foreign same-name trigger occupant could then publish
-> `_sessions_trigram_available = True` on a mode=ro connection — serving an
-> index whose live-maintenance contract is no longer trusted. Fix: read-only
-> discovery now uses `_sessions_trigram_owned()` (the R2 composition; no new
-> abstraction), so a foreign occupant anywhere in root / source VIEW / trigger
-> namespace fails closed. Tests: replaced the monkeypatched
-> `test_read_only_unknown_trigram_fail_closed` (classifier mock) with real
-> mixed-DDL read-only fixtures — foreign trigger occupant and foreign source
-> VIEW both assert `_sessions_trigram_available is False`; the owned-serving
-> case stays pinned by `test_read_only_discovers_session_unicode_and_trigram`.
-> Validation: registry + trigram/CJK + repair + narrowing suites
-> 117 passed / 29 skipped, `test_hermes_state.py` 178 passed, ruff clean.
+> Review history (full detail lives in the issue comments + fix commits):
+> - R1 ponytail + code-review (`5253715082`, fixed `0400c66f0`) — over-engineering/standards cleanups, net −35 lines.
+> - R2 (`5254482988`, fixed `933a2ce86`) — ownership gate reused in offline/global paths (P1), read-only CJK worker flag (P2), real mixed-DDL fixtures (S1).
+> - R3 (`5260385052`, fixed `ed5ab2e8e`) — read-only trigram discovery gates on full #30 namespace ownership.
 
 ## The six authoritative members
 

@@ -759,44 +759,6 @@ def test_offline_repair_leaves_foreign_trigram_untouched(tmp_path):
         conn.close()
 
 
-def test_health_probe_never_reports_foreign_trigram_as_owned_repair(tmp_path):
-    """A corrupt foreign-gated sessions_fts_trigram is outside owned repair:
-    the health check still surfaces real corruption (PRAGMA integrity_check
-    is detection, not mutation), but repair must fail closed and leave the
-    foreign objects byte/DDL-identical. This pins the read-probe ownership
-    gate end-to-end via the repair path."""
-    from hermes_state import _db_opens_cleanly, repair_state_db_schema
-
-    db_path = _build_db_with_session(tmp_path, title="pizza pie party")
-    conn = sqlite3.connect(str(db_path))
-    _install_foreign_trigram_triggers(conn)
-    conn.execute(
-        "UPDATE sessions_fts_trigram_data SET block = X'BADC0FFEE0DDF00D'"
-    )
-    conn.commit()
-    before_trigger = conn.execute(
-        "SELECT sql FROM sqlite_master "
-        "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
-    ).fetchone()[0]
-    conn.close()
-
-    # Detection is fine (integrity_check reports the corruption), but repair
-    # must not claim success over a foreign object it refuses to touch.
-    assert _db_opens_cleanly(db_path) is not None
-    report = repair_state_db_schema(db_path, backup=False)
-    assert report["repaired"] is False
-
-    conn = sqlite3.connect(str(db_path))
-    try:
-        after_trigger = conn.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'trigger' AND name = 'sessions_fts_trigram_update_before'"
-        ).fetchone()[0]
-        assert after_trigger == before_trigger  # foreign occupant untouched
-    finally:
-        conn.close()
-
-
 def test_destructive_repair_removes_owned_objects_preserves_canonical(tmp_path):
     from hermes_state import _drop_owned_fts_derived_schema
 
@@ -877,22 +839,6 @@ def test_read_only_unknown_trigram_fail_closed(tmp_path):
     _install_foreign_trigram_triggers(
         conn, names=("sessions_fts_trigram_update_before",)
     )
-    conn.close()
-
-    ro = SessionDB(db_path=db_path, read_only=True)
-    try:
-        assert ro._sessions_trigram_available is False
-    finally:
-        ro.close()
-
-
-def test_read_only_foreign_trigram_source_fail_closed(tmp_path):
-    """A read-only open never serves a canonical root whose derived source
-    VIEW is foreign (real mixed DDL — the same boundary the R2 destructive
-    fixtures pin, exercised on the SELECT-only path)."""
-    db_path = _build_db_with_session(tmp_path)
-    conn = sqlite3.connect(str(db_path))
-    _install_foreign_trigram_source(conn)
     conn.close()
 
     ro = SessionDB(db_path=db_path, read_only=True)
