@@ -63,6 +63,24 @@ Research artifact: `docs/research/issue-35-unified-fts-lifecycle.md` (PR #75)
 > narrowing suites 116 passed / 29 skipped, `test_hermes_state.py` 178 passed,
 > ruff clean.
 
+> **Review round 3 (2026-08-12, issue comment `5260385052`, fixed in
+> `ed5ab2e8e`).** One P1 — a sibling path of the R2 ownership gate.
+> Read-only discovery classified `sessions_fts_trigram` with
+> `_classify_sessions_fts_trigram == "modern_trigram"` only (root + derived
+> source VIEW), skipping the trigger namespace. A canonical root/source with a
+> foreign same-name trigger occupant could then publish
+> `_sessions_trigram_available = True` on a mode=ro connection — serving an
+> index whose live-maintenance contract is no longer trusted. Fix: read-only
+> discovery now uses `_sessions_trigram_owned()` (the R2 composition; no new
+> abstraction), so a foreign occupant anywhere in root / source VIEW / trigger
+> namespace fails closed. Tests: replaced the monkeypatched
+> `test_read_only_unknown_trigram_fail_closed` (classifier mock) with real
+> mixed-DDL read-only fixtures — foreign trigger occupant and foreign source
+> VIEW both assert `_sessions_trigram_available is False`; the owned-serving
+> case stays pinned by `test_read_only_discovers_session_unicode_and_trigram`.
+> Validation: registry + trigram/CJK + repair + narrowing suites
+> 117 passed / 29 skipped, `test_hermes_state.py` 178 passed, ruff clean.
+
 ## The six authoritative members
 
 1. `messages_fts`
