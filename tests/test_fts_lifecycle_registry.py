@@ -867,15 +867,34 @@ def test_read_only_discovers_session_unicode_and_trigram(tmp_path):
         ro.close()
 
 
-def test_read_only_unknown_trigram_fail_closed(tmp_path, monkeypatch):
-    """A read-only open never serves an unknown same-name sessions_fts_trigram
-    (#30 fail-closed, SELECT-only classification)."""
+def test_read_only_unknown_trigram_fail_closed(tmp_path):
+    """A read-only open never serves a sessions_fts_trigram namespace with a
+    foreign same-name trigger occupant — #30 fail-closed covers the trigger
+    namespace, not just root + source VIEW (issue #27 review R3, real mixed
+    DDL instead of a monkeypatched classifier)."""
     db_path = _build_db_with_session(tmp_path)
-    monkeypatch.setattr(
-        SessionDB,
-        "_classify_sessions_fts_trigram",
-        staticmethod(lambda cursor: "unknown_same_name"),
+    conn = sqlite3.connect(str(db_path))
+    _install_foreign_trigram_triggers(
+        conn, names=("sessions_fts_trigram_update_before",)
     )
+    conn.close()
+
+    ro = SessionDB(db_path=db_path, read_only=True)
+    try:
+        assert ro._sessions_trigram_available is False
+    finally:
+        ro.close()
+
+
+def test_read_only_foreign_trigram_source_fail_closed(tmp_path):
+    """A read-only open never serves a canonical root whose derived source
+    VIEW is foreign (real mixed DDL — the same boundary the R2 destructive
+    fixtures pin, exercised on the SELECT-only path)."""
+    db_path = _build_db_with_session(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    _install_foreign_trigram_source(conn)
+    conn.close()
+
     ro = SessionDB(db_path=db_path, read_only=True)
     try:
         assert ro._sessions_trigram_available is False

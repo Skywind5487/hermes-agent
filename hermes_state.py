@@ -2406,17 +2406,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                     # Session normalized trigram (issue #30): SELECT-only
                     # discovery with #30 ownership classification. The lane is
-                    # served only when the root is positively a canonical
-                    # modern trigram object, this connection can tokenize it,
-                    # and it is not durably stale — an unknown same-name
-                    # object is never served (fail closed), and a pending/
-                    # stale lane never serves (worker-vs-serving distinction
-                    # preserved). No DDL / stale mutation / trigger repair
-                    # from a read-only open.
+                    # served only when the whole namespace is positively
+                    # owned — canonical modern root + derived source VIEW +
+                    # trigger namespace with no foreign occupant (issue #27
+                    # review R3) — this connection can tokenize it, and it is
+                    # not durably stale. A foreign same-name object anywhere
+                    # in the namespace is never served (fail closed), and a
+                    # pending/stale lane never serves (worker-vs-serving
+                    # distinction preserved). No DDL / stale mutation /
+                    # trigger repair from a read-only open.
                     self._sessions_trigram_available = False
                     if (
-                        SessionDB._classify_sessions_fts_trigram(cursor)
-                        == "modern_trigram"
+                        SessionDB._sessions_trigram_owned(cursor)
                         and self._fts_table_probe(
                             cursor, "sessions_fts_trigram"
                         )
