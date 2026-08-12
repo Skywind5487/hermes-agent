@@ -164,7 +164,11 @@ SCHEMA_VERSION = 25
 # layout 0 (marker absent) with a working inline index until the user opts in.
 #   1 = v23 external-content layout (content/tool_name/tool_calls,
 #       tool-row-excluded trigram)
-FTS_STORAGE_VERSION = 1
+#   2 = #31 six-index settlement: the same layout claim additionally
+#       requires EVERY session-metadata index (Unicode/CJK/trigram) to be
+#       acceptance-complete through the shared storage-v2 evaluator — it is
+#       never stamped from a message-only subset of state.
+FTS_STORAGE_VERSION = 2
 
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
