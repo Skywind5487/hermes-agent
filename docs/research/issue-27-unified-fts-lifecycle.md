@@ -14,6 +14,7 @@ Research artifact: `docs/research/issue-35-unified-fts-lifecycle.md` (PR #75)
 > - R1 ponytail + code-review (`5253715082`, fixed `0400c66f0`) — over-engineering/standards cleanups, net −35 lines.
 > - R2 (`5254482988`, fixed `933a2ce86`) — ownership gate reused in offline/global paths (P1), read-only CJK worker flag (P2), real mixed-DDL fixtures (S1).
 > - R3 (`5260385052`, fixed `ed5ab2e8e`) — read-only trigram discovery gates on full #30 namespace ownership.
+> - R4 (`5264349085`, fixed `d6a4d7048`) — read-only trigram serving requires a complete trigger set (missing live trigger → unavailable).
 
 ## The six authoritative members
 
