@@ -1101,31 +1101,6 @@ class SessionSchemaMixin:
                 # one large prompt copy per session.
                 self._dedupe_legacy_system_prompts(cursor)
 
-            # The FTS storage layout is versioned independently of the main
-            # schema (see the v23 note above). Stamp the current layout so the
-            # main version can always advance: a fresh/optimized DB is at
-            # FTS_STORAGE_VERSION; a legacy DB is left at whatever it had
-            # (absent/0) until `optimize-storage` runs. An INTERRUPTED
-            # optimize (legacy vtables already demoted, but rebuild markers
-            # or demoted trash tables still present, or an empty external
-            # index against non-empty messages) is NOT stamped either —
-            # the marker is the source of truth for "fully optimized", and
-            # `fts_optimize_available()` keeps offering the resume until the
-            # transition actually completes.
-            if (
-                fts5_available
-                and not self._db_has_legacy_inline_fts(cursor)
-                and cursor.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
-                ).fetchone() is None
-                and not self._has_fts_trash(cursor)
-                and not self._fts_external_index_empty_with_messages(cursor)
-            ):
-                self.set_meta(
-                    "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
-                )
-
             # Advance schema_version to current for ALL non-FTS-layout
             # migrations. This is deliberately NOT gated on the FTS opt-in —
             # holding the whole version back would block every future schema
@@ -1275,6 +1250,32 @@ class SessionSchemaMixin:
             # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
             if getattr(self, "_fts_enabled", False):
                 self._migrate_broad_fts_update_triggers(cursor)
+
+            # ── Storage-v2 auto-settlement (issue #31) ─────────────
+            # Runs AFTER every message/session FTS ensure path so the shared
+            # SELECT-only completion evaluator sees the full staged state. A
+            # populated DB's first open therefore does NOT stamp v2 (session
+            # Unicode/CJK/trigram ensure stages durable H/P claims that
+            # remain pending); a fresh/empty or already-settled DB may claim
+            # the current storage layout. The SAME evaluator drives
+            # fts_optimize_available(), the foreground pre-VACUUM refusal,
+            # and the final transactional stamp, so no completion decision
+            # can diverge. schema_version stays independent (decoupled), as
+            # in v23.
+            blocker = self._fts_storage_v2_blocker(cursor)
+            if blocker is None:
+                self.set_meta(
+                    "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
+                )
+            else:
+                # A previously stamped layout claim is now stale (new
+                # incomplete work appeared — e.g. an optional CJK/trigram
+                # index staged on a previously-settled DB). Withdraw it so
+                # no completion can be advertised while work remains
+                # (issue #31).
+                cursor.execute(
+                    "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
+                )
 
         self._conn.commit()
 

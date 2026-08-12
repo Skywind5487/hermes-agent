@@ -331,6 +331,18 @@ _FTS_REBUILD_LANES: Tuple[Dict[str, Any], ...] = (
 )
 
 
+# Storage-v2 settlement reason per deferred rebuild lane (issue #31). Lane
+# membership still comes from ``_FTS_REBUILD_LANES``; this only maps the
+# spec's internal name to the human/CLI reason label (the required message
+# lane is handled separately as ``backfill_incomplete``).
+_FTS_STORAGE_V2_LANE_REASONS = {
+    "messages_cjk": "message_cjk_incomplete",
+    "sessions": "session_unicode_incomplete",
+    "sessions_trigram": "session_trigram_incomplete",
+    "sessions_cjk": "session_cjk_incomplete",
+}
+
+
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
 
@@ -428,32 +440,142 @@ class SessionSearchMixin:
         pct = min(100, int(100 * progress / total))
         return {"pending": True, "total": total, "indexed": progress, "percent": pct}
 
-    def _fts_lane_pending(self, lane: Dict[str, Any], conn) -> bool:
-        """True when a deferred-rebuild lane has durable pending work (an H
-        marker and/or its stale breadcrumb) that THIS process can operate
-        (issue #27).
+    def _fts_lane_durable_keys(self, lane: Dict[str, Any]) -> Tuple[str, ...]:
+        """All durable settlement-relevant ``state_meta`` keys for one
+        deferred rebuild lane: the H/P marker pair plus the lane's stale
+        breadcrumb when it has one. Membership comes from
+        ``_FTS_REBUILD_LANES`` (issue #31) — never a hand-maintained ladder.
+        """
+        spec = lane["spec"]
+        keys = [spec["high_water_key"], spec["progress_key"]]
+        stale = lane.get("stale_key")
+        if stale:
+            keys.append(stale)
+        return tuple(keys)
 
-        SELECT-only — no schema mutation, so it is safe for read-only opens
-        and status surfaces. The operability gate is the lane spec's
-        ``available`` callback (e.g. ``_sessions_trigram_available`` for the
-        #30 trigram lane), preserving the worker-vs-serving distinction.
+    def _fts_meta_has_any(self, conn, keys: Collection[str]) -> bool:
+        """True when any of *keys* is present in ``state_meta`` (SELECT-only)."""
+        placeholders = ", ".join("?" for _ in keys)
+        row = conn.execute(
+            f"SELECT 1 FROM state_meta WHERE key IN ({placeholders}) LIMIT 1",
+            tuple(keys),
+        ).fetchone()
+        return row is not None
+
+    def _fts_lane_actionable(self, lane: Dict[str, Any]) -> bool:
+        """True when THIS process can operate the lane's ordinary optimize /
+        repair work — the lane's own worker gate, used ONLY for the
+        storage-v2 "actionable here" flag, never as proof of DB acceptance
+        completeness (issue #31)."""
+        return bool(lane["spec"]["available"](self))
+
+    def _fts_storage_v2_blocker(self, conn) -> Optional[Tuple[str, bool]]:
+        """Return the first storage-v2 settlement blocker ``(reason,
+        actionable_here)``, or None when the database is acceptance-complete
+        for ``fts_storage_version = 2`` (issue #31).
+
+        SELECT-only and durable/schema-aware: every check reads
+        ``sqlite_master`` or ``state_meta`` — never process-local serving
+        booleans as evidence of DB completeness. None is the single proof
+        that v2 may be claimed; the ``actionable_here`` flag only
+        distinguishes "work this process can finish via optimize-storage"
+        from "blocked until a capable/external resolution exists". The SAME
+        evaluator drives startup auto-settlement, ``fts_optimize_available()``,
+        the foreground pre-VACUUM refusal, and the final transactional
+        stamp, so no completion decision can diverge.
+
         ``conn`` must be a connection the caller already holds under a
         suitable lock/read context (this helper does NOT take ``self._lock``,
         which is non-reentrant).
         """
-        spec = lane["spec"]
-        if not spec["available"](self):
-            return False
-        keys = [spec["high_water_key"]]
-        stale = lane.get("stale_key")
-        if stale:
-            keys.append(stale)
-        placeholders = ", ".join("?" for _ in keys)
-        row = conn.execute(
-            f"SELECT 1 FROM state_meta WHERE key IN ({placeholders}) LIMIT 1",
-            keys,
-        ).fetchone()
-        return row is not None
+        if not getattr(self, "_fts_enabled", False):
+            return ("fts5_unavailable", False)
+
+        # ── Required message base ──
+        if self._db_has_legacy_inline_fts(conn):
+            return ("legacy_inline", True)
+        if self._has_fts_trash(conn):
+            return ("teardown_incomplete", True)
+        if self._fts_external_index_empty_with_messages(conn):
+            return ("backfill_incomplete", True)
+        if self._fts_meta_has_any(
+            conn, ("fts_rebuild_high_water", "fts_rebuild_progress")
+        ):
+            return ("backfill_incomplete", True)
+
+        # ── Optional / session deferred lanes: durable H/P/stale state ──
+        # Any H, P, or stale breadcrumb is non-settled durable state — even
+        # on a host that cannot operate the lane (missing capability is never
+        # evidence of completion). Membership is ``_FTS_REBUILD_LANES``.
+        for lane in _FTS_REBUILD_LANES[1:]:
+            spec = lane["spec"]
+            if self._fts_meta_has_any(conn, self._fts_lane_durable_keys(lane)):
+                return (
+                    _FTS_STORAGE_V2_LANE_REASONS[spec["name"]],
+                    self._fts_lane_actionable(lane),
+                )
+
+        # ── Optional / session structural (schema-identity) states ──
+        # message CJK orphan-empty (optional; an absent table is valid
+        # absence, and an empty source is nothing to index).
+        if self._fts_external_index_empty_with_source(
+            conn, "messages_fts_cjk_src", "messages_fts_cjk"
+        ):
+            return ("message_cjk_orphan_empty", getattr(self, "_fts_cjk_loaded", False))
+        # session Unicode legacy/internal shape or orphan-empty.
+        if self._db_has_internal_content_sessions_fts(conn):
+            return ("session_unicode_legacy", True)
+        if self._fts_external_index_empty_with_source(
+            conn, "sessions", "sessions_fts"
+        ):
+            return ("session_unicode_orphan_empty", True)
+        # session CJK legacy/internal shape or orphan-empty (optional).
+        if self._db_has_internal_content_sessions_fts_cjk(conn):
+            return (
+                "session_cjk_legacy",
+                getattr(self, "_sessions_cjk_worker_operable", False),
+            )
+        if self._fts_external_index_empty_with_source(
+            conn, "sessions", "sessions_fts_cjk"
+        ):
+            return (
+                "session_cjk_orphan_empty",
+                getattr(self, "_sessions_cjk_worker_operable", False),
+            )
+        return self._fts_session_trigram_settlement_blocker(conn)
+
+    def _fts_session_trigram_settlement_blocker(
+        self, conn
+    ) -> Optional[Tuple[str, bool]]:
+        """Storage-v2 structural refusal for the #30 normalized session
+        trigram lane (issue #31): an ``unknown_same_name`` object or any
+        noncanonical root/source/trigger ownership fails closed — v2 is
+        refused and the object is left untouched (never deleted or demoted
+        inside #31)."""
+        classification = self._classify_sessions_fts_trigram(conn)
+        if classification == "unknown_same_name":
+            return ("session_trigram_unknown_same_name", False)
+        _owned, foreign, missing = self._sessions_trigram_namespace_owned(
+            conn, classification
+        )
+        if foreign:
+            return ("session_trigram_namespace_foreign", False)
+        if classification == "absent":
+            if not self._sessions_trigram_src_compatible(conn):
+                return ("session_trigram_source_collision", False)
+            return None
+        # modern_trigram: an incomplete exact trigger set is a fail-closed
+        # state the #30 lifecycle cannot create — refuse without repair.
+        if missing:
+            return ("session_trigram_trigger_incomplete", False)
+        if self._fts_external_index_empty_with_source(
+            conn, "sessions_fts_trigram_src", "sessions_fts_trigram"
+        ):
+            return (
+                "session_trigram_orphan_empty",
+                getattr(self, "_sessions_trigram_available", False),
+            )
+        return None
 
     def _fts_first_pending_lane_status(self) -> Optional[Dict[str, Any]]:
         """First non-None deferred-rebuild status across the ordered lanes
@@ -1230,60 +1352,26 @@ class SessionSearchMixin:
         self._repair_session_spec_bookkeeping(_FTS_SESSION_CJK_SPEC)
 
     def fts_optimize_available(self) -> bool:
-        """True when `optimize_fts_storage()` has work to do: either this DB
-        is a legacy inline-FTS install that can be optimized to the v23
-        external-content schema, or a previous optimize run was interrupted
-        (legacy vtables already demoted, but backfill markers and/or trash
-        tables remain) and re-running would resume it, or the CJK-bigram
-        index needs a backfill/rebuild on this tokenizer-capable host, or
-        a prior demote left an empty external-content index without markers
-        (healable on re-run).
-        False for fresh and fully-optimized installs (and when FTS5 is
-        unavailable)."""
+        """True when `optimize_fts_storage()` has work THIS process can
+        finish: the DB is not yet acceptance-complete for the current storage
+        layout AND at least one remaining blocker is actionable on this host
+        (legacy inline layout to demote, deferred rebuild lanes to backfill,
+        trash to tear down, orphan/empty indexes to heal).
+
+        Derived from the SAME shared storage-v2 evaluator as startup
+        auto-settlement and the final stamp (issue #31), so "is there work"
+        and "may v2 be claimed" can never diverge. A blocker that requires an
+        optional tokenizer / external resolution this process lacks is NOT
+        advertised here (the stamp is still refused; status surfaces report
+        why). False for fresh/fully-settled installs, when FTS5 is
+        unavailable, and on read-only opens."""
         if not self._fts_enabled or self.read_only:
             return False
         with self._lock:
-            if self._db_has_legacy_inline_fts(self._conn):
-                return True
-            # Interrupted optimize: demotion already removed the legacy
-            # vtables (so the check above is False), but the transition is
-            # unfinished until the backfill markers are cleared and the
-            # demoted trash tables are torn down. Search stays complete
-            # through the gap supplement meanwhile; re-running resumes.
-            # Every deferred-rebuild lane with durable pending work
-            # (H marker and/or stale breadcrumb) that THIS process can
-            # operate advertises work through the shared lane surface
-            # (issue #27): message, message-CJK, session Unicode, session
-            # trigram, and session CJK.
-            for lane in _FTS_REBUILD_LANES:
-                if self._fts_lane_pending(lane, self._conn):
-                    return True
-            if self._has_fts_trash(self._conn):
-                return True
-            # Pre-fix crash window: empty external-content index with
-            # messages still present, no markers, no trash (teardown already
-            # finished or never needed). Re-run seeds markers and backfills.
-            if self._fts_external_index_empty_with_messages(self._conn):
-                return True
-            # Session orphan: external sessions_fts empty with sessions
-            # present and no claim (crash window) — healable on re-run.
-            if self._fts_external_index_empty_with_source(
-                self._conn, "sessions", "sessions_fts"
-            ):
-                return True
-            # Trigram orphan: empty sessions_fts_trigram with the derived
-            # source populated and no trigram claim (crash window / lost
-            # markers) — healable on re-run. The trigram source is a VIEW so
-            # this probe also covers the not-yet-created table (absent → the
-            # ensure that follows creates it fresh over the claim). Only
-            # advertised when THIS runtime owns+serves the lane (finding 4:
-            # an unknown/quarantined target must never trigger a delete-all /
-            # re-seed).
-            if not self._sessions_trigram_available:
+            blocker = self._fts_storage_v2_blocker(self._conn)
+            if blocker is None:
                 return False
-            return self._fts_external_index_empty_with_source(
-                self._conn, "sessions_fts_trigram_src", "sessions_fts_trigram"
-            )
+            return blocker[1]
 
     def _demote_legacy_fts_to_trash(self) -> int:
         """Demote the legacy inline FTS vtables and stage their shadow tables
@@ -1478,54 +1566,29 @@ class SessionSearchMixin:
             _emit("teardown")
             self._fts_rebuild_pause(time.monotonic() - _t0)
 
-        # Refuse to stamp "optimized" while work remains or the base index is
-        # still empty against a non-empty messages table. Pre-fix code could
-        # tear down trash and settle after a no-op backfill when markers were
-        # missing — permanent search-index loss for historical rows. Session
-        # markers / empty session index (issue #25) count as remaining work,
-        # as do the trigram lane's own markers / empty index (issue #30).
+        # Refuse to stamp "optimized" while the shared storage-v2 evaluator
+        # reports ANY incomplete durable state — message/session Unicode/CJK/
+        # trigram H/P or stale breadcrumbs, demoted trash, orphan-empty or
+        # legacy shapes, and #30 fail-closed trigram ownership. This is the
+        # SAME predicate startup and the final transactional re-check use
+        # (issue #31), so a DB cannot be stamped here and refused there (or
+        # vice versa), and pre-fix code can never settle past a no-op
+        # backfill into permanent search-index loss again.
         with self._lock:
-            # The trigram lane's marker / empty-index only counts as remaining
-            # work when THIS runtime owns+serves it (finding 1 point 4): an
-            # incapable host must not report permanent backfill_incomplete for
-            # a lane it can never recover — the stale evidence stays, but the
-            # settle check ignores it here.
-            trigram_pending = self._conn.execute(
-                "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_session_trigram_rebuild_high_water' LIMIT 1"
-            ).fetchone() is not None
-            still_pending = (
-                self._conn.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key IN ('fts_rebuild_high_water', "
-                    "'fts_session_rebuild_high_water') LIMIT 1"
-                ).fetchone() is not None
-                or (self._sessions_trigram_available and trigram_pending)
-            )
-            still_trash = self._has_fts_trash(self._conn)
-            trigram_empty = self._fts_external_index_empty_with_source(
-                self._conn,
-                "sessions_fts_trigram_src",
-                "sessions_fts_trigram",
-            )
-            empty_index = (
-                self._fts_external_index_empty_with_messages(self._conn)
-                or self._fts_external_index_empty_with_source(
-                    self._conn, "sessions", "sessions_fts"
+            blocker = self._fts_storage_v2_blocker(self._conn)
+        if blocker is not None:
+            # Withdraw any stale layout claim — the DB is not
+            # acceptance-complete (issue #31).
+            def _withdraw(conn):
+                conn.execute(
+                    "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
                 )
-                or (self._sessions_trigram_available and trigram_empty)
-            )
-        if still_pending or still_trash or empty_index:
-            reason = (
-                "backfill_incomplete" if still_pending or empty_index
-                else "teardown_incomplete"
-            )
+            self._execute_write(_withdraw)
             logger.warning(
-                "FTS storage optimization did not settle (%s): "
-                "pending=%s trash=%s empty_index=%s",
-                reason, still_pending, still_trash, empty_index,
+                "FTS storage optimization did not settle (%s, actionable=%s)",
+                blocker[0], blocker[1],
             )
-            return {"ok": False, "reason": reason, "vacuumed": None}
+            return {"ok": False, "reason": blocker[0], "vacuumed": None}
 
         # Phase 3: reclaim freed pages to the OS.
         vacuum_ok = None
@@ -1563,18 +1626,20 @@ class SessionSearchMixin:
         # DB opened only by pre-decoupling code still settles). The FTS-layout
         # marker is the source of truth for "is this DB optimized".
         def _settle(conn):
-            # Re-check inside the write transaction so a concurrent writer
-            # cannot race a stamp past incomplete work. Returns a refusal
-            # reason (stamping nothing) or None once the stamp is written.
-            if conn.execute(
-                "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
-            ).fetchone() is not None:
-                return "backfill_incomplete"
-            if self._has_fts_trash(conn):
-                return "teardown_incomplete"
-            if self._fts_external_index_empty_with_messages(conn):
-                return "backfill_incomplete"
+            # Re-check inside the write transaction that performs the claim
+            # so a concurrent writer cannot race a stamp past incomplete work
+            # (the #76832 rule). Uses the SAME shared storage-v2 evaluator as
+            # startup / availability / the pre-VACUUM refusal (issue #31).
+            # Returns a refusal reason (stamping nothing) or None once the
+            # stamp is written.
+            blocker = self._fts_storage_v2_blocker(conn)
+            if blocker is not None:
+                # Withdraw any stale claim in the same transaction that would
+                # have stamped it (issue #31).
+                conn.execute(
+                    "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
+                )
+                return blocker[0]
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES ('fts_storage_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
