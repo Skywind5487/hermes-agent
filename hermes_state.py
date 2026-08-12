@@ -2397,13 +2397,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         self._fts_table_probe(cursor, "sessions_fts") is True
                     )
                     # Session normalized trigram (issue #30): SELECT-only
-                    # discovery — served only when the whole namespace is
-                    # #30-owned (root + source VIEW + trigger namespace),
-                    # this connection can tokenize it, and it is not durably
-                    # stale. No DDL / mutation from a read-only open.
+                    # discovery — served only when the root + source VIEW are
+                    # canonical AND the trigger set is COMPLETE (owned ==
+                    # True: no foreign, no missing live trigger — a missing
+                    # trigger can leave the index stale/incomplete). This
+                    # connection can tokenize it and it is not durably stale.
+                    # No DDL / mutation from a read-only open.
                     self._sessions_trigram_available = False
+                    classification = (
+                        SessionDB._classify_sessions_fts_trigram(cursor)
+                    )
+                    owned, _foreign, _missing = (
+                        SessionDB._sessions_trigram_namespace_owned(
+                            cursor, classification
+                        )
+                    )
                     if (
-                        SessionDB._sessions_trigram_owned(cursor)
+                        classification == "modern_trigram"
+                        and owned
                         and self._fts_table_probe(
                             cursor, "sessions_fts_trigram"
                         )

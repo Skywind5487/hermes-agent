@@ -848,6 +848,25 @@ def test_read_only_unknown_trigram_fail_closed(tmp_path):
         ro.close()
 
 
+def test_read_only_missing_trigram_trigger_fail_closed(tmp_path):
+    """A read-only open never serves a canonical root/source whose live
+    trigger set is incomplete — a missing owned trigger means mutations may
+    not have propagated, so the index can be stale (issue #27 review R4)."""
+    db_path = _build_db_with_session(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "DROP TRIGGER IF EXISTS sessions_fts_trigram_update_after"
+    )
+    conn.commit()
+    conn.close()
+
+    ro = SessionDB(db_path=db_path, read_only=True)
+    try:
+        assert ro._sessions_trigram_available is False
+    finally:
+        ro.close()
+
+
 def test_lane_surface_sequences_pending_lanes(db, monkeypatch):
     """The shared deferred-rebuild lane surface runs every lane with pending
     work and skips lanes without it (issue #27)."""
