@@ -49,17 +49,29 @@ and fuzz-test every path.
 - Canonical counts intact: `sessions=7268`, `messages=231513`, `gateway_routing=78`;
   `PRAGMA integrity_check` ok; `foreign_key_check` 0.
 
-## Fuzz / recall testing (every path)
+## Path + router validation (every path, real executing queries)
 
-Harness `fuzz_all_paths.py` (seed `20260813`), all six indexes, on the candidate:
+Harness `paths_and_router_test.py` (seed `20260813`), run on a **scratch copy** of
+the frozen artifact with `HERMES_HOME` set (CJK lane live); the frozen artifact
+was never opened writably.
 
-- Recall: every sampled real row findable by its own terms — no misses.
-- Fuzz MATCH: 15,000 randomized queries (2,500 × 6) — zero crashes; only graceful
-  SQLite parse errors.
-- Stability post-fuzz: known-good recall still hits.
-- Contracts: trigram substring 200/200; CJK bigram `sessions_fts_cjk` 294/294;
-  `messages_fts_cjk` (non-tool) 299/299; unicode61 punct-word 298/300.
-- Verifiers 4.1 + 4.2 re-run after fuzzing: PASS (no corruption).
+- **Part 1 — per-index positive execution** (valid MATCH from real content,
+  expected row asserted back):
+  `messages_fts` 298/299, `messages_fts_trigram` 298/298, `messages_fts_cjk`
+  294/295, `sessions_fts` 300/300, `sessions_fts_trigram` 300/300,
+  `sessions_fts_cjk` 300/300.
+- **Part 2 — router path** (real Hermes search APIs): message router routes
+  ASCII→`fts5`, CJK→`fts_cjk`, lone single CJK char→`like_scan`, each returning
+  the exact source message; session lanes (`_fts_metadata_candidates` /
+  `_fts_session_trigram_candidates` / `_fts_cjk_metadata_candidates`) each return
+  the source session; lone char refused by the CJK lane → LIKE fallback;
+  `resolve_session_by_title` and `search_sessions_by_id` resolve exactly.
+- **Part 3 — structurally valid fuzz** (9,000 queries: single phrase / AND / OR /
+  NOT / prefix / column filters from real tokens): all 9,000 executed, 0 errors,
+  0 unhandled, 10k–23k rows per index. Malformed robustness (2,400): all graceful,
+  0 crashes.
+- Verifiers 4.1 + 4.2 re-run after all of the above: PASS; artifact SHA/mode/
+  sidecars re-verified unchanged.
 
 ## Frozen artifact
 
