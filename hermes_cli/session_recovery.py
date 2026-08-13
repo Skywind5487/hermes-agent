@@ -65,6 +65,12 @@ _GENERATED_META_KEYS = frozenset({
     "fts_session_cjk_rebuild_high_water",
     "fts_session_cjk_rebuild_progress",
     "fts_session_cjk_stale",
+    # Session trigram metadata rebuild markers + stale breadcrumb (issue #30) -
+    # trigram derived state, regenerated from the current schema on a fresh
+    # destination, never copied.
+    "fts_session_trigram_rebuild_high_water",
+    "fts_session_trigram_rebuild_progress",
+    "fts_session_trigram_stale",
     "telegram_dm_topic_schema_version",
 })
 
@@ -1119,6 +1125,9 @@ def _verify_recovered_database(
                 "fts_session_cjk_rebuild_high_water",
                 "fts_session_cjk_rebuild_progress",
                 "fts_session_cjk_stale",
+                "fts_session_trigram_rebuild_high_water",
+                "fts_session_trigram_rebuild_progress",
+                "fts_session_trigram_stale",
             )
             if key in meta
         )
