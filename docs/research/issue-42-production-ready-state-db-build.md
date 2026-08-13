@@ -1,55 +1,53 @@
 # Issue #42 — production-ready `state.db` build surface for #22
 
-Status: research complete; execution belongs to #22.
+Status: **research complete; execution belongs to #22**.
 
-This note freezes the exact source revision, build seam, safety boundary, completion evidence, and retry rules for producing the first production-ready database from the recovered patched-canonical master. It intentionally does **not** perform the production-scale build.
+This note freezes the exact revision, build seam, safety boundary, completion predicate, validation probes, artifact receipt, and retry rules for producing the first production-ready database from the recovered patched-canonical master. It intentionally does **not** run the production-scale build.
 
-## Decision summary
+## 1. Frozen decisions
 
-- **Pinned target:** `4e5ad5c2230300d1ffae84b089ffc70e368c8a23` (`dev` when this research was finalized).
-- **#12 gate:** clear. Final #79 closed after the remaining recovery-marker audit, and the pinned target is a descendant of the accepted six-index/storage-v2 core at `276d497764feb7d4a71f1424ed44b8958da63b16`.
-- **Canonical input:** `/home/skywind/hermes-recovery/runs/20260807-081043/state.recovered.patched.db`
-- **Canonical SHA-256:** `23cfa3c8adb94ed403058329ae7e252e1d4c4bc01ead76e22ac7d0ff99948104`
-- **Canonical size:** `1,675,415,552` bytes.
-- **Canonical row counts:** `sessions=7,268`, `messages=231,513`, `gateway_routing=78`.
-- **Build seam:** `hermes sessions optimize-storage --yes`, executed from the pinned checkout with an **isolated `HERMES_HOME` whose `state.db` is a fresh writable copy of the canonical master**.
-- **Default production path keeps VACUUM enabled.** `--no-vacuum` is a deviation, not the default recipe.
-- **Success is not the CLI exit alone.** Acceptance requires the pinned target's shared storage-v2 evaluator to report zero blockers, `fts_storage_version=2`, settled rebuild/stale markers, six-index schema/capability semantics, canonical counts, integrity/FK checks, and a frozen output receipt.
-- **Never open the frozen master with writable Hermes/SQLite.** Never run schema/FTS migration, `VACUUM`, manual marker edits, or build probes directly against it. Every attempt starts from a fresh copy.
+| Item | Pinned value |
+|---|---|
+| Target commit | `4e5ad5c2230300d1ffae84b089ffc70e368c8a23` |
+| Accepted six-index/storage-v2 core ancestor | `276d497764feb7d4a71f1424ed44b8958da63b16` |
+| Canonical master | `/home/skywind/hermes-recovery/runs/20260807-081043/state.recovered.patched.db` |
+| Canonical SHA-256 | `23cfa3c8adb94ed403058329ae7e252e1d4c4bc01ead76e22ac7d0ff99948104` |
+| Canonical size | `1,675,415,552` bytes |
+| Canonical counts | `sessions=7,268`, `messages=231,513`, `gateway_routing=78` |
+| Schema version at target | `25` |
+| FTS storage version at target | `2` |
+| Build entrypoint | `hermes sessions optimize-storage --yes` |
+| DB-path isolation | fresh `$HERMES_HOME/state.db`; **there is no `--db` option on `optimize-storage`** |
 
-If `dev` advances after this note, #22 must continue using the pinned SHA above unless the new revision is explicitly re-reviewed and re-pinned. Do not silently float the target.
+Final #79 closed the remaining #12 audit, and the pinned target is five commits ahead of `276d497...` with that accepted core as its merge-base. #22 must pin the full SHA above; if `dev` moves later, do not silently float the production target.
 
-## Why this command actually builds the database
+The frozen patched-canonical master is immutable input. Never run writable Hermes/SQLite, migration, FTS rebuild, `VACUUM`, marker repair, or ad-hoc probes directly on it. Every build or retry begins from a fresh writable copy unless the retry rule below explicitly says the current candidate is resumable.
 
-`hermes sessions optimize-storage` is not a mere open/probe command.
+## 2. Primary-source build surface
 
-CLI definition:
+The command that actually drives the build is `hermes sessions optimize-storage`:
 
-- [`hermes_cli/main.py` at the pinned target](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/main.py#L12154-L12190) defines `sessions optimize-storage`, `--yes`, and `--no-vacuum`.
-- [`hermes_cli/sessions_cmd.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sessions_cmd.py#L1032-L1135) constructs `SessionDB()` and calls `db.optimize_fts_storage(...)`, with disk-space preflight, progress output, and resumable error handling.
-- [`SessionSearchMixin.optimize_fts_storage()`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_search.py#L1460-L1685) repairs bookkeeping, drains every pending rebuild lane, removes legacy trash, refuses incomplete storage-v2 state, VACUUMs by default, checkpoints WAL best-effort, re-checks completeness inside the final write transaction, then stamps storage layout v2.
+- [`hermes_cli/main.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/main.py#L12154-L12190) defines `optimize-storage`, `--yes`, and `--no-vacuum`.
+- [`hermes_cli/sessions_cmd.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sessions_cmd.py#L1032-L1145) constructs `SessionDB()`, performs disk-space preflight, emits foreground progress, and calls `db.optimize_fts_storage(...)`.
+- [`hermes_state_search.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_search.py#L1460-L1685) repairs migration bookkeeping, drains every pending rebuild lane, tears down legacy trash, refuses incomplete storage-v2 state, VACUUMs by default, checkpoints WAL best-effort, re-evaluates completion transactionally, and stamps `fts_storage_version=2` only if the shared evaluator has no blocker.
+- The rebuild registry in [`hermes_state_search.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_search.py#L150-L315) has five lanes covering six indexes:
+  1. `messages` → `messages_fts` + `messages_fts_trigram`
+  2. `messages_cjk` → `messages_fts_cjk`
+  3. `sessions` → `sessions_fts`
+  4. `sessions_trigram` → `sessions_fts_trigram`
+  5. `sessions_cjk` → `sessions_fts_cjk`
 
-The foreground rebuild lanes are declared in [`hermes_state_search.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_search.py#L150-L315):
+A plain `SessionDB()` open is therefore not the #22 build contract. It may reconcile/seed state, but the production executor must drive the foreground optimizer and then independently prove settlement.
 
-1. `messages` → `messages_fts` + `messages_fts_trigram`
-2. `messages_cjk` → `messages_fts_cjk`
-3. `sessions` → `sessions_fts`
-4. `sessions_trigram` → `sessions_fts_trigram`
-5. `sessions_cjk` → `sessions_fts_cjk`
+### Why `HERMES_HOME` is the DB selector
 
-That is five rebuild lanes covering the six modern FTS indexes.
+`optimize-storage` has no `--db`. [`hermes_state.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state.py#L490-L525) resolves the default database at call time from `get_hermes_home() / "state.db"`; [`hermes_constants.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_constants.py#L84-L145) honors `HERMES_HOME`.
 
-A plain `SessionDB()` open is therefore **not** the production build contract. It can reconcile/seed schema state, but #22 must drive `optimize-storage` to foreground completion and then independently verify settlement.
+Therefore the isolation boundary is a dedicated build home containing a fresh copy named exactly `state.db`.
 
-### Important CLI path fact
+## 3. Production recipe
 
-`optimize-storage` has no `--db` option. It uses `SessionDB()`.
-
-[`hermes_state.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state.py#L490-L525) resolves the default DB at call time from `get_hermes_home() / "state.db"`; [`hermes_constants.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_constants.py#L84-L145) honors the `HERMES_HOME` environment override. Therefore isolation is performed by creating a dedicated build home and placing the candidate at `$HERMES_HOME/state.db`, not by attempting to pass a database path to the CLI.
-
-## Pinned target and ancestry gate
-
-The production executor should record these exact values before touching a candidate:
+### 3.1 Pin source and prove frozen-master provenance
 
 ```bash
 set -Eeuo pipefail
@@ -65,30 +63,19 @@ MASTER_SIZE=1675415552
 git -C "$REPO" cat-file -e "${TARGET_COMMIT}^{commit}"
 test "$(git -C "$REPO" rev-parse "$TARGET_COMMIT")" = "$TARGET_COMMIT"
 git -C "$REPO" merge-base --is-ancestor "$ACCEPTED_CORE" "$TARGET_COMMIT"
-```
 
-If the target object is absent locally, fetching that exact repository/ref is allowed **before** the build. After the object exists, the build worktree is detached at the pinned SHA; do not substitute current `dev`.
-
-## Frozen-master gate
-
-Do not open the canonical master in SQLite during this gate. Verify it as a file only:
-
-```bash
 test -f "$MASTER"
 test "$(stat -c %s "$MASTER")" -eq "$MASTER_SIZE"
 test "$(sha256sum "$MASTER" | awk '{print $1}')" = "$MASTER_SHA"
 test "$(stat -c %a "$MASTER")" = 400
-
 test ! -e "${MASTER}-wal"
 test ! -e "${MASTER}-shm"
 test ! -e "${MASTER}-journal"
 ```
 
-Any mismatch is a **hard stop**. Do not chmod, checkpoint, VACUUM, repair, or otherwise “fix” the master in place. Resolve the provenance problem under #20 first.
+**Hard stop:** any master path/size/hash/mode/sidecar mismatch. Resolve provenance under #20. Do not chmod or repair the master in place.
 
-## Isolated source and build home
-
-Create one attempt directory. A failed/rejected attempt is never reused as the source of a later attempt.
+### 3.2 Create one isolated attempt
 
 ```bash
 TARGET_SHORT=${TARGET_COMMIT:0:12}
@@ -100,24 +87,22 @@ WORK_DB="$BUILD_HOME/state.db"
 
 mkdir -p "$BUILD_ROOT" "$BUILD_HOME"
 git -C "$REPO" worktree add --detach "$SOURCE" "$TARGET_COMMIT"
-
 test "$(git -C "$SOURCE" rev-parse HEAD)" = "$TARGET_COMMIT"
 test -z "$(git -C "$SOURCE" status --porcelain)"
 
 cp --reflink=auto -- "$MASTER" "$WORK_DB"
 chmod 0600 "$WORK_DB"
-
 test "$(stat -c %s "$WORK_DB")" -eq "$MASTER_SIZE"
 test "$(sha256sum "$WORK_DB" | awk '{print $1}')" = "$MASTER_SHA"
 
 export HERMES_HOME="$BUILD_HOME"
 ```
 
-The candidate starts byte-identical to the master but is writable. The source master remains read-only and untouched.
+The candidate is byte-identical to the master at birth but writable. The source master stays untouched.
 
-## Producer runtime gate
+### 3.3 Resolve and hard-gate the producer runtime
 
-The project requires Python `>=3.11`. Resolve the pinned checkout first, then record the **actual Python-linked SQLite runtime** used by Hermes; the system `sqlite3` executable is not sufficient evidence.
+The project requires Python `>=3.11`. The relevant SQLite is the one linked into the Python that runs Hermes, not the standalone `sqlite3` executable.
 
 ```bash
 cd "$SOURCE"
@@ -125,14 +110,9 @@ uv sync --frozen
 
 PY="$SOURCE/.venv/bin/python"
 HERMES="$SOURCE/.venv/bin/hermes"
-
 test -x "$PY"
 test -x "$HERMES"
-```
 
-Run this hard gate before opening the candidate with Hermes:
-
-```bash
 "$PY" - <<'PY'
 import json
 import sqlite3
@@ -148,7 +128,7 @@ finally:
     conn.close()
 
 vulnerable = is_sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info)
-record = {
+print(json.dumps({
     "python_executable": sys.executable,
     "python_version": list(sys.version_info[:3]),
     "sqlite_version": sqlite3.sqlite_version,
@@ -156,22 +136,22 @@ record = {
     "wal_reset_vulnerable": vulnerable,
     "fts5": True,
     "trigram": True,
-}
-print(json.dumps(record, indent=2, sort_keys=True))
+}, indent=2, sort_keys=True))
+
 if vulnerable:
     raise SystemExit("STOP: selected Python is linked to a WAL-reset-vulnerable SQLite")
 PY
 ```
 
-The target's WAL-reset classifier treats SQLite `>=3.51.3` as safe and also recognizes the known safe backport windows; use the target helper instead of re-implementing the version rule. See [`hermes_cli/sqlite_runtime.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sqlite_runtime.py).
+Use the target helper rather than reimplementing the vulnerability rule; [`hermes_cli/sqlite_runtime.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sqlite_runtime.py) recognizes upstream-safe `>=3.51.3` and the known backport windows.
 
-If FTS5/trigram creation fails or the helper reports a vulnerable runtime, stop **before** the build and select a safe Python runtime. Do not “accept” a DB produced by a known-vulnerable runtime.
+**Hard stop:** vulnerable SQLite, missing FTS5, or missing built-in trigram. Pick another safe Python runtime before any Hermes open of the candidate.
 
-CJK is optional-capability work: the loadable `cjk_unicode61` tokenizer may or may not be available on the producer. Do not fake the capability with markers. The target's schema/settlement logic determines whether CJK work is actionable on that host; the final receipt must record the observed CJK schema/availability outcome.
+CJK is an optional loadable capability. Do not manufacture CJK state. The target's own schema/settlement logic decides whether CJK work exists and is actionable; the receipt records what this producer actually loaded/built.
 
-## Pre-build candidate checkpoint
+### 3.4 Pre-build candidate invariant check
 
-Before the first writable Hermes open, preserve the canonical invariants on the fresh copy:
+Run this only on the writable candidate copy:
 
 ```bash
 WORK_DB="$WORK_DB" "$PY" - <<'PY'
@@ -199,9 +179,7 @@ finally:
 PY
 ```
 
-These checks are against the writable candidate, never the frozen master.
-
-## Production build command
+### 3.5 Run the actual build
 
 ```bash
 set -o pipefail
@@ -210,29 +188,28 @@ HERMES_HOME="$BUILD_HOME" \
   2>&1 | tee "$BUILD_ROOT/optimize-storage.log"
 ```
 
-Keep the default VACUUM. The CLI has its own disk-space preflight; insufficient space is a hard stop before migration. `--no-vacuum` may be used only as an explicitly reviewed deviation with the receipt noting that the physical-space reclaim step was omitted.
+Keep the default VACUUM for the production path. The CLI preflights free space. `--no-vacuum` is an explicitly documented deviation, not the default recipe.
 
-Expected progress surfaces include `[backfill]`, `[teardown]`, `[vacuum]`, and `[done]`. Rebuild work is resumable on the same candidate after a normal interruption.
+Expected foreground phases include rebuild/backfill, teardown, VACUUM, and done. An ordinary interruption is resumable by re-running the same pinned command on the same candidate.
 
-### Do not treat these as success
+Do **not** accept any of these by themselves:
 
-- A plain `SessionDB()` open.
-- CLI output saying `Already compact; nothing to do.`
-- `fts_storage_version=2` by itself.
-- Six table names by themselves.
-- A table named `sessions_fts_trigram` without proving its DDL identity.
-- A manually edited `state_meta` row.
+- a plain DB open;
+- `Already compact; nothing to do`;
+- table names alone;
+- `fts_storage_version=2` alone;
+- a table named `sessions_fts_trigram` without schema identity;
+- hand-edited state markers.
 
-The command can legitimately find no actionable work; final acceptance still comes from the verifier below.
+## 4. Authoritative artifact verifier
 
-## Authoritative completion gate
+The verifier has three layers: durable relational state, the pinned target's own storage-v2/schema classifier, then artifact-specific FTS integrity + MATCH probes.
 
-Run this verifier with the **same pinned target runtime** and the candidate still at `$BUILD_HOME/state.db`:
+### 4.1 Durable state + exact target predicates
 
 ```bash
 WORK_DB="$WORK_DB" "$PY" - <<'PY'
 import os
-import re
 import sqlite3
 from pathlib import Path
 
@@ -240,11 +217,10 @@ from hermes_state import SessionDB
 from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
 
 path = Path(os.environ["WORK_DB"])
+expected_counts = {"sessions": 7268, "messages": 231513, "gateway_routing": 78}
 
-# 1. Raw durable invariants.
 conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 try:
-    expected_counts = {"sessions": 7268, "messages": 231513, "gateway_routing": 78}
     counts = {}
     for table, want in expected_counts.items():
         got = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -261,7 +237,7 @@ try:
 
     schema_row = conn.execute("SELECT version FROM schema_version").fetchone()
     if schema_row is None or int(schema_row[0]) != int(SCHEMA_VERSION):
-        raise SystemExit(f"FAIL schema_version: {schema_row!r}, expected {SCHEMA_VERSION}")
+        raise SystemExit(f"FAIL schema_version={schema_row!r}, expected {SCHEMA_VERSION}")
 
     meta = dict(conn.execute("SELECT key, value FROM state_meta"))
     if meta.get("fts_storage_version") != str(FTS_STORAGE_VERSION):
@@ -291,136 +267,182 @@ try:
     if trash:
         raise SystemExit(f"FAIL legacy FTS trash remains: {trash!r}")
 
-    required = {
-        "messages_fts", "messages_fts_trigram",
-        "sessions_fts", "sessions_fts_trigram",
+    present = {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
-    present_tables = {
-        r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
-    }
-    missing = sorted(required - present_tables)
+    required = {"messages_fts", "messages_fts_trigram", "sessions_fts", "sessions_fts_trigram"}
+    missing = sorted(required - present)
     if missing:
         raise SystemExit(f"FAIL required FTS table(s) missing: {missing}")
 
-    # Same-name legacy protection: identity is DDL, never the table name.
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' "
-        "AND name='sessions_fts_trigram'"
-    ).fetchone()
-    if not row or not row[0]:
-        raise SystemExit("FAIL sessions_fts_trigram DDL missing")
-    tri_sql = row[0]
-    for pattern, label in (
-        (r"tokenize\s*=\s*['\"]trigram['\"]", "tokenize='trigram'"),
-        (r"content\s*=\s*['\"]sessions_fts_trigram_src['\"]", "modern source view"),
-        (r"content_rowid\s*=\s*['\"]row_id['\"]", "content_rowid='row_id'"),
-    ):
-        if re.search(pattern, tri_sql, re.I) is None:
-            raise SystemExit(f"FAIL sessions_fts_trigram lacks {label}: {tri_sql}")
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions_fts_trigram)")]
-    if cols[:3] != ["title", "id", "display_name"]:
-        raise SystemExit(f"FAIL sessions_fts_trigram columns: {cols!r}")
-    view = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='view' "
-        "AND name='sessions_fts_trigram_src'"
-    ).fetchone()
-    if not view or not view[0]:
-        raise SystemExit("FAIL sessions_fts_trigram_src view missing")
-    modern_trigger_count = conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
-        "AND tbl_name='sessions' AND sql LIKE '%sessions_fts_trigram%'"
-    ).fetchone()[0]
-    if modern_trigger_count != 4:
-        raise SystemExit(
-            f"FAIL sessions trigram trigger count={modern_trigger_count}, expected 4"
-        )
-
-    # If CJK surfaces exist, both message + session sides must be coherent.
-    cjk_tables = present_tables.intersection({"messages_fts_cjk", "sessions_fts_cjk"})
-    if cjk_tables and cjk_tables != {"messages_fts_cjk", "sessions_fts_cjk"}:
-        raise SystemExit(f"FAIL partial CJK table set: {sorted(cjk_tables)}")
-
-    print(f"counts={counts}")
-    print(f"schema_version={schema_row[0]}")
-    print(f"fts_storage_version={meta['fts_storage_version']}")
-    print(f"cjk_tables={sorted(cjk_tables)}")
+    cjk = present.intersection({"messages_fts_cjk", "sessions_fts_cjk"})
+    if cjk and cjk != {"messages_fts_cjk", "sessions_fts_cjk"}:
+        raise SystemExit(f"FAIL partial CJK surface: {sorted(cjk)}")
 finally:
     conn.close()
 
-# 2. Reuse the pinned target's own authoritative storage-v2 evaluator.
+# Exact target-owned acceptance predicates. The same storage-v2 evaluator is
+# used by startup settlement, optimize availability, pre-VACUUM refusal, and
+# the final transactional stamp.
 db = SessionDB(path, read_only=True)
 try:
     blockers = list(db._fts_storage_v2_blockers(db._conn))
+    if blockers:
+        raise SystemExit(f"FAIL storage-v2 blocker(s): {blockers!r}")
+
+    trigram_shape = db._classify_sessions_fts_trigram(db._conn)
+    if trigram_shape != "modern_trigram":
+        raise SystemExit(f"FAIL sessions_fts_trigram shape={trigram_shape!r}")
+
     cjk_runtime = {
         "messages_cjk_loaded": bool(getattr(db, "_fts_cjk_loaded", False)),
         "messages_cjk_available": bool(getattr(db, "_fts_cjk_available", False)),
         "sessions_cjk_available": bool(getattr(db, "_sessions_cjk_available", False)),
     }
-    if blockers:
-        raise SystemExit(f"FAIL storage-v2 blocker(s): {blockers!r}")
-    print(f"storage_v2_blockers={blockers}")
-    print(f"cjk_runtime={cjk_runtime}")
+    print("counts=", counts)
+    print("schema_version=", schema_row[0])
+    print("fts_storage_version=", meta["fts_storage_version"])
+    print("storage_v2_blockers=", blockers)
+    print("sessions_trigram_shape=", trigram_shape)
+    print("cjk_tables=", sorted(cjk))
+    print("cjk_runtime=", cjk_runtime)
 finally:
     db.close()
 PY
 ```
 
-The private evaluator call is intentional here: #22 is pinned to this exact source revision, and this is the same target-owned predicate used by startup settlement, `fts_optimize_available()`, the pre-VACUUM refusal, and the final storage-v2 stamp. It is stronger than maintaining a second hand-written approximation.
+The private calls are deliberate: #22 is pinned to this exact commit, and these are the target's canonical completion/schema predicates. The #30 classifier explicitly distinguishes `modern_trigram` from `unknown_same_name`; historical same-name `tokenize='simple'` residue fails closed instead of being blessed by name.
 
-### Six-index acceptance table
+### 4.2 FTS5 external-content integrity + title/ID/display-name MATCH smoke
 
-| Surface | Durable identity | Completion rule |
-|---|---|---|
-| `messages_fts` | modern external-content message FTS | target evaluator accepts; no message Unicode H/P markers |
-| `messages_fts_trigram` | modern derived-source trigram message FTS | target evaluator accepts; same message rebuild lane complete |
-| `messages_fts_cjk` | CJK external-content message FTS | required when CJK capability/work is present; otherwise absence is allowed only when target evaluator has no blocker |
-| `sessions_fts` | `title`, `id`, `display_name`, source `sessions`, rowid `row_id` | no session Unicode H/P markers; target evaluator accepts |
-| `sessions_fts_trigram` | source `sessions_fts_trigram_src`, rowid `row_id`, `tokenize='trigram'`, columns `title/id/display_name`, four modern triggers | no trigram H/P/stale markers; exact modern identity; target evaluator accepts |
-| `sessions_fts_cjk` | CJK metadata FTS over `title/id/display_name` | required when CJK capability/work is present; otherwise absence is allowed only when target evaluator has no blocker |
-
-At this target `SCHEMA_VERSION=25` and `FTS_STORAGE_VERSION=2`; see [`hermes_state_common.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_common.py#L145-L180) and the six descriptors in the same file.
-
-The final session trigram representation is the #16/#30 normalized metadata design: compact separator forms for title/display-name, raw `id`, and external content through `sessions_fts_trigram_src`. The historical same-name `sessions_fts_trigram` using `tokenize='simple'` is **not** compatible and must fail closed; see [`docs/research/issue-30-normalized-session-metadata-trigram-fts.md`](./issue-30-normalized-session-metadata-trigram-fts.md).
-
-## Checkpoint / stop matrix
-
-| Checkpoint | Continue when | Stop / retry rule |
-|---|---|---|
-| Source provenance | master path, size, SHA, mode, no sidecars all match | stop; resolve under #20; never repair master in place |
-| Target provenance | exact target object exists; accepted core is ancestor; detached worktree clean | stop; do not substitute floating `dev` |
-| Producer runtime | pinned environment resolves; Python-linked SQLite safe; FTS5 + trigram probes succeed | stop and choose a safe runtime; discard any DB already opened by a rejected runtime |
-| Candidate birth | fresh copy is byte-identical to master before open | discard candidate and copy master again |
-| Canonical pre-check | counts 7,268 / 231,513 / 78; integrity `ok`; FK 0 | discard candidate; investigate provenance |
-| Build | `optimize-storage --yes` reaches completion or reports resumable interruption | interruption: re-run exact command on same candidate; semantic/schema refusal: do not hand-edit markers, investigate/fix then restart from fresh copy |
-| Settlement | zero target evaluator blockers; v2 stamp; no active H/P/stale/optimize markers; no trash | reject artifact; re-run if target reports actionable resumable work, otherwise investigate before any retry |
-| Trigram identity | exact modern `tokenize='trigram'` + derived view/rowid/columns/triggers | hard reject; same-name `simple`/unknown schema must never be mutated or blessed manually |
-| Canonical post-check | counts unchanged; integrity `ok`; FK 0 | reject artifact |
-| Freeze | no live writer, sidecars settled, final file hashed and chmod 0400 | do not promote until receipt is complete |
-
-## Freeze and artifact receipt
-
-After all acceptance checks pass, close every build connection. Ensure no process is using the isolated build home. A final writable checkpoint of the **candidate only** is allowed before freeze if a non-empty WAL remains; never do this to the master.
-
-Recommended final artifact name:
-
-```text
-/home/skywind/hermes-recovery/production-builds/<RUN_ID>/state.production-ready.<TARGET_SHORT>.db
-```
-
-Recommended final sequence:
+Run before freeze, on the candidate only, with the same producer runtime. This validates every actually present modern FTS table against its external content and proves that all three session metadata fields are searchable on every present session index.
 
 ```bash
-# Candidate only; run after verifier, before chmod/freeze.
+WORK_DB="$WORK_DB" "$PY" - <<'PY'
+import os
+from pathlib import Path
+
+from hermes_state import SessionDB
+from hermes_state_common import compact_session_metadata_text
+
+path = Path(os.environ["WORK_DB"])
+db = SessionDB(path)
+try:
+    conn = db._conn
+    present = {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    indexes = [
+        name for name in (
+            "messages_fts", "messages_fts_trigram", "messages_fts_cjk",
+            "sessions_fts", "sessions_fts_trigram", "sessions_fts_cjk",
+        ) if name in present
+    ]
+
+    # FTS5 rank=1 integrity-check also cross-checks external content.
+    for table in indexes:
+        conn.execute(
+            f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)"
+        )
+        print(f"fts_integrity={table}:ok")
+    # The special command is validation, not canonical data mutation.
+    conn.rollback()
+
+    def quote_fts(text: str) -> str:
+        return '"' + text.replace('"', '""') + '"'
+
+    def probe_session_field(table: str, field: str) -> None:
+        rows = conn.execute(
+            f"SELECT row_id, {field} FROM sessions "
+            f"WHERE {field} IS NOT NULL AND TRIM({field}) <> '' "
+            "ORDER BY row_id LIMIT 1000"
+        ).fetchall()
+        for row in rows:
+            rowid = int(row[0])
+            raw = str(row[1])
+            value = (
+                compact_session_metadata_text(raw)
+                if table == "sessions_fts_trigram" and field in {"title", "display_name"}
+                else raw
+            )
+            # Built-in trigram requires >=3 characters to produce useful grams.
+            if table == "sessions_fts_trigram" and len(value) < 3:
+                continue
+            query = f"{field} : {quote_fts(value)}"
+            try:
+                hit = conn.execute(
+                    f"SELECT 1 FROM {table} WHERE {table} MATCH ? AND rowid = ? LIMIT 1",
+                    (query, rowid),
+                ).fetchone()
+            except Exception:
+                hit = None
+            if hit is not None:
+                print(f"match_probe={table}.{field}:ok rowid={rowid}")
+                return
+        raise SystemExit(f"FAIL no passing MATCH probe for {table}.{field}")
+
+    for table in ("sessions_fts", "sessions_fts_trigram", "sessions_fts_cjk"):
+        if table not in present:
+            continue
+        for field in ("title", "id", "display_name"):
+            probe_session_field(table, field)
+finally:
+    db.close()
+PY
+```
+
+The production artifact is not modified in canonical rows by these probes. The FTS special integrity command is run before freeze and rolled back; the MATCH probes are reads.
+
+If optional CJK was never established and the producer lacks the tokenizer, absence is acceptable only when the target storage-v2 evaluator returns **zero blockers**. If CJK exists, it must be internally/external-content clean and the session CJK index must pass the same three-field MATCH smoke.
+
+## 5. Six-index acceptance state
+
+| Surface | Required production meaning |
+|---|---|
+| `messages_fts` | modern external-content Unicode message FTS, complete |
+| `messages_fts_trigram` | modern derived-source trigram message FTS, complete |
+| `messages_fts_cjk` | complete when optional CJK capability/work is established; otherwise valid absence only if target evaluator has no blocker |
+| `sessions_fts` | external-content `title`, logical `id`, `display_name` over `sessions.row_id`, complete |
+| `sessions_fts_trigram` | **exact** #30 modern identity: derived `sessions_fts_trigram_src`, `content_rowid='row_id'`, `tokenize='trigram'`, compacted title/display-name + raw id, exact modern triggers |
+| `sessions_fts_cjk` | complete CJK metadata surface when capability/work is established; otherwise valid absence only if target evaluator has no blocker |
+
+At this target, storage-v2 acceptance additionally means no required H/P/stale breadcrumb remains, no `fts_v22_trash_%` object remains, no `fts_optimize_available` residue remains, and the shared evaluator has no blocker. See [`docs/research/issue-31-storage-v2-settlement.md`](./issue-31-storage-v2-settlement.md).
+
+The same-name trigram rule comes from [`docs/research/issue-30-normalized-session-metadata-trigram-fts.md`](./issue-30-normalized-session-metadata-trigram-fts.md): name alone is never identity. `tokenize='simple'`, source collisions, incomplete modern trigger ownership, or another near-match is `unknown_same_name` and must remain fail-closed.
+
+## 6. VACUUM result and retry semantics
+
+`optimize_fts_storage()` treats FTS/storage settlement and physical VACUUM as separate outcomes. A VACUUM failure can still leave logically complete storage-v2 state and stamp v2. In that state **re-running `optimize-storage` may correctly say “already compact” and will not necessarily retry VACUUM**.
+
+The CLI itself points physical reclaim to `hermes sessions optimize`; see [`sessions_cmd.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sessions_cmd.py#L970-L1045) and its post-`optimize-storage` VACUUM-failure message.
+
+Therefore:
+
+- If the default `optimize-storage` VACUUM succeeds: continue.
+- If it reports `VACUUM was skipped or failed`: record that fact, investigate/free disk, then run **on the same isolated candidate**:
+
+```bash
+HERMES_HOME="$BUILD_HOME" "$HERMES" sessions optimize \
+  2>&1 | tee "$BUILD_ROOT/post-storage-optimize.log"
+```
+
+Then re-run all artifact verifiers. If the failure indicates I/O/corruption rather than simple space pressure, stop and investigate instead of treating it as a reclaim-only problem.
+
+## 7. Freeze and receipt
+
+After every verifier passes, close build connections and ensure no process is using the isolated build home. A final checkpoint is allowed on the **candidate only**:
+
+```bash
 WORK_DB="$WORK_DB" "$PY" - <<'PY'
 import os
 import sqlite3
 from pathlib import Path
+
 p = Path(os.environ["WORK_DB"])
 conn = sqlite3.connect(p)
 try:
-    print("wal_checkpoint=", conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+    result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    print("wal_checkpoint=", result)
 finally:
     conn.close()
 PY
@@ -434,7 +456,7 @@ ARTIFACT_SIZE=$(stat -c %s "$ARTIFACT")
 ARTIFACT_SHA=$(sha256sum "$ARTIFACT" | awk '{print $1}')
 printf 'artifact=%s\nsize=%s\nsha256=%s\n' "$ARTIFACT" "$ARTIFACT_SIZE" "$ARTIFACT_SHA"
 
-# Re-prove the source master remained untouched.
+# Re-prove the master was never touched.
 test "$(stat -c %s "$MASTER")" -eq "$MASTER_SIZE"
 test "$(sha256sum "$MASTER" | awk '{print $1}')" = "$MASTER_SHA"
 test "$(stat -c %a "$MASTER")" = 400
@@ -443,62 +465,65 @@ test ! -e "${MASTER}-shm"
 test ! -e "${MASTER}-journal"
 ```
 
-If `wal_checkpoint(TRUNCATE)` reports busy or leaves a non-empty WAL, **do not freeze/promote**. Find the unexpected connection to the isolated build home, close it, and retry the candidate checkpoint. Do not copy only the main DB while ignoring a live WAL.
+If checkpoint reports busy or leaves a non-empty WAL, do not freeze/promote. Find the unexpected connection to the isolated build home, close it, and retry the candidate checkpoint. Never copy only a main DB while ignoring a live WAL.
 
-The receipt stored beside the artifact should contain at least:
+The receipt beside the artifact must record at least:
 
-- `run_id`
-- canonical master path / size / SHA-256 / mode, plus post-build re-verification
-- target full SHA and `TARGET_SHORT`
-- accepted-core ancestry result
-- source worktree clean-state result
-- exact build command and `optimize-storage.log` path
-- `HERMES_HOME` used for the build
-- Python executable + Python version
-- Python-linked SQLite version + `sqlite_source_id()`
-- target WAL-reset classifier result
-- FTS5 and trigram probe results
-- observed CJK capability/schema/availability result
-- `schema_version`
-- `fts_storage_version`
-- active rebuild/stale/optimize marker list (must be empty)
-- storage-v2 blocker list (must be empty)
-- six-index/schema identity verdict, including modern session trigram proof
-- canonical post-build row counts
-- `PRAGMA integrity_check` result
-- `PRAGMA foreign_key_check` violation count
-- final artifact path / size / SHA-256 / mode
-- final sidecar state
-- producer timestamp in UTC
+- `run_id` and UTC producer timestamp;
+- canonical master path / size / SHA-256 / mode before and after build;
+- target full SHA, short SHA, accepted-core ancestry result, detached-worktree cleanliness;
+- exact `HERMES_HOME` and build command/log path;
+- Python executable/version;
+- Python-linked SQLite version and `sqlite_source_id()`;
+- target WAL-reset classifier verdict;
+- FTS5/trigram probes and observed CJK loaded/schema/availability state;
+- `schema_version` and `fts_storage_version`;
+- active H/P/stale/optimize markers (must be empty);
+- target storage-v2 blocker list (must be empty);
+- session trigram classifier result (must be `modern_trigram`);
+- FTS5 external-content integrity results for every present index;
+- title/ID/display-name MATCH smoke results for every present session index;
+- canonical post-build counts;
+- `PRAGMA integrity_check` and FK violation count;
+- VACUUM result, including any `sessions optimize` reclaim retry;
+- final artifact path / size / SHA-256 / mode and sidecar state.
 
-The output artifact SHA is expected to differ from the recovered master because schema/FTS/VACUUM work changes the file. The invariant is that the **source master SHA never changes** and the canonical relational counts/integrity remain accepted.
+The output artifact SHA is expected to differ from the recovered master: derived schema/FTS/VACUUM state changed. The protected invariant is that the **source master SHA never changes**, while canonical relational counts/relationships and integrity remain accepted.
 
-## Rollback / retry policy
+## 8. Stop / rollback / retry matrix
 
-1. **Before any candidate open:** any provenance/runtime failure → fix the environment and make a new fresh copy.
-2. **Normal interruption during `optimize-storage`:** keep the same isolated candidate and re-run the exact pinned command; the rebuild lanes are designed to resume from durable markers.
-3. **Unknown same-name trigram schema, non-actionable storage blocker, integrity/FK/count failure, or unexplained schema state:** reject the candidate. Do **not** edit `sqlite_master`, FTS H/P/stale markers, or `fts_storage_version` to force acceptance. Investigate first; after a code/environment fix, start again from a fresh canonical copy.
-4. **VACUUM alone fails for space:** the optimizer treats physical reclaim separately from logical migration. For #22 production acceptance, free enough disk and re-run with the default VACUUM path rather than silently downgrading to `--no-vacuum`.
-5. **After freeze:** never resume migration on the frozen production artifact. If acceptance evidence is later found incomplete, quarantine it and rebuild from the frozen recovered canonical master.
-6. **Promotion/restart is out of scope for #42/#22 build production.** #23 owns the rollout/cutover after the frozen artifact and receipt exist.
+| Failure point | Correct action |
+|---|---|
+| Master path/hash/size/mode/sidecar mismatch | hard stop; resolve under #20; never repair master |
+| Target/ancestry mismatch | hard stop; do not float `dev` |
+| Unsafe Python-linked SQLite or missing FTS5/trigram | select safe runtime; if candidate was already opened by rejected runtime, discard it and copy master again |
+| Fresh-copy hash/count/integrity/FK mismatch | discard candidate; investigate provenance |
+| Normal interruption during rebuild | re-run exact pinned `optimize-storage` on the **same** candidate; durable H/P state is designed to resume |
+| Unknown same-name trigram / source collision / non-actionable durable blocker | do not edit `sqlite_master` or markers; investigate; after code/environment correction start from fresh master copy |
+| `optimize-storage` VACUUM-only failure | if logical validators settle cleanly, fix space/cause and use `hermes sessions optimize` on same candidate, then re-verify |
+| FTS integrity/MATCH probe failure | reject candidate; do not freeze; investigate index/schema/runtime cause |
+| Canonical post-build count/integrity/FK failure | reject candidate; rebuild only after root cause is understood |
+| Frozen artifact later found incomplete | quarantine it; never resume migration on the frozen artifact; rebuild from frozen canonical master |
 
-## Primary-source map
+Promotion/restart is outside this research/build handoff. #23 owns cutover after #22 has a frozen artifact and complete receipt.
+
+## 9. Primary-source map
 
 - #42 research contract: https://github.com/Skywind5487/hermes-agent/issues/42
 - #22 execution contract: https://github.com/Skywind5487/hermes-agent/issues/22
-- #20 recovered canonical source: https://github.com/Skywind5487/hermes-agent/issues/20
-- Final #12 closure audit / #79: https://github.com/Skywind5487/hermes-agent/issues/79
-- CLI parser: [`hermes_cli/main.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/main.py#L12154-L12190)
-- CLI execution seam: [`hermes_cli/sessions_cmd.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sessions_cmd.py#L1032-L1135)
-- Foreground optimizer / settlement: [`hermes_state_search.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_search.py#L1460-L1685)
-- Rebuild lane registry: [`hermes_state_search.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_search.py#L150-L315)
-- Runtime DB-path resolution: [`hermes_state.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state.py#L490-L525)
-- Six FTS descriptors / schema constants: [`hermes_state_common.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_common.py)
-- SQLite runtime classifier: [`hermes_cli/sqlite_runtime.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sqlite_runtime.py)
-- Modern same-name trigram design / fail-closed classifier: [`docs/research/issue-30-normalized-session-metadata-trigram-fts.md`](./issue-30-normalized-session-metadata-trigram-fts.md)
-- Storage-v2 settlement audit: [`docs/research/issue-31-storage-v2-settlement.md`](./issue-31-storage-v2-settlement.md)
-- Final negative-space / marker audit: [`docs/research/issue-79-session-recovery-trigram-markers.md`](./issue-79-session-recovery-trigram-markers.md)
+- #20 canonical recovery source: https://github.com/Skywind5487/hermes-agent/issues/20
+- #79 final #12 closure audit: https://github.com/Skywind5487/hermes-agent/issues/79
+- optimizer CLI parser: [`hermes_cli/main.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/main.py#L12154-L12190)
+- optimizer CLI execution: [`hermes_cli/sessions_cmd.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sessions_cmd.py#L1032-L1145)
+- storage optimizer/settlement: [`hermes_state_search.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_search.py#L1460-L1685)
+- rebuild-lane registry: [`hermes_state_search.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_search.py#L150-L315)
+- DB-path resolution: [`hermes_state.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state.py#L490-L525)
+- schema/index descriptors and version constants: [`hermes_state_common.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_state_common.py)
+- SQLite producer-runtime classifier: [`hermes_cli/sqlite_runtime.py`](https://github.com/Skywind5487/hermes-agent/blob/4e5ad5c2230300d1ffae84b089ffc70e368c8a23/hermes_cli/sqlite_runtime.py)
+- modern normalized session trigram design: [`docs/research/issue-30-normalized-session-metadata-trigram-fts.md`](./issue-30-normalized-session-metadata-trigram-fts.md)
+- storage-v2 settlement contract: [`docs/research/issue-31-storage-v2-settlement.md`](./issue-31-storage-v2-settlement.md)
+- final negative-space/marker audit: [`docs/research/issue-79-session-recovery-trigram-markers.md`](./issue-79-session-recovery-trigram-markers.md)
 
-## Handoff to #22
+## 10. Handoff verdict
 
-#22 is ready for an execution agent once this research note is merged and the distilled issue handoff is posted. The executor should treat the command blocks above as the production recipe, preserving the stop conditions rather than optimizing them away.
+The research surface is stable enough to hand #22 to an execution agent **after this note is merged and the distilled #22 comment is posted**. The executor should preserve the pin, isolation boundary, exact target predicates, and stop conditions rather than simplifying them away.
