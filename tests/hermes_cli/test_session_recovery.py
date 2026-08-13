@@ -606,6 +606,72 @@ def test_session_cjk_derived_keys_are_generated_meta():
         assert key in session_recovery._GENERATED_META_KEYS, key
 
 
+def test_session_trigram_derived_keys_are_generated_meta():
+    """#79: the session-trigram derived markers (H/P/stale) are regenerated
+    from the fresh destination's own schema on recovery — never copied from
+    the source — mirroring the #25 session Unicode and #26 session CJK
+    lanes."""
+    for key in (
+        "fts_session_trigram_rebuild_high_water",
+        "fts_session_trigram_rebuild_progress",
+        "fts_session_trigram_stale",
+    ):
+        assert key in session_recovery._GENERATED_META_KEYS, key
+
+
+def test_recovery_strips_session_trigram_derived_markers(
+    tmp_path: Path,
+) -> None:
+    """Session-trigram transition markers must not reach the recovered DB.
+
+    #31's final merge note recorded this as a pre-existing #30 recovery gap:
+    the session-trigram lane was missing from both _GENERATED_META_KEYS and
+    the pending_fts_keys verifier, so a source DB carrying trigram transition
+    state had that derived bookkeeping copied into the new DB as ordinary
+    state_meta, and verification never flagged it.
+    """
+    source = tmp_path / "trigram-markers.db"
+    output = tmp_path / "trigram-markers-recovered.db"
+    _make_source(source)
+
+    db = SessionDB(db_path=source)
+    try:
+        # The source carries trigram transition state: a partially-done
+        # rebuild plus a stale breadcrumb, exactly the shape the #30 lane
+        # can leave behind before recovery.
+        db.set_meta("fts_session_trigram_rebuild_high_water", "999")
+        db.set_meta("fts_session_trigram_rebuild_progress", "500")
+        db.set_meta("fts_session_trigram_stale", "1")
+    finally:
+        db.close()
+
+    report = recover_session_database(
+        source,
+        output,
+        work_dir=tmp_path,
+        chunk_size=16,
+    )
+
+    assert report["verified"] is True
+    assert report["complete"] is True
+    assert report["verification"]["healthy"] is True
+    assert report["verification"]["pending_fts_keys"] == []
+
+    conn = sqlite3.connect(str(output))
+    try:
+        recovered_keys = {
+            str(row[0]) for row in conn.execute("SELECT key FROM state_meta")
+        }
+    finally:
+        conn.close()
+    for key in (
+        "fts_session_trigram_rebuild_high_water",
+        "fts_session_trigram_rebuild_progress",
+        "fts_session_trigram_stale",
+    ):
+        assert key not in recovered_keys, key
+
+
 def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
     tmp_path: Path,
 ) -> None:
