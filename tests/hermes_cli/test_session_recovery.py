@@ -672,6 +672,65 @@ def test_recovery_strips_session_trigram_derived_markers(
         assert key not in recovered_keys, key
 
 
+@pytest.mark.parametrize(
+    "marker_key",
+    (
+        "fts_session_trigram_rebuild_high_water",
+        "fts_session_trigram_rebuild_progress",
+        "fts_session_trigram_stale",
+    ),
+)
+def test_verify_flags_leftover_session_trigram_markers(
+    tmp_path: Path,
+    marker_key: str,
+) -> None:
+    """The recovered-DB verifier must detect a trigram transition marker that
+    survives recovery.
+
+    The behavioral recovery test above proves the copy path strips the
+    markers, but if someone later removes the trigram keys from the verifier's
+    pending_fts_keys inventory, a leftover marker would go un-noticed. This
+    guards the detection side of the two-layer fix (#79 item 1): build a
+    healthy recovered DB, seed one leftover marker, and require verification
+    to flag it.
+    """
+    source = tmp_path / "trigram-marker-source.db"
+    output = tmp_path / "trigram-marker-output.db"
+    _make_source(source)
+
+    report = recover_session_database(
+        source,
+        output,
+        work_dir=tmp_path,
+        chunk_size=16,
+    )
+    assert report["verified"] is True
+    assert report["complete"] is True
+
+    # Simulate a marker that survived the copy (e.g. the inventory drifts
+    # again and a future lane is omitted from _GENERATED_META_KEYS).
+    conn = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+            (marker_key, "1"),
+        )
+    finally:
+        conn.close()
+
+    verification = session_recovery._verify_recovered_database(
+        output,
+        expected_counts={},
+        copy_report={},
+    )
+    assert marker_key in verification["pending_fts_keys"]
+    assert verification["healthy"] is False
+    assert any(
+        "derived FTS transition markers remain" in error
+        for error in verification["errors"]
+    )
+
+
 def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
     tmp_path: Path,
 ) -> None:
