@@ -116,6 +116,31 @@ A **new** producer interpreter reopens the same clone. All passed:
   `source.before.txt` **byte-for-byte** (`cmp -s` passes): SHA `3a3a410f…6818f`,
   size `1667649536`, mode `0400`, no `-wal/-shm/-journal` sidecars.
 
+## 6.5 Supplementary direct-MATCH coverage (all six FTS lanes)
+
+Process A/B drove the public router, which on this CJK-capable runtime routes
+message search through `fts5` (ASCII) / `fts_cjk` (CJK) and never through the
+`messages_fts_trigram` fallback. A follow-up **read-only** probe
+(`supplemental-coverage.json`, `SessionDB(read_only=True)` + direct `MATCH`
+against every FTS table) closes that gap — all six lanes hit the new row:
+
+```text
+messages_fts           "RestartMessageNeedle"  → hit 287815
+messages_fts_trigram   "RestartMessageNeedle"  → hit 287815   (router-fallback lane)
+messages_fts_cjk       "重啟訊息龍門"            → hit 287815
+sessions_fts           "QuartzNeedle"          → hit 7326
+sessions_fts_trigram   "Needle"                → hit 7326
+sessions_fts_cjk       "重啟龍門"               → hit 7326
+```
+
+The `like_scan` fallback route was also exercised via the public router with a
+lone single CJK character (`"龍"`): route `like_scan`, hit. Note: on a
+read-only open `_fts_cjk_available` stays `False` (read-only skips
+`_probe_fts_cjk`), so `_describe_search_path` reports `trigram` for the CJK
+query even though the public CJK search still returns the message
+(`returned=1`); the writable Process A/B used the real `fts_cjk` route. This is
+a descriptor-flag difference, not a data problem.
+
 ## 7. Evidence directory
 
 ```text
@@ -128,6 +153,7 @@ write-evidence.json                       Process-A writes + immediate search pr
 restart-evidence.json                     Process-B persistence/search/integrity proofs
 restart-validation.log                    full gate + A + B stdout/stderr
 forbidden-warnings.txt                    empty (clean)
+supplemental-coverage.json                read-only direct MATCH on all six FTS lanes + like_scan
 ```
 
 ## Acceptance criteria
