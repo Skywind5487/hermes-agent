@@ -7472,7 +7472,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the highest existing number and increments.
         """
         # Strip existing #N suffix to find the true base
-        match = re.match(r'^(.*?) #(\d+)$', base_title)
+        match = re.match(r'^(.*?) #([0-9]+)$', base_title)
         if match:
             base = match.group(1)
         else:

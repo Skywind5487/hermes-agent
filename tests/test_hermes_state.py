@@ -1587,6 +1587,23 @@ class TestNumberedTitleLiteralSafety:
         db.set_session_title("s1", "100% done #2")
         assert db.get_next_title_in_lineage("100% done") == "100% done #3"
 
+    def test_resolve_title_with_hash_in_base(self, db):
+        """A '#' inside the base stays literal ('my #project' must find
+        'my #project #2')."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "my #project")
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "my #project #2")
+        # The numbered continuation (most recent) wins over the exact base.
+        assert db.resolve_session_by_title("my #project") == "s2"
+
+    def test_next_title_fullwidth_suffix_not_stripped(self, db):
+        """A fullwidth-digit suffix is not an ASCII-integer '#N': the input
+        'foo #２' is a literal base, never 'foo' + a numbered suffix (#15)."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        assert db.get_next_title_in_lineage("foo #２") == "foo #２"
+
 
 class TestListSessionsRich:
     """Tests for enhanced session listing with preview and last_active."""

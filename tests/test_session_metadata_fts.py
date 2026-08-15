@@ -1377,6 +1377,23 @@ class TestBoundedGapSearch:
         finally:
             r.close()
 
+    def test_resolve_like_lane_accepts_integer_suffix(self, tmp_path):
+        """The LIKE fallback lane must also RESOLVE integer '#N' continuations
+        whose base contains a wildcard ('my_notes' -> 'my_notes #2') (#15)."""
+        db_path = tmp_path / "s.db"
+        w = SessionDB(db_path=db_path)
+        w.create_session("s1", source="cli")
+        w.set_session_title("s1", "my_notes #2")
+        w.close()
+        r = SessionDB(db_path=db_path)
+        try:
+            # Break only the session FTS lane (message FTS stays alive).
+            r._conn.execute("DROP TABLE sessions_fts")
+            r._conn.commit()
+            assert r.resolve_session_by_title("my_notes") == "s1"
+        finally:
+            r.close()
+
 
 # =========================================================================
 # Group F — concurrency + shared throttle
