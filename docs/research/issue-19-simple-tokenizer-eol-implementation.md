@@ -19,14 +19,26 @@ Branch: `feat/19-simple-tokenizer-eol`
   lane's sync triggers) before `_init_schema()` can touch the unloadable
   tokenizer. The retired vtable is never connected (`writable_schema`
   surgery + `DROP TRIGGER`); canonical `sessions` / `messages` rows are
-  preserved and the modern FTS lifecycle converges. Modern/foreign
-  same-name objects fail closed, untouched.
+  preserved and the modern FTS lifecycle converges.
+- **Exact-signature fail-closed** (review round): the recognizer matches the
+  root by normalized-DDL identity against the exact historical Hermes
+  declarations (`_SIMPLE_MESSAGE_ROOT_DDL` / `_SIMPLE_SESSION_ROOT_DDL`),
+  never by a `tokenize='simple'` substring, and drops only the fixed
+  historical Hermes sync-trigger allowlist (`_SIMPLE_RESIDUE_TRIGGER_NAMES`)
+  — a foreign same-name vtable or same-prefix trigger survives untouched.
+  `VACUUM` after the surgery reclaims the detached shadow-table pages so
+  `integrity_check` / the repair health re-probe see a clean file.
+- **Repair integration** (review round): `repair_state_db_schema` runs the
+  sanitation first (strategy `simple_eol_sanitized`), so a session-lane
+  residue DB is repairable without escalating to corruption repair.
 - **Deleted** the dead `tests/test_optional_cjk_tokenizer_fallback.py`
   (referenced removed shim symbols; asserted the retired
   simple-as-optional-tokenizer policy).
 - **Added** `tests/test_simple_tokenizer_eol.py`: message/session residue
-  convergence, unknown same-name fail-closed, loader-gone, and
-  health-probe-without-simple policy pins.
+  convergence, unknown same-name fail-closed, loader-gone,
+  health-probe-without-simple, foreign simple-shape untouched, foreign
+  same-prefix trigger survival, repair `simple_eol_sanitized`, and
+  read-only-never-loads-simple policy pins.
 
 No `SCHEMA_VERSION` / `FTS_STORAGE_VERSION` bump. No new durable marker or
 state machine. Historical research notes (#40) remain historical.

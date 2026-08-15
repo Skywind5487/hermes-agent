@@ -1646,6 +1646,31 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         bpath = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
 
+    # ── Strategy -1: #19 EOL sanitation of retired simple-tokenizer residue ──
+    # A DB carrying the exact historical tokenize='simple' residue probes
+    # unhealthy (its triggers raise "no such tokenizer: simple" without the
+    # retired shim) but needs no corruption repair — the residue is
+    # structurally detached and the next writable open converges to the modern
+    # lifecycle. Sanitize first so the remaining strategies see a converged
+    # schema instead of escalating a non-corruption capability gap.
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            sanitized = _sanitize_retired_simple_residue(conn)
+        finally:
+            conn.close()
+        if sanitized and _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "simple_eol_sanitized"
+            logger.warning(
+                "state.db simple-tokenizer residue EOL-cleaned: %s", db_path
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "state.db simple-tokenizer EOL sanitation pass failed: %s", exc
+        )
+
     # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
     # The FTS5 'rebuild' command rewrites the internal index from the canonical
     # content table. This is the recommended, least-destructive recovery for a
@@ -1916,14 +1941,30 @@ def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
 # The fork's pre-v23 / pre-#30 dev builds created ``messages_fts_trigram`` and
 # ``sessions_fts_trigram`` with ``tokenize='simple'`` (a loadable jieba-CJK
 # tokenizer). Final #12/#30 classify those as unsupported history. #19
-# structurally detaches ONLY that exact residue on writable open — before
-# ``_init_schema`` can touch the unloadable tokenizer — and removes the
-# loadable-extension shim entirely. Modern/foreign same-name objects are left
-# untouched.
+# structurally detaches ONLY the exact historical Hermes residue on writable
+# open — before ``_init_schema`` can touch the unloadable tokenizer — and
+# removes the loadable-extension shim entirely. Same-name objects that are not
+# the exact Hermes signature (modern or foreign) fail closed, untouched.
+
+# The exact historical Hermes root declarations (stored ``sqlite_master.sql``),
+# matched by normalized-DDL identity so a foreign same-name vtable that merely
+# uses the simple tokenizer is never deleted.
+_SIMPLE_MESSAGE_ROOT_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+    content,
+    tokenize='simple'
+);
+"""
+_SIMPLE_SESSION_ROOT_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_trigram USING fts5(
+    title,
+    tokenize='simple'
+);
+"""
+# root name -> (exact root declaration, FTS5 shadow tables)
 _SIMPLE_RESIDUE_SPECS = {
-    # root name -> (canonical base table, FTS5 shadow tables)
     "messages_fts_trigram": (
-        "messages",
+        _SIMPLE_MESSAGE_ROOT_DDL,
         (
             "messages_fts_trigram_data",
             "messages_fts_trigram_idx",
@@ -1933,7 +1974,7 @@ _SIMPLE_RESIDUE_SPECS = {
         ),
     ),
     "sessions_fts_trigram": (
-        "sessions",
+        _SIMPLE_SESSION_ROOT_DDL,
         (
             "sessions_fts_trigram_data",
             "sessions_fts_trigram_idx",
@@ -1943,22 +1984,38 @@ _SIMPLE_RESIDUE_SPECS = {
         ),
     ),
 }
+# The exact historical Hermes sync trigger names per lane — a fixed allowlist,
+# never a name-prefix sweep (a foreign same-prefix trigger must survive).
+_SIMPLE_RESIDUE_TRIGGER_NAMES = {
+    "messages_fts_trigram": (
+        "messages_fts_trigram_insert",
+        "messages_fts_trigram_delete",
+        "messages_fts_trigram_update",
+    ),
+    "sessions_fts_trigram": (
+        "sessions_fts_trigram_insert",
+        "sessions_fts_trigram_delete",
+        "sessions_fts_trigram_update",
+    ),
+}
 
 
 def _sanitize_retired_simple_residue(conn: sqlite3.Connection) -> int:
     """#19: structurally detach the fork's retired ``tokenize='simple'``
     residue before ``_init_schema`` can touch the unloadable tokenizer.
 
-    Recognized only by exact root name + ``tokenize='simple'`` in the stored
-    DDL (the historical Hermes message/session trigram residue). The lane's
+    Recognized ONLY by exact root name + exact historical Hermes root
+    declaration (normalized-DDL identity), so a foreign same-name vtable that
+    merely uses the simple tokenizer is never deleted. The lane's known Hermes
     sync triggers are dropped, then the root + its five FTS5 shadow tables are
     removed via ``writable_schema`` surgery — the retired vtable is never
-    connected. Modern/foreign same-name objects are left untouched. Returns
-    the number of recognized roots detached.
+    connected. Canonical rows are untouched. Returns the number of recognized
+    roots detached (used by ``repair_state_db_schema``).
     """
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     found = []
-    for root, (base, shadows) in _SIMPLE_RESIDUE_SPECS.items():
+    for root, (root_ddl, shadows) in _SIMPLE_RESIDUE_SPECS.items():
         row = cursor.execute(
             "SELECT type, sql FROM sqlite_master "
             "WHERE name = ? AND type IN ('table', 'view', 'index')",
@@ -1966,25 +2023,22 @@ def _sanitize_retired_simple_residue(conn: sqlite3.Connection) -> int:
         ).fetchone()
         if row is None:
             continue
-        if (row["type"] if isinstance(row, sqlite3.Row) else row[0]) != "table":
+        if row["type"] != "table":
             continue  # same-name VIEW/INDEX — not a Hermes vtable
-        sql = (row["sql"] if isinstance(row, sqlite3.Row) else row[1]) or ""
-        if "tokenize='simple'" not in sql:
-            continue  # modern / foreign same-name → untouched
-        found.append((root, base, shadows))
+        sql = row["sql"] or ""
+        if _normalize_ddl_for_identity(sql) != _normalize_ddl_for_identity(
+            root_ddl
+        ):
+            continue  # not the exact Hermes simple signature → fail closed
+        found.append((root, shadows))
     if not found:
         return 0
-    for root, base, _shadows in found:
-        # Drop the lane's sync triggers (DROP TRIGGER never connects the
-        # retired vtable; the root match already owns this namespace).
-        for trow in cursor.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type = 'trigger' AND tbl_name = ? AND name LIKE ?",
-            (base, f"{root}_%"),
-        ).fetchall():
-            name = trow[0] if isinstance(trow, sqlite3.Row) else trow[0]
+    for root, _shadows in found:
+        # Drop only the lane's exact known Hermes sync triggers (fixed
+        # allowlist; DROP TRIGGER never connects the retired vtable).
+        for name in _SIMPLE_RESIDUE_TRIGGER_NAMES[root]:
             cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
-    names = [n for root, _b, shadows in found for n in (root, *shadows)]
+    names = [n for root, shadows in found for n in (root, *shadows)]
     placeholders = ", ".join("?" for _ in names)
     conn.execute("PRAGMA writable_schema=ON")
     conn.execute(
@@ -1994,10 +2048,16 @@ def _sanitize_retired_simple_residue(conn: sqlite3.Connection) -> int:
     )
     conn.execute("PRAGMA writable_schema=RESET")
     conn.commit()
+    # The raw sqlite_master DELETE leaves the detached shadow-table pages
+    # unreferenced; integrity_check reports them as "Page N: never used" until
+    # VACUUM reclaims them (same teardown discipline as
+    # _drop_owned_fts_derived_schema), so both the writable open and the repair
+    # health re-probe see a clean file. Runs only when residue was found.
+    conn.execute("VACUUM")
     logger.warning(
         "issue #19: retired %d historical tokenize='simple' FTS residue "
         "object(s): %s",
-        len(found), ", ".join(root for root, _b, _s in found),
+        len(found), ", ".join(root for root, _s in found),
     )
     return len(found)
 
