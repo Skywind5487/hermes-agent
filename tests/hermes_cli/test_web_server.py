@@ -1637,6 +1637,55 @@ class TestWebServerEndpoints:
         # Unfiltered corpus totals stay intact for response compatibility.
         assert payload["total"] >= 206
 
+    def test_profiles_sessions_search_cross_profile(self, tmp_path, monkeypatch):
+        """``q`` fans out to EVERY profile's state.db through the same seam and
+        surfaces an old match from a second profile without crossing
+        profile/source/archive scope. Isolates Path.home() too so profile
+        fan-out resolves inside the test temp dir."""
+        from pathlib import Path as _Path
+
+        from hermes_state import SessionDB
+
+        monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+        home = tmp_path / ".hermes"
+        home.mkdir(exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        # Default profile: an old matching session under 210 recents.
+        default_db = SessionDB(db_path=home / "state.db")
+        try:
+            default_db.create_session("default_old", source="cli")
+            default_db.set_session_title("default_old", "Cross Needle Default")
+            for i in range(210):
+                default_db.create_session(f"default_recent_{i}", source="cli")
+            default_db._conn.commit()
+        finally:
+            default_db.close()
+
+        # Second profile: an old matching session under its own recents.
+        second_home = home / "profiles" / "second"
+        second_home.mkdir(parents=True, exist_ok=True)
+        second_db = SessionDB(db_path=second_home / "state.db")
+        try:
+            second_db.create_session("second_old", source="cli")
+            second_db.set_session_title("second_old", "Cross Needle Second")
+            for i in range(210):
+                second_db.create_session(f"second_recent_{i}", source="cli")
+            second_db._conn.commit()
+        finally:
+            second_db.close()
+
+        resp = self.client.get(
+            "/api/profiles/sessions?q=cross%20needle&limit=10&profile=all"
+        )
+        assert resp.status_code == 200
+        payload = resp.json()
+        ids = [s["id"] for s in payload["sessions"]]
+        assert "default_old" in ids
+        assert "second_old" in ids
+        # Every result stays within the two expected profiles (no scope leak).
+        assert {s["profile"] for s in payload["sessions"]} <= {"default", "second"}
+
     def test_get_session_messages_rejects_negative_limit(self):
         """limit=-1 previously bypassed the documented 500-row clamp because
         min(-1, 500) == -1, which SQLite treats as 'no limit'."""

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n/context'
@@ -132,5 +132,49 @@ describe('SessionPickerDialog', () => {
     fireEvent.click(await screen.findByText('Recent One'))
     expect(onResume).toHaveBeenCalledWith('recent-1')
     expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+
+  it('discards a stale older search response in favor of the latest', async () => {
+    // A slow 'a' search must not overwrite a newer 'ab' search that resolved
+    // first — the query key carries the debounced term, so react-query
+    // discards the stale in-flight response.
+    const STALE_RESPONSE = makeResponse([makeSession('stale-1', 'Stale Match')])
+    let resolveStale!: (v: PaginatedSessions) => void
+    const stalePromise = new Promise<PaginatedSessions>(res => {
+      resolveStale = res
+    })
+
+    mockedList.mockImplementation(async (limit, minMessages, archived, order, profile, filter, q) => {
+      if (q === 'a') {
+        return stalePromise
+      }
+      if (q === 'ab') {
+        return SEARCH_RESPONSE
+      }
+      return RECENT_RESPONSE
+    })
+
+    renderPicker()
+    const input = await screen.findByRole('combobox')
+    fireEvent.change(input, { target: { value: 'a' } })
+    await waitFor(() => {
+      expect(mockedList).toHaveBeenCalledWith(200, 1, 'exclude', 'recent', 'all', {}, 'a')
+    })
+
+    fireEvent.change(input, { target: { value: 'ab' } })
+    await waitFor(() => {
+      expect(mockedList).toHaveBeenCalledWith(200, 1, 'exclude', 'recent', 'all', {}, 'ab')
+    })
+    expect(await screen.findByText('Found Match')).toBeDefined()
+
+    // The stale 'a' response resolves AFTER 'ab' — it must not replace the
+    // newer results.
+    await act(async () => {
+      resolveStale(STALE_RESPONSE)
+    })
+    await waitFor(() => {
+      expect(screen.queryByText('Stale Match')).toBeNull()
+    })
+    expect(screen.getByText('Found Match')).toBeDefined()
   })
 })
