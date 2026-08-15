@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 from hermes_state import SessionDB
-from hermes_state_common import MAX_FTS5_QUERY_CHARS
+from hermes_state_common import MAX_FTS5_QUERY_CHARS, _compression_edge_sql
 
 #: (label, query) — each class exercises a distinct route.
 QUERY_CLASSES: dict[str, str] = {
@@ -108,10 +108,7 @@ def _legacy_broad_like_ms(db: SessionDB, needle: str, iterations: int) -> list[f
             FROM chain c
             JOIN sessions parent ON parent.id = c.cur_id
             JOIN sessions child ON child.parent_session_id = c.cur_id
-            WHERE parent.end_reason = 'compression'
-              AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
-              AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
-              AND COALESCE(child.source, '') != 'tool'
+            WHERE {edge}
         ),
         chain_max AS (
             SELECT root_id, MAX(COALESCE(sm.started_at, 0)) AS eff
@@ -126,7 +123,7 @@ def _legacy_broad_like_ms(db: SessionDB, needle: str, iterations: int) -> list[f
            OR LOWER(COALESCE(s.display_name, '')) LIKE ? ESCAPE '\\'
         ORDER BY COALESCE(cm.eff, s.started_at) DESC
         LIMIT 10
-    """
+    """.format(edge=_compression_edge_sql("parent", "child"))
     params = (pattern, pattern, pattern)
     # warm the page cache once
     with db._read_ctx() as conn:
@@ -143,14 +140,23 @@ def _legacy_broad_like_ms(db: SessionDB, needle: str, iterations: int) -> list[f
 def _benchmark_size(db: SessionDB, size: int, iterations: int) -> dict:
     results: dict[str, dict] = {}
 
-    def _counted_fallback(self, needle, *, conn=None, limit=None):
+    def _counted_fallback(self, needle, *, conn=None):
         _counted_fallback.calls += 1  # type: ignore[attr-defined]
-        return _orig_fallback(self, needle, conn=conn, limit=limit)
+        return _orig_fallback(self, needle, conn=conn)
 
     _orig_fallback = SessionDB._metadata_like_fallback_row_ids
     SessionDB._metadata_like_fallback_row_ids = _counted_fallback  # type: ignore[method-assign]
     try:
         for label, query in QUERY_CLASSES.items():
+            _counted_fallback.calls = 0  # type: ignore[attr-defined]
+            # COLD-OPEN: the first run after corpus build is recorded separately
+            # and never mixed into the warm percentiles (spec: record cold-open
+            # samples separately).
+            start = time.perf_counter()
+            db.list_sessions_rich(
+                search_query=query, order_by_last_active=True, limit=10
+            )
+            cold_ms = round((time.perf_counter() - start) * 1000, 3)
             _counted_fallback.calls = 0  # type: ignore[attr-defined]
             # Warm the routed path once so both lanes share a warm page cache.
             db.list_sessions_rich(
@@ -167,6 +173,24 @@ def _benchmark_size(db: SessionDB, size: int, iterations: int) -> dict:
                 final_counts.append(len(rows))
             fallback_calls = _counted_fallback.calls
             route = db._metadata_candidate_row_ids(query)
+            # Self-check (spec's correctness gate): FTS-hit lanes never run
+            # LIKE (0 calls); direct-LIKE lanes run exactly warmup+iterations
+            # (one per executed search). Known-hit classes must return rows.
+            expected_fallback = (
+                0
+                if route.path in ("unicode", "cjk+unicode", "trigram")
+                else iterations + 1
+            )
+            check = "ok"
+            if fallback_calls != expected_fallback:
+                check = (
+                    f"fallback={fallback_calls} expected={expected_fallback}"
+                )
+            if (
+                route.path in ("unicode", "cjk+unicode", "trigram")
+                and not final_counts[-1]
+            ):
+                check += " no-rows"
             results[label] = {
                 "query": query[:MAX_FTS5_QUERY_CHARS],
                 "route": route.path,
@@ -174,6 +198,8 @@ def _benchmark_size(db: SessionDB, size: int, iterations: int) -> dict:
                 "candidates": len(route.row_ids),
                 "final_rows": final_counts[-1] if final_counts else 0,
                 "fallback_calls": fallback_calls,
+                "check": check,
+                "cold_ms": cold_ms,
                 "routed": _warm_p50_p95(routed_samples),
                 "legacy_broad_like": _warm_p50_p95(
                     _legacy_broad_like_ms(db, query, iterations)
