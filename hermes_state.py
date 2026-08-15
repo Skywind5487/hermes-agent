@@ -30,6 +30,7 @@ import time
 import unicodedata
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -44,7 +45,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -81,6 +82,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+    _session_metadata_compact_sql,
     compact_session_metadata_text,
 )
 from hermes_state_portability import SessionPortabilityMixin
@@ -2166,6 +2168,24 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             pass
         finally:
             handle.close()
+
+
+@dataclass(frozen=True)
+class MetadataCandidateResult:
+    """Outcome of routing one metadata search query to whole-store row_ids.
+
+    ``path`` names the lane that produced the final ``row_ids``: ``"none"``
+    (empty query), ``"like"`` (direct / zero-result / route-failure canonical
+    LIKE fallback), ``"unicode"`` (raw Unicode token lane), ``"cjk+unicode"``
+    (CJK+Unicode union), or ``"trigram"`` (normalized trigram lane).
+    ``status`` is ``"hits"`` when ``row_ids`` is non-empty and ``"zero"`` when
+    the search ran but matched nothing. ``row_ids`` are stable
+    ``sessions.row_id`` values — never public text IDs.
+    """
+
+    path: Literal["none", "like", "unicode", "cjk+unicode", "trigram"]
+    status: Literal["hits", "zero"]
+    row_ids: Tuple[int, ...]
 
 
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
@@ -6953,7 +6973,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (f"{escaped} #%",),
             ))
 
-    def _session_fts_rebuild_gap(self) -> Optional[Tuple[int, int]]:
+    def _session_fts_rebuild_gap(self, *, conn=None) -> Optional[Tuple[int, int]]:
         """Bounded unindexed session-metadata gap ``(progress, high_water]``.
 
         During a #25 session metadata backfill, rows whose ``row_id`` falls in
@@ -6962,26 +6982,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         FTS candidates so no valid session is hidden while the rebuild is
         pending. Returns ``(progress, high_water)`` or ``None`` when no
         session rebuild is pending (normal operation).
+
+        ``conn`` (optional) is a caller-owned read snapshot — when given, the
+        markers are read from THAT connection so #14's router can observe one
+        coherent snapshot; otherwise a fresh read connection is used.
         """
-        with self._read_ctx() as conn:
-            row = conn.execute(
+        def _read(c):
+            row = c.execute(
                 "SELECT value FROM state_meta "
                 "WHERE key = 'fts_session_rebuild_high_water'"
             ).fetchone()
             if row is None:
                 return None
             high_water = int(row[0])
-            p = conn.execute(
+            p = c.execute(
                 "SELECT value FROM state_meta "
                 "WHERE key = 'fts_session_rebuild_progress'"
             ).fetchone()
             progress = int(p[0]) if p is not None else 0
-        if progress >= high_water:
-            return None
-        return progress, high_water
+            if progress >= high_water:
+                return None
+            return progress, high_water
+        if conn is not None:
+            return _read(conn)
+        with self._read_ctx() as conn:
+            return _read(conn)
 
     def _fts_metadata_candidates(
-        self, raw_query: str
+        self, raw_query: str, *, conn=None
     ) -> Tuple[bool, List[Dict[str, Any]]]:
         """Raw Unicode session-metadata candidates matching ``raw_query``.
 
@@ -7000,7 +7028,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         both lanes and sorted ``started_at DESC`` (the resume-ordering that
         ``resolve_session_by_title`` relies on — never a lane-then-gap
         concatenation). Raw Unicode only — no normalization policy
-        (normalized arbitrary infix is owned by #30).
+        (normalized arbitrary infix is owned by #30). ``conn`` (optional) is
+        a caller-owned read snapshot — when given, the rebuild-gap markers and
+        the MATCH are read from THAT connection so #14's router sees one
+        coherent snapshot; otherwise a fresh read connection is used.
 
         The gap supplement folds values with ``_fts_unicode61_fold`` — a
         conservative Unicode approximation of the unicode61 rules (case fold
@@ -7018,28 +7049,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         sanitized = self._sanitize_fts5_query(raw_query)
         if not sanitized:
             return True, []
-        gap = self._session_fts_rebuild_gap()
-        # Conservative FTS-superset terms for the gap supplement: the gap
-        # cannot parse FTS5's query syntax, so it matches ANY positive term
-        # in ANY field (over-match is accepted; a miss is not — a session
-        # the indexed lane matches must never hide while in (P, H]). Terms
-        # derive from the SANITIZED query (capped at MAX_FTS5_QUERY_CHARS, the
-        # same string the FTS lane MATCHes) so both lanes process the same
-        # bounded input and a huge query cannot blow up gap-row × terms.
-        terms = _fts_query_positive_terms(sanitized)
-        fts_ok = True
-        by_row_id: Dict[int, Dict[str, Any]] = {}
 
-        def _candidate(c) -> Dict[str, Any]:
-            return {
-                "id": c["id"],
-                "title": c["title"],
-                "display_name": c["display_name"],
-                "started_at": c["started_at"],
-                "row_id": c["row_id"],
-            }
+        def _run(conn):
+            gap = self._session_fts_rebuild_gap(conn=conn)
+            # Conservative FTS-superset terms for the gap supplement: the gap
+            # cannot parse FTS5's query syntax, so it matches ANY positive term
+            # in ANY field (over-match is accepted; a miss is not — a session
+            # the indexed lane matches must never hide while in (P, H]). Terms
+            # derive from the SANITIZED query (capped at MAX_FTS5_QUERY_CHARS,
+            # the same string the FTS lane MATCHes) so both lanes process the
+            # same bounded input and a huge query cannot blow up gap-row ×
+            # terms.
+            terms = _fts_query_positive_terms(sanitized)
+            fts_ok = True
+            by_row_id: Dict[int, Dict[str, Any]] = {}
 
-        with self._read_ctx() as conn:
+            def _candidate(c) -> Dict[str, Any]:
+                return {
+                    "id": c["id"],
+                    "title": c["title"],
+                    "display_name": c["display_name"],
+                    "started_at": c["started_at"],
+                    "row_id": c["row_id"],
+                }
+
             try:
                 cursor = conn.execute(
                     "SELECT s.id AS id, s.title, s.display_name, "
@@ -7074,12 +7107,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         for field in (c["title"], c["id"], c["display_name"])
                     ):
                         by_row_id.setdefault(c["row_id"], _candidate(c))
-        # Global merge ordering, not lane-then-gap: resolve_session_by_title
-        # takes candidates[0] and must resume the LATEST continuation even
-        # when the newer one is still in the gap.
-        return fts_ok, sorted(
-            by_row_id.values(), key=lambda c: c["started_at"], reverse=True
-        )
+            # Global merge ordering, not lane-then-gap: resolve_session_by_title
+            # takes candidates[0] and must resume the LATEST continuation even
+            # when the newer one is still in the gap.
+            return fts_ok, sorted(
+                by_row_id.values(), key=lambda c: c["started_at"], reverse=True
+            )
+
+        if conn is not None:
+            return _run(conn)
+        with self._read_ctx() as conn:
+            return _run(conn)
 
     def _session_trigram_rebuild_gap(
         self, conn=None
@@ -7132,7 +7170,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return '"' + needle.replace('"', '""') + '"'
 
     def _fts_session_trigram_candidates(
-        self, raw_query: str
+        self, raw_query: str, *, conn=None
     ) -> Tuple[bool, List[Dict[str, Any]]]:
         """Low-level normalized trigram candidate lane (issue #30) for #14.
 
@@ -7185,7 +7223,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "row_id": c["row_id"],
             }
 
-        with self._read_ctx() as conn:
+        def _run(conn):
             # Round-11 P1 #4: ONE explicit read transaction (one DB snapshot)
             # for the whole candidate call — the ownership/stale decision, the
             # H/P gap, the MATCH, the canonical join, and the gap supplement
@@ -7194,93 +7232,113 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # stale FTS hit joined to post-quarantine canonical rows is never
             # served). The gap markers are read inline from this same
             # connection, NOT via helpers that open fresh autocommit reads.
+            # With a caller-supplied ``conn`` inside a transaction, that
+            # transaction already provides the snapshot.
+            fts_ok = True
+            by_row_id: Dict[int, Dict[str, Any]] = {}
+            gap = None
+
+            def _candidate(c) -> Dict[str, Any]:
+                return {
+                    "id": c["id"],
+                    "title": c["title"],
+                    "display_name": c["display_name"],
+                    "started_at": c["started_at"],
+                    "row_id": c["row_id"],
+                }
+
+            if self._session_trigram_is_stale(conn):
+                return False, []
+            gap = self._session_trigram_rebuild_gap(conn)
+            try:
+                # Field-aware trigram MATCH: compact title/display needle
+                # (if any) plus the RAW id needle. Both are quoted phrases
+                # so punctuation is preserved (trigram does substring
+                # matching).
+                match_parts = []
+                if compact_needle:
+                    match_parts.append(
+                        f"title:{self._trigram_match_needle(compact_needle)}"
+                    )
+                    match_parts.append(
+                        "display_name:"
+                        f"{self._trigram_match_needle(compact_needle)}"
+                    )
+                match_parts.append(
+                    f"id:{self._trigram_match_needle(needle)}"
+                )
+                match_expr = " OR ".join(match_parts)
+                cursor = conn.execute(
+                    "SELECT s.id AS id, s.title, s.display_name, "
+                    "       s.started_at, s.row_id AS row_id "
+                    "FROM sessions_fts_trigram f "
+                    "JOIN sessions s ON s.row_id = f.rowid "
+                    "WHERE sessions_fts_trigram MATCH ? ",
+                    (match_expr,),
+                )
+                for c in cursor:
+                    by_row_id[c["row_id"]] = _candidate(c)
+            except sqlite3.OperationalError:
+                # Trigram lane unavailable/corrupt: signal failure so the
+                # #14 router can fall back instead of trusting a partial
+                # result; the gap supplement below still runs.
+                fts_ok = False
+                logging.debug(
+                    "sessions_fts_trigram MATCH failed for %r",
+                    match_expr,
+                    exc_info=True,
+                )
+            if gap is not None:
+                progress, high_water = gap
+                gap_rows = conn.execute(
+                    "SELECT id, title, display_name, started_at, row_id "
+                    "FROM sessions "
+                    "WHERE row_id > ? AND row_id <= ? ",
+                    (progress, high_water),
+                ).fetchall()
+                # Case-insensitive like the trigram tokenizer's default:
+                # fold both sides before the substring test (the indexed
+                # lane folds at tokenization, so a case-sensitive Python
+                # test would let a gap row hide until backfilled).
+                compact_needle_folded = compact_needle.casefold()
+                needle_folded = needle.casefold()
+                for c in gap_rows:
+                    # Same policy as the indexed lane: compact title/display
+                    # needles and the raw id needle, on the COMPACTED field
+                    # values (the index stores compacted text, so matching
+                    # raw would miss once backfilled).
+                    if (
+                        compact_needle_folded
+                        and compact_needle_folded
+                        in compact_session_metadata_text(
+                            c["title"]
+                        ).casefold()
+                    ) or (
+                        compact_needle_folded
+                        and compact_needle_folded
+                        in compact_session_metadata_text(
+                            c["display_name"]
+                        ).casefold()
+                    ) or (
+                        needle_folded
+                        and needle_folded in (c["id"] or "").casefold()
+                    ):
+                        by_row_id.setdefault(c["row_id"], _candidate(c))
+            return fts_ok, sorted(
+                by_row_id.values(), key=lambda c: c["started_at"], reverse=True
+            )
+
+        if conn is not None:
+            return _run(conn)
+        with self._read_ctx() as conn:
             conn.execute("BEGIN")
             try:
-                if self._session_trigram_is_stale(conn):
-                    return False, []
-                gap = self._session_trigram_rebuild_gap(conn)
-                try:
-                    # Field-aware trigram MATCH: compact title/display needle
-                    # (if any) plus the RAW id needle. Both are quoted phrases
-                    # so punctuation is preserved (trigram does substring
-                    # matching).
-                    match_parts = []
-                    if compact_needle:
-                        match_parts.append(
-                            f"title:{self._trigram_match_needle(compact_needle)}"
-                        )
-                        match_parts.append(
-                            "display_name:"
-                            f"{self._trigram_match_needle(compact_needle)}"
-                        )
-                    match_parts.append(
-                        f"id:{self._trigram_match_needle(needle)}"
-                    )
-                    match_expr = " OR ".join(match_parts)
-                    cursor = conn.execute(
-                        "SELECT s.id AS id, s.title, s.display_name, "
-                        "       s.started_at, s.row_id AS row_id "
-                        "FROM sessions_fts_trigram f "
-                        "JOIN sessions s ON s.row_id = f.rowid "
-                        "WHERE sessions_fts_trigram MATCH ? ",
-                        (match_expr,),
-                    )
-                    for c in cursor:
-                        by_row_id[c["row_id"]] = _candidate(c)
-                except sqlite3.OperationalError:
-                    # Trigram lane unavailable/corrupt: signal failure so the
-                    # #14 router can fall back instead of trusting a partial
-                    # result; the gap supplement below still runs.
-                    fts_ok = False
-                    logging.debug(
-                        "sessions_fts_trigram MATCH failed for %r",
-                        match_expr,
-                        exc_info=True,
-                    )
-                if gap is not None:
-                    progress, high_water = gap
-                    gap_rows = conn.execute(
-                        "SELECT id, title, display_name, started_at, row_id "
-                        "FROM sessions "
-                        "WHERE row_id > ? AND row_id <= ? ",
-                        (progress, high_water),
-                    ).fetchall()
-                    # Case-insensitive like the trigram tokenizer's default:
-                    # fold both sides before the substring test (the indexed
-                    # lane folds at tokenization, so a case-sensitive Python
-                    # test would let a gap row hide until backfilled).
-                    compact_needle_folded = compact_needle.casefold()
-                    needle_folded = needle.casefold()
-                    for c in gap_rows:
-                        # Same policy as the indexed lane: compact title/display
-                        # needles and the raw id needle, on the COMPACTED field
-                        # values (the index stores compacted text, so matching
-                        # raw would miss once backfilled).
-                        if (
-                            compact_needle_folded
-                            and compact_needle_folded
-                            in compact_session_metadata_text(
-                                c["title"]
-                            ).casefold()
-                        ) or (
-                            compact_needle_folded
-                            and compact_needle_folded
-                            in compact_session_metadata_text(
-                                c["display_name"]
-                            ).casefold()
-                        ) or (
-                            needle_folded
-                            and needle_folded in (c["id"] or "").casefold()
-                        ):
-                            by_row_id.setdefault(c["row_id"], _candidate(c))
+                return _run(conn)
             finally:
                 conn.execute("ROLLBACK")
-        return fts_ok, sorted(
-            by_row_id.values(), key=lambda c: c["started_at"], reverse=True
-        )
 
     def _fts_cjk_metadata_candidates(
-        self, raw_query: str
+        self, raw_query: str, *, conn=None
     ) -> Tuple[bool, Optional[List[Dict[str, Any]]]]:
         """CJK session-metadata candidates over raw (title, id, display_name).
 
@@ -7306,7 +7364,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         transaction, so ``(servable=True, ...)`` always reflects a single
         consistent SQLite snapshot — never a torn read of a partially-mutated
         index that a concurrent writer landed between a standalone guard
-        statement and the MATCH.
+        statement and the MATCH. ``conn`` (optional) is a caller-owned read
+        snapshot — when given, the guard and MATCH run on THAT connection
+        (whose transaction provides the snapshot); otherwise a fresh read
+        connection with an explicit read transaction is used.
         """
         # A lone single CJK character cannot match inside longer runs in the
         # bigram index — classify as fallback-only before touching the index.
@@ -7318,6 +7379,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not getattr(self, "_sessions_cjk_available", False):
             # Process-local hint: this process knows the index is not servable.
             return False, None
+
+        def _run(conn):
+            # ONE SQLite snapshot for the durable guard reads AND the MATCH
+            # (the caller's transaction, or the BEGIN below).
+            if self._cjk_lane_durable_guarded(conn):
+                return False, None
+            try:
+                cursor = conn.execute(
+                    "SELECT s.id AS id, s.title, s.display_name, "
+                    "       s.started_at, s.row_id AS row_id "
+                    "FROM sessions_fts_cjk f "
+                    "JOIN sessions s ON s.row_id = f.rowid "
+                    "WHERE sessions_fts_cjk MATCH ? "
+                    "ORDER BY s.started_at DESC",
+                    (sanitized,),
+                )
+                candidates = [dict(row) for row in cursor]
+            except sqlite3.OperationalError:
+                # CJK lane unavailable/corrupt on this connection (e.g. the
+                # tokenizer did not load on this read connection): signal
+                # fallback, never trust a partial result.
+                logging.debug(
+                    "sessions_fts_cjk MATCH failed for %r, falling back",
+                    raw_query, exc_info=True,
+                )
+                return False, None
+            return True, candidates
+
+        if conn is not None:
+            return _run(conn)
         with self._read_ctx() as conn:
             # ONE SQLite snapshot for the durable guard reads AND the MATCH.
             # ``_read_ctx()`` connections are autocommit (isolation_level
@@ -7337,32 +7428,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # the reads still share whatever snapshot already exists.
                     began = False
             try:
-                if self._cjk_lane_durable_guarded(conn):
-                    return False, None
-                try:
-                    cursor = conn.execute(
-                        "SELECT s.id AS id, s.title, s.display_name, "
-                        "       s.started_at, s.row_id AS row_id "
-                        "FROM sessions_fts_cjk f "
-                        "JOIN sessions s ON s.row_id = f.rowid "
-                        "WHERE sessions_fts_cjk MATCH ? "
-                        "ORDER BY s.started_at DESC",
-                        (sanitized,),
-                    )
-                    candidates = [dict(row) for row in cursor]
-                except sqlite3.OperationalError:
-                    # CJK lane unavailable/corrupt on this connection (e.g.
-                    # the tokenizer did not load on this read connection):
-                    # signal fallback, never trust a partial result.
-                    logging.debug(
-                        "sessions_fts_cjk MATCH failed for %r, falling back",
-                        raw_query, exc_info=True,
-                    )
-                    return False, None
+                return _run(conn)
             finally:
                 if began:
                     conn.execute("COMMIT")
-        return True, candidates
 
     def _cjk_lane_durable_guarded(self, conn) -> bool:
         """True when a durable CJK guard is present on ``conn``'s snapshot.
@@ -7540,6 +7609,245 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         {"system_prompt", "system_prompt_hash"}
     )
     _session_compact_cols_sql: Optional[str] = None
+
+    # ── #14: routed session-metadata picker candidates ──────────────────
+    # The three low-level candidate lanes (#25 Unicode, #26 CJK, #30
+    # trigram) expose raw row-level candidates. The router below decides
+    # WHICH lane (or the direct canonical-LIKE fallback) serves an ordinary
+    # picker/listing query, normalizes lane outcomes into hits / zero, and
+    # returns stable ``row_id`` candidates across the whole store so
+    # ``list_sessions_rich`` can map them to visible logical roots before
+    # any expensive lineage/projection work.
+
+    @staticmethod
+    def _metadata_search_needle(raw_query: str) -> str:
+        """Bound and trim a raw metadata search query (issue #37)."""
+        return (raw_query or "")[:MAX_FTS5_QUERY_CHARS].strip()
+
+    def _metadata_query_has_explicit_token_syntax(self, needle: str) -> bool:
+        """True when *needle* carries explicit FTS5 token intent.
+
+        Token intent is a balanced double-quoted phrase, a standalone boolean
+        operator (AND/OR/NOT), or a legal trailing prefix star. Only these
+        signals route a bare Latin query down the raw Unicode token lane;
+        ordinary picker text is treated as a literal/infix query so a single
+        token hit cannot suppress other valid interior-fragment matches
+        (issue #37's routing table).
+        """
+        if '"' in needle:
+            # Balanced double-quoted phrase: every quote pairs. Mirrors the
+            # linear scan in ``_sanitize_fts5_query`` so pathological quote
+            # runs cannot induce regex backtracking.
+            open_quote = False
+            for ch in needle:
+                if ch == '"':
+                    open_quote = not open_quote
+            if not open_quote:
+                return True
+        if re.search(r"\b(?:AND|OR|NOT)\b", needle, flags=re.IGNORECASE):
+            return True
+        # Legal trailing prefix star: a '*' immediately after a token char.
+        if "*" in needle and re.search(r"[A-Za-z0-9_]\*", needle):
+            return True
+        return False
+
+    def _classify_metadata_query(self, needle: str) -> str:
+        """Classify a bounded metadata search needle into a route.
+
+        Returns one of:
+
+        - ``"none"`` — empty query, no search;
+        - ``"like"`` — direct canonical LIKE fallback (lone CJK run, a plain
+          literal whose raw or compact needle is < 3 chars, or only
+          separators);
+        - ``"cjk"`` — CJK (2+ run) + Unicode union;
+        - ``"unicode"`` — raw Unicode token lane (explicit FTS token syntax);
+        - ``"trigram"`` — normalized trigram lane (plain literal/infix with a
+          usable 3+ char needle).
+
+        CJK classification takes precedence over token/literal classification
+        (issue #37 routing table).
+        """
+        needle = needle.strip()
+        if not needle:
+            return "none"
+        if self._has_lone_cjk_run(needle):
+            return "like"
+        if self._contains_cjk(needle):
+            return "cjk"
+        if self._metadata_query_has_explicit_token_syntax(needle):
+            return "unicode"
+        if len(needle) >= 3 and len(compact_session_metadata_text(needle)) >= 3:
+            return "trigram"
+        return "like"
+
+    @staticmethod
+    def _metadata_literal_fallback_needle(needle: str) -> str:
+        """Strip FTS5 query syntax so a fallback LIKE searches literal content.
+
+        Removes balanced double-quoted phrase delimiters, standalone boolean
+        operators (AND/OR/NOT), and trailing prefix stars — the syntax the
+        routed lanes interpret — leaving the searchable literal substring for
+        the canonical LIKE recall-recovery fallback.
+        """
+        open_quote = False
+        out = []
+        for ch in needle or "":
+            if ch == '"':
+                open_quote = not open_quote
+                continue
+            out.append(ch)
+        cleaned = "".join(out)
+        cleaned = re.sub(
+            r"\s*\b(?:AND|OR|NOT)\b\s*", " ", cleaned, flags=re.IGNORECASE
+        )
+        return re.sub(r"\*+\s*$", "", cleaned).strip()
+
+    def _metadata_like_fallback_row_ids(
+        self, needle: str, *, conn=None, limit: int = None
+    ) -> List[int]:
+        """Direct / zero-result / route-failure canonical LIKE fallback.
+
+        Searches stable ``row_id`` only (no preview/prompt/tip hydration)
+        over the three metadata fields with the canonical compact policy.
+        The raw needle is first stripped of FTS5 query syntax (quotes,
+        boolean operators, prefix stars) and then every predicate uses
+        ``ESCAPE '\\'`` with an escaped pattern so ``%`` / ``_`` / ``\\`` stay
+        literal — a bare ``%`` or ``_`` (or an empty cleaned needle) can never
+        become an accidental match-all scan.
+
+        Predicates (all case-insensitive via ``LOWER``): raw title, raw id
+        (never compacted), raw display_name, canonical compact title, and
+        canonical compact display_name.
+        """
+        needle = self._metadata_literal_fallback_needle(needle)
+        if not needle:
+            return []
+
+        def _escape(text: str) -> str:
+            return (
+                text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+
+        pattern = f"%{_escape(needle)}%"
+        compact_needle = compact_session_metadata_text(needle)
+        compact_pattern = (
+            f"%{_escape(compact_needle)}%" if compact_needle else None
+        )
+        clauses = [
+            "LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'",
+            "LOWER(COALESCE(s.id, '')) LIKE ? ESCAPE '\\'",
+            "LOWER(COALESCE(s.display_name, '')) LIKE ? ESCAPE '\\'",
+        ]
+        params: List[Any] = [pattern] * 3
+        if compact_pattern is not None:
+            clauses.append(
+                "LOWER("
+                f"{_session_metadata_compact_sql('s.title')}) LIKE ? ESCAPE '\\'"
+            )
+            params.append(compact_pattern)
+            clauses.append(
+                "LOWER("
+                f"{_session_metadata_compact_sql('s.display_name')}) "
+                "LIKE ? ESCAPE '\\'"
+            )
+            params.append(compact_pattern)
+        sql = f"SELECT s.row_id FROM sessions s WHERE {' OR '.join(clauses)}"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        if conn is not None:
+            return [r["row_id"] for r in conn.execute(sql, params).fetchall()]
+        with self._read_ctx() as conn:
+            return [r["row_id"] for r in conn.execute(sql, params).fetchall()]
+
+    def _metadata_candidate_row_ids(
+        self, raw_query: str, *, conn=None
+    ) -> MetadataCandidateResult:
+        """Route one metadata search query to whole-store ``row_id`` candidates.
+
+        Bounds the raw query, classifies it, runs the routed candidate lane(s)
+        (or the direct canonical-LIKE fallback), and normalizes the outcome
+        into ``hits`` / ``zero``. A successful non-empty routed result never
+        runs the LIKE fallback; a valid zero or route failure runs it exactly
+        once. With ``conn`` (optional), all route-group reads share that
+        caller-owned snapshot (one explicit read transaction).
+        """
+        needle = self._metadata_search_needle(raw_query)
+        if not needle:
+            return MetadataCandidateResult(path="none", status="zero", row_ids=())
+        if conn is not None:
+            return self._metadata_candidate_row_ids_on_conn(needle, conn)
+        with self._read_ctx() as conn:
+            conn.execute("BEGIN")
+            try:
+                return self._metadata_candidate_row_ids_on_conn(needle, conn)
+            finally:
+                conn.execute("ROLLBACK")
+
+    def _metadata_candidate_row_ids_on_conn(
+        self, needle: str, conn
+    ) -> MetadataCandidateResult:
+        """Inner router over a caller-provided coherent read snapshot."""
+
+        def _like_fallback() -> MetadataCandidateResult:
+            row_ids = tuple(self._metadata_like_fallback_row_ids(needle, conn=conn))
+            return MetadataCandidateResult(
+                path="like",
+                status="hits" if row_ids else "zero",
+                row_ids=row_ids,
+            )
+
+        route = self._classify_metadata_query(needle)
+        if route == "like":
+            return _like_fallback()
+        if route == "unicode":
+            fts_ok, candidates = self._fts_metadata_candidates(needle, conn=conn)
+            if fts_ok and candidates:
+                return MetadataCandidateResult(
+                    path="unicode",
+                    status="hits",
+                    row_ids=tuple(c["row_id"] for c in candidates),
+                )
+            # Valid zero or lane failure -> canonical LIKE once.
+            return _like_fallback()
+        if route == "trigram":
+            fts_ok, candidates = self._fts_session_trigram_candidates(
+                needle, conn=conn
+            )
+            if fts_ok and candidates:
+                return MetadataCandidateResult(
+                    path="trigram",
+                    status="hits",
+                    row_ids=tuple(c["row_id"] for c in candidates),
+                )
+            return _like_fallback()
+        if route == "cjk":
+            # CJK + Unicode union; a partial/failed union is never trusted.
+            servable, cjk_candidates = self._fts_cjk_metadata_candidates(
+                needle, conn=conn
+            )
+            fts_ok, uni_candidates = self._fts_metadata_candidates(
+                needle, conn=conn
+            )
+            if not (servable and fts_ok):
+                return _like_fallback()
+            union: Dict[int, Any] = {}
+            for c in cjk_candidates or []:
+                union.setdefault(c["row_id"], c)
+            for c in uni_candidates or []:
+                union.setdefault(c["row_id"], c)
+            if union:
+                return MetadataCandidateResult(
+                    path="cjk+unicode",
+                    status="hits",
+                    row_ids=tuple(union),
+                )
+            return _like_fallback()
+        # Defensive: an unknown classifier result never fabricates a match.
+        return _like_fallback()
 
     def list_sessions_rich(
         self,
