@@ -1409,7 +1409,8 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # Without it, this probe sees the DB exactly as a tokenizer-less
         # SessionDB open would (which drops the cjk triggers to keep writes
         # working), so tokenizer absence must never classify as corruption.
-        load_simple_extension(conn)
+        # The retired simple tokenizer is never loaded (issue #19); residue
+        # DBs probe unhealthy and are EOL-cleaned by the writable open.
         load_fts5_cjk_extension(conn)
         conn.execute("PRAGMA journal_mode").fetchone()
         rows = conn.execute("PRAGMA integrity_check").fetchall()
@@ -1644,6 +1645,31 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     if backup:
         bpath = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
+
+    # ── Strategy -1: #19 EOL sanitation of retired simple-tokenizer residue ──
+    # A DB carrying the exact historical tokenize='simple' residue probes
+    # unhealthy (its triggers raise "no such tokenizer: simple" without the
+    # retired shim) but needs no corruption repair — the residue is
+    # structurally detached and the next writable open converges to the modern
+    # lifecycle. Sanitize first so the remaining strategies see a converged
+    # schema instead of escalating a non-corruption capability gap.
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            sanitized = _sanitize_retired_simple_residue(conn)
+        finally:
+            conn.close()
+        if sanitized and _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "simple_eol_sanitized"
+            logger.warning(
+                "state.db simple-tokenizer residue EOL-cleaned: %s", db_path
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "state.db simple-tokenizer EOL sanitation pass failed: %s", exc
+        )
 
     # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
     # The FTS5 'rebuild' command rewrites the internal index from the canonical
@@ -1911,42 +1937,129 @@ def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
         return False
 
 
-def simple_tokenizer_so_path() -> Path:
-    """Location of the simple (jieba CJK) loadable FTS5 tokenizer."""
-    env = os.getenv("HERMES_LIBSIMPLE_PATH")
-    if env:
-        return Path(env).expanduser()
-    return get_hermes_home() / "libsimple" / "libsimple.so"
+# ── #19 EOL: retired `simple`-tokenizer residue ─────────────────────────────
+# The fork's pre-v23 / pre-#30 dev builds created ``messages_fts_trigram`` and
+# ``sessions_fts_trigram`` with ``tokenize='simple'`` (a loadable jieba-CJK
+# tokenizer). Final #12/#30 classify those as unsupported history. #19
+# structurally detaches ONLY the exact historical Hermes residue on writable
+# open — before ``_init_schema`` can touch the unloadable tokenizer — and
+# removes the loadable-extension shim entirely. Same-name objects that are not
+# the exact Hermes signature (modern or foreign) fail closed, untouched.
+
+# The exact historical Hermes root declarations (stored ``sqlite_master.sql``),
+# matched by normalized-DDL identity so a foreign same-name vtable that merely
+# uses the simple tokenizer is never deleted.
+_SIMPLE_MESSAGE_ROOT_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+    content,
+    tokenize='simple'
+);
+"""
+_SIMPLE_SESSION_ROOT_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_trigram USING fts5(
+    title,
+    tokenize='simple'
+);
+"""
+# root name -> (exact root declaration, FTS5 shadow tables)
+_SIMPLE_RESIDUE_SPECS = {
+    "messages_fts_trigram": (
+        _SIMPLE_MESSAGE_ROOT_DDL,
+        (
+            "messages_fts_trigram_data",
+            "messages_fts_trigram_idx",
+            "messages_fts_trigram_content",
+            "messages_fts_trigram_docsize",
+            "messages_fts_trigram_config",
+        ),
+    ),
+    "sessions_fts_trigram": (
+        _SIMPLE_SESSION_ROOT_DDL,
+        (
+            "sessions_fts_trigram_data",
+            "sessions_fts_trigram_idx",
+            "sessions_fts_trigram_content",
+            "sessions_fts_trigram_docsize",
+            "sessions_fts_trigram_config",
+        ),
+    ),
+}
+# The exact historical Hermes sync trigger names per lane — a fixed allowlist,
+# never a name-prefix sweep (a foreign same-prefix trigger must survive).
+_SIMPLE_RESIDUE_TRIGGER_NAMES = {
+    "messages_fts_trigram": (
+        "messages_fts_trigram_insert",
+        "messages_fts_trigram_delete",
+        "messages_fts_trigram_update",
+    ),
+    "sessions_fts_trigram": (
+        "sessions_fts_trigram_insert",
+        "sessions_fts_trigram_delete",
+        "sessions_fts_trigram_update",
+    ),
+}
 
 
-def load_simple_extension(conn: sqlite3.Connection) -> bool:
-    """Best-effort load of the simple (jieba CJK) FTS5 tokenizer into ``conn``.
+def _sanitize_retired_simple_residue(conn: sqlite3.Connection) -> int:
+    """#19: structurally detach the fork's retired ``tokenize='simple'``
+    residue before ``_init_schema`` can touch the unloadable tokenizer.
 
-    Legacy state.db installs (pre-v23 dev builds) created
-    ``messages_fts_trigram`` / ``sessions_fts_trigram`` with
-    ``tokenize='simple'``. Current code no longer creates simple tables, but an
-    existing DB still carries them — any statement touching those tables
-    (trigger-driven writes, MATCH queries) needs the tokenizer, otherwise the
-    whole session store fails to open with ``no such tokenizer: simple``.
-    Load best-effort like :func:`load_fts5_cjk_extension`; returns False
-    (never raises) when the .so is absent or loading fails.
+    Recognized ONLY by exact root name + exact historical Hermes root
+    declaration (normalized-DDL identity), so a foreign same-name vtable that
+    merely uses the simple tokenizer is never deleted. The lane's known Hermes
+    sync triggers are dropped, then the root + its five FTS5 shadow tables are
+    removed via ``writable_schema`` surgery — the retired vtable is never
+    connected. Canonical rows are untouched. Returns the number of recognized
+    roots detached (used by ``repair_state_db_schema``).
     """
-    path = simple_tokenizer_so_path()
-    if not path.exists():
-        logger.warning("simple tokenizer .so missing: %s", path)
-        return False
-    try:
-        conn.enable_load_extension(True)
-        try:
-            conn.load_extension(str(path))
-        finally:
-            conn.enable_load_extension(False)
-        return True
-    except Exception:
-        logger.warning(
-            "simple tokenizer extension load failed (%s)", path, exc_info=True
-        )
-        return False
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    found = []
+    for root, (root_ddl, shadows) in _SIMPLE_RESIDUE_SPECS.items():
+        row = cursor.execute(
+            "SELECT type, sql FROM sqlite_master "
+            "WHERE name = ? AND type IN ('table', 'view', 'index')",
+            (root,),
+        ).fetchone()
+        if row is None:
+            continue
+        if row["type"] != "table":
+            continue  # same-name VIEW/INDEX — not a Hermes vtable
+        sql = row["sql"] or ""
+        if _normalize_ddl_for_identity(sql) != _normalize_ddl_for_identity(
+            root_ddl
+        ):
+            continue  # not the exact Hermes simple signature → fail closed
+        found.append((root, shadows))
+    if not found:
+        return 0
+    for root, _shadows in found:
+        # Drop only the lane's exact known Hermes sync triggers (fixed
+        # allowlist; DROP TRIGGER never connects the retired vtable).
+        for name in _SIMPLE_RESIDUE_TRIGGER_NAMES[root]:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+    names = [n for root, shadows in found for n in (root, *shadows)]
+    placeholders = ", ".join("?" for _ in names)
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute(
+        "DELETE FROM sqlite_master WHERE type = 'table' AND name IN ("
+        + placeholders + ")",
+        names,
+    )
+    conn.execute("PRAGMA writable_schema=RESET")
+    conn.commit()
+    # The raw sqlite_master DELETE leaves the detached shadow-table pages
+    # unreferenced; integrity_check reports them as "Page N: never used" until
+    # VACUUM reclaims them (same teardown discipline as
+    # _drop_owned_fts_derived_schema), so both the writable open and the repair
+    # health re-probe see a clean file. Runs only when residue was found.
+    conn.execute("VACUUM")
+    logger.warning(
+        "issue #19: retired %d historical tokenize='simple' FTS residue "
+        "object(s): %s",
+        len(found), ", ".join(root for root, _s in found),
+    )
+    return len(found)
 
 
 class CompressionSessionClosedError(RuntimeError):
@@ -2315,10 +2428,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_usermerge_floor_applied = False
         self._fts_enabled = False
         self._trigram_available = False
-        # simple (jieba CJK) tokenizer loaded on the writer connection —
-        # legacy DBs carry messages_fts_trigram / sessions_fts_trigram with
-        # tokenize='simple' and any touch needs the extension loaded.
-        self._simple_loaded = False
         # CJK-bigram index (cjk_unicode61 loadable tokenizer). _fts_cjk_loaded:
         # extension present on the writer connection; _fts_cjk_available: the
         # messages_fts_cjk table is queryable AND not marked stale. Set during
@@ -2520,8 +2629,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
-                self._simple_loaded = load_simple_extension(self._conn)
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                # #19: structurally detach retired tokenize='simple' residue
+                # BEFORE schema init can touch the unloadable tokenizer.
+                _sanitize_retired_simple_residue(self._conn)
                 self._init_schema()
 
             def _connect_and_init_with_lock_patience():
@@ -2643,13 +2754,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             conn.row_factory = sqlite3.Row
             apply_database_pragmas(conn, db_label="state.db")
-            # Load the simple tokenizer (legacy trigram tables are
-            # tokenize='simple' on pre-v23 DBs) and the CJK tokenizer so
-            # MATCH queries work on the read path. The .so registers the
-            # tokenizer in the connection's in-memory registry, not the
-            # database file, so mode=ro is fine.
-            if self._simple_loaded:
-                load_simple_extension(conn)
+            # Load the CJK tokenizer so MATCH queries work on the read path.
+            # The retired simple tokenizer is never loaded (issue #19): a
+            # sanitized store has no simple residue, and an unsanitized
+            # legacy read-only open fails closed rather than resurrecting
+            # libsimple.
             if self._fts_cjk_loaded:
                 load_fts5_cjk_extension(conn)
             with self._read_conns_lock:
