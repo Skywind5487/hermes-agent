@@ -112,9 +112,9 @@ class TestRouteAndFallbackContract:
         calls = []
         orig = SessionDB._metadata_like_fallback_row_ids
 
-        def spy(self_, needle, *, conn=None, limit=None):
+        def spy(self_, needle, *, conn=None):
             calls.append(needle)
-            return orig(self_, needle, conn=conn, limit=limit)
+            return orig(self_, needle, conn=conn)
 
         monkeypatch.setattr(SessionDB, "_metadata_like_fallback_row_ids", spy)
         result = db._metadata_candidate_row_ids(q)
@@ -307,6 +307,25 @@ class TestCjkRoute:
         result = db._metadata_candidate_row_ids("中文")
         assert result.status == "hits"
         assert "cjk" in _row_ids_to_ids(db, result.row_ids)
+
+    def test_cjk_unservable_skips_unicode_lane(self, db, monkeypatch):
+        """When the CJK lane cannot serve, a CJK 2+ query goes straight to the
+        canonical LIKE fallback — the knowingly-useless Unicode MATCH must not
+        run first (spec: known-unindexable -> bounded LIKE directly)."""
+        _seed_an94(db)
+        # Simulate a host without the CJK tokenizer regardless of environment.
+        db._sessions_cjk_available = False
+        unicode_calls = []
+        orig = SessionDB._fts_metadata_candidates
+
+        def spy(self_, raw_query, *, conn=None):
+            unicode_calls.append(raw_query)
+            return orig(self_, raw_query, conn=conn)
+
+        monkeypatch.setattr(SessionDB, "_fts_metadata_candidates", spy)
+        result = db._metadata_candidate_row_ids("中文")
+        assert result.path == "like"  # direct canonical LIKE, not a union
+        assert unicode_calls == []  # RED: currently the Unicode lane runs
 
 
 class TestSnapshotRule:

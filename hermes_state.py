@@ -50,6 +50,7 @@ from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Tup
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
+    _compression_edge_sql,
     _FTS_CJK_TRIGGERS,
     _FTS_SESSION_CJK_TRIGGERS,
     _LISTABLE_CHILD_SQL,
@@ -7210,18 +7211,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # instead of serving stale hits.
         if not self._sessions_trigram_available:
             return False, []
-        fts_ok = True
-        by_row_id: Dict[int, Dict[str, Any]] = {}
-        gap = None
-
-        def _candidate(c) -> Dict[str, Any]:
-            return {
-                "id": c["id"],
-                "title": c["title"],
-                "display_name": c["display_name"],
-                "started_at": c["started_at"],
-                "row_id": c["row_id"],
-            }
 
         def _run(conn):
             # Round-11 P1 #4: ONE explicit read transaction (one DB snapshot)
@@ -7704,7 +7693,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return re.sub(r"\*+\s*$", "", cleaned).strip()
 
     def _metadata_like_fallback_row_ids(
-        self, needle: str, *, conn=None, limit: int = None
+        self, needle: str, *, conn=None
     ) -> List[int]:
         """Direct / zero-result / route-failure canonical LIKE fallback.
 
@@ -7755,9 +7744,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             params.append(compact_pattern)
         sql = f"SELECT s.row_id FROM sessions s WHERE {' OR '.join(clauses)}"
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(int(limit))
         if conn is not None:
             return [r["row_id"] for r in conn.execute(sql, params).fetchall()]
         with self._read_ctx() as conn:
@@ -7825,14 +7811,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return _like_fallback()
         if route == "cjk":
-            # CJK + Unicode union; a partial/failed union is never trusted.
+            # CJK + Unicode union. Run the CJK lane FIRST: when it cannot serve
+            # (tokenizer unavailable, stale, or a pending rebuild) the route
+            # group cannot serve coherently, so a knowingly-useless Unicode
+            # MATCH must not run before the bounded LIKE fallback (spec:
+            # known-unindexable -> direct LIKE). A partial union is never
+            # trusted.
             servable, cjk_candidates = self._fts_cjk_metadata_candidates(
                 needle, conn=conn
             )
+            if not servable:
+                return _like_fallback()
             fts_ok, uni_candidates = self._fts_metadata_candidates(
                 needle, conn=conn
             )
-            if not (servable and fts_ok):
+            if not fts_ok:
                 return _like_fallback()
             union: Dict[int, Any] = {}
             for c in cjk_candidates or []:
@@ -7883,10 +7876,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 FROM reverse_chain rc
                 JOIN sessions child ON child.id = rc.id
                 JOIN sessions p ON p.id = child.parent_session_id
-                WHERE p.end_reason = 'compression'
-                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
+                WHERE {_compression_edge_sql('p', 'child')}
             ),
             eligible_roots(id) AS (
                 SELECT DISTINCT s.id
@@ -8129,10 +8119,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                                     FROM chain c
                                     JOIN sessions parent ON parent.id = c.cur_id
                                     JOIN sessions child ON child.parent_session_id = c.cur_id
-                                    WHERE parent.end_reason = 'compression'
-                                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                                      AND COALESCE(child.source, '') != 'tool'
+                                    WHERE {_compression_edge_sql('parent', 'child')}
                                 ),
                                 chain_max AS (
                                     SELECT
@@ -8181,10 +8168,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         FROM chain c
                         JOIN sessions parent ON parent.id = c.cur_id
                         JOIN sessions child ON child.parent_session_id = c.cur_id
-                        WHERE parent.end_reason = 'compression'
-                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                          AND COALESCE(child.source, '') != 'tool'
+                        WHERE {_compression_edge_sql('parent', 'child')}
                     ),
                     chain_max AS (
                         SELECT
