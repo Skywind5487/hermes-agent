@@ -19,6 +19,8 @@ Whole-store lineage/eligibility/pagination behavior lives in
 ``TestWholeStoreListingSearch`` (added with the listing integration).
 """
 
+import time
+
 import pytest
 
 from hermes_state import SessionDB
@@ -330,3 +332,189 @@ class TestSnapshotRule:
         # Only the caller's single read context was used — the router and its
         # lanes must not open fresh per-query reads.
         assert calls == []
+
+
+class TestWholeStoreListingSearch:
+    """The listing seam maps whole-store candidates -> visible logical roots.
+
+    Candidate narrowing must cover the WHOLE store (not the loaded page),
+    reverse compression closure must map historical segments to their visible
+    tip, dedupe must not starve other lineages, branch/delegate/tool and the
+    base filters must precede the final LIMIT, >999 candidates must not trip a
+    bind ceiling, and non-matching pins must never leak into a search result.
+    """
+
+    def _search_ids(self, db, query, **kw):
+        return [
+            r["id"]
+            for r in db.list_sessions_rich(
+                search_query=query, order_by_last_active=True, **kw
+            )
+        ]
+
+    def test_old_session_outside_recent_page_is_found(self, db):
+        db.create_session("old_needle", source="cli")
+        db.set_session_title("old_needle", "Needle Old")
+        for i in range(60):
+            db.create_session(f"new_{i}", source="cli")
+            db.set_session_title(f"new_{i}", f"Fresh Title {i}")
+        db._conn.commit()
+        ids = self._search_ids(db, "needle", limit=10)
+        assert "old_needle" in ids
+
+    def test_historical_compression_segment_returns_one_visible_tip(self, db):
+        db.create_session("root", source="cli")
+        db.set_session_title("root", "Needle Origin")
+        db.end_session("root", "compression")
+        db.create_session("tip", source="cli", parent_session_id="root")
+        db.set_session_title("tip", "Live Continuation")
+        db._conn.commit()
+        rows = db.list_sessions_rich(
+            search_query="needle",
+            order_by_last_active=True,
+            project_compression_tips=True,
+        )
+        assert [r["id"] for r in rows] == ["tip"]
+        assert rows[0]["_lineage_root_id"] == "root"
+
+    def test_multiple_matching_segments_do_not_starve_another_lineage(self, db):
+        db.create_session("A_root", source="cli")
+        db.set_session_title("A_root", "Needle A1")
+        db.end_session("A_root", "compression")
+        db.create_session("A_tip1", source="cli", parent_session_id="A_root")
+        db.set_session_title("A_tip1", "Needle A2")
+        db.end_session("A_tip1", "compression")
+        db.create_session("A_tip2", source="cli", parent_session_id="A_tip1")
+        db.set_session_title("A_tip2", "Needle A3")
+        db.create_session("B_root", source="cli")
+        db.set_session_title("B_root", "Needle B")
+        db._conn.commit()
+        rows = self._search_ids(db, "needle")
+        # One row per distinct lineage (A projected to its live tip), never one
+        # row per matching segment.
+        assert len(rows) == 2
+        assert "B_root" in rows
+        assert any(r in rows for r in ("A_tip2", "A_root"))
+
+    def test_branches_separate_delegates_tools_hidden(self, db):
+        db.create_session("parent", source="cli")
+        db.set_session_title("parent", "Needle Parent")
+        db.create_session(
+            "branch",
+            source="cli",
+            parent_session_id="parent",
+            model_config={"_branched_from": "parent"},
+        )
+        db.set_session_title("branch", "Needle Branch")
+        db.create_session(
+            "delegate",
+            source="tool",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.set_session_title("delegate", "Needle Delegate")
+        db.end_session("parent", "compression")
+        db.create_session("cont", source="cli", parent_session_id="parent")
+        db.set_session_title("cont", "Needle Continuation")
+        db._conn.commit()
+        rows = db.list_sessions_rich(search_query="needle", order_by_last_active=True)
+        ids = {r["id"] for r in rows}
+        # The parent lineage surfaces as its live continuation; the branch is a
+        # separate visible conversation; the delegate/tool row stays hidden.
+        assert "cont" in ids
+        assert "branch" in ids
+        assert "delegate" not in ids
+
+    def test_source_filter_precedes_final_limit(self, db):
+        for i in range(30):
+            db.create_session(f"cli_{i}", source="cli")
+            db.set_session_title(f"cli_{i}", f"Needle cli {i}")
+        for i in range(30):
+            db.create_session(f"tg_{i}", source="telegram")
+            db.set_session_title(f"tg_{i}", f"Needle tg {i}")
+        db._conn.commit()
+        rows = db.list_sessions_rich(
+            source="cli",
+            search_query="needle",
+            order_by_last_active=True,
+            limit=10,
+        )
+        assert len(rows) == 10
+        assert all(r["source"] == "cli" for r in rows)
+
+    def test_min_message_count_filter_precedes_final_limit(self, db):
+        db.create_session("rich", source="cli")
+        db.set_session_title("rich", "Needle Rich")
+        db._conn.execute(
+            "UPDATE sessions SET message_count = 5 WHERE id = 'rich'"
+        )
+        db.create_session("thin", source="cli")
+        db.set_session_title("thin", "Needle Thin")
+        db._conn.execute(
+            "UPDATE sessions SET message_count = 1 WHERE id = 'thin'"
+        )
+        db._conn.commit()
+        ids = self._search_ids(db, "needle", min_message_count=5)
+        assert ids == ["rich"]
+
+    def test_archive_filter_precedes_final_limit(self, db):
+        db.create_session("live", source="cli")
+        db.set_session_title("live", "Needle Live")
+        db.create_session("arch", source="cli")
+        db.set_session_title("arch", "Needle Archived")
+        db._conn.execute("UPDATE sessions SET archived = 1 WHERE id = 'arch'")
+        db._conn.commit()
+        assert self._search_ids(db, "needle") == ["live"]
+        assert set(self._search_ids(db, "needle", include_archived=True)) == {
+            "live",
+            "arch",
+        }
+
+    def test_over_999_candidates_work(self, db):
+        """A single JSON ``json_each(?)`` candidate source — no per-candidate
+        bind that would trip SQLite's bind-variable ceiling."""
+        t0 = time.time()
+        db._conn.executemany(
+            "INSERT INTO sessions (id, source, started_at, title) "
+            "VALUES (?, 'cli', ?, ?)",
+            [(f"s{i}", t0 + i, f"Needle {i}") for i in range(1100)],
+        )
+        db._conn.commit()
+        rows = self._search_ids(db, "needle", limit=20)
+        assert len(rows) == 20
+
+    def test_pins_do_not_leak_in_search(self, db):
+        db.create_session("match", source="cli")
+        db.set_session_title("match", "Needle Match")
+        db.create_session("pin", source="cli")
+        db.set_session_title("pin", "Unrelated Pinned")
+        db._conn.execute("UPDATE sessions SET pinned = 1 WHERE id = 'pin'")
+        db._conn.commit()
+        rows = self._search_ids(db, "needle", include_pinned=True, limit=1)
+        assert rows == ["match"]
+
+    def test_matching_pin_still_backfilled(self, db):
+        db.create_session("pin_old", source="cli")
+        db.set_session_title("pin_old", "Needle Old Pin")
+        db._conn.execute(
+            "UPDATE sessions SET pinned = 1, started_at = 1 WHERE id = 'pin_old'"
+        )
+        db.create_session("newer", source="cli")
+        db.set_session_title("newer", "Needle Newer")
+        db._conn.commit()
+        rows = self._search_ids(db, "needle", include_pinned=True, limit=1)
+        assert "pin_old" in rows
+        assert "newer" in rows
+
+    def test_include_children_keeps_segments_individually_visible(self, db):
+        db.create_session("root", source="cli")
+        db.set_session_title("root", "Needle Root")
+        db.end_session("root", "compression")
+        db.create_session("seg", source="cli", parent_session_id="root")
+        db.set_session_title("seg", "Needle Segment")
+        db._conn.commit()
+        rows = self._search_ids(db, "needle", include_children=True)
+        # With children admitted, the candidate segment AND its ancestor are
+        # individually eligible (no child exclusion in the CTE).
+        assert "seg" in rows
+        assert "root" in rows
