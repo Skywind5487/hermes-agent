@@ -1606,6 +1606,37 @@ class TestWebServerEndpoints:
         assert payload["limit"] == 3
         assert len(payload["sessions"]) == 3
 
+    def test_profiles_sessions_search_finds_old_session_outside_recent_page(self):
+        """``q`` searches the WHOLE store through the common metadata seam: an
+        old session buried under 205 newer rows (outside the recent-200 page)
+        is still found without crossing profile/source/archive scope."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="old_needle", source="cli")
+            db.set_session_title("old_needle", "Old Needle Session")
+            db.append_message(session_id="old_needle", role="user", content="search me")
+            for i in range(205):
+                db.create_session(session_id=f"recent-{i}", source="cli")
+                db.append_message(session_id=f"recent-{i}", role="user", content="hi")
+        finally:
+            db.close()
+
+        # Without q, the recent-200 page hides the old session.
+        resp = self.client.get("/api/profiles/sessions?limit=200&offset=0")
+        payload = resp.json()
+        assert "old_needle" not in {s["id"] for s in payload["sessions"]}
+
+        # With q, whole-store discovery surfaces it.
+        resp = self.client.get("/api/profiles/sessions?q=old%20needle&limit=200")
+        assert resp.status_code == 200
+        payload = resp.json()
+        ids = [s["id"] for s in payload["sessions"]]
+        assert "old_needle" in ids
+        # Unfiltered corpus totals stay intact for response compatibility.
+        assert payload["total"] >= 206
+
     def test_get_session_messages_rejects_negative_limit(self):
         """limit=-1 previously bypassed the documented 500-row clamp because
         min(-1, 500) == -1, which SQLite treats as 'no limit'."""

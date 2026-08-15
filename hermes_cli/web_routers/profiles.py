@@ -72,6 +72,7 @@ def get_profiles_sessions(
     sources: str = None,
     exclude_sources: str = None,
     full: bool = False,
+    q: str = "",
 ):
     """Unified, read-only session list aggregated across ALL profiles.
 
@@ -81,6 +82,13 @@ def get_profiles_sessions(
     browsable list and only spins up a profile's backend when the user actually
     interacts (sends a message). A user with a single (default) profile gets the
     same rows as ``/api/sessions``, just tagged ``profile="default"``.
+
+    ``q`` (optional) searches the WHOLE session store through the common
+    metadata seam: when non-empty, every profile's ``list_sessions_rich`` is
+    asked for matching rows (routed FTS candidates + bounded LIKE fallback) and
+    the merged result is the search response. ``total`` / ``profile_totals``
+    stay the endpoint's existing UNFILTERED corpus counts for response
+    compatibility — the resume picker ignores them while ``q`` is active.
 
     Rows omit ``system_prompt``/``model_config`` unless ``full=1`` — same
     list projection as ``/api/sessions``.
@@ -116,6 +124,12 @@ def get_profiles_sessions(
     source_filter = source or None
     source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
     exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
+    # Search over the whole store through the common metadata seam. Empty q
+    # keeps the existing recent/created listing; non-empty q routes each
+    # profile's list_sessions_rich through the metadata candidate seam and
+    # orders by last-active.
+    search_query = q.strip() or None
+    order_by_last_active = order == "recent" or bool(search_query)
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -147,7 +161,8 @@ def get_profiles_sessions(
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
-                order_by_last_active=order == "recent",
+                order_by_last_active=order_by_last_active,
+                search_query=search_query,
                 # Same SQL-level blob skip as /api/sessions (see above).
                 compact_rows=not full,
                 include_pinned=True,
