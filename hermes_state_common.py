@@ -716,6 +716,19 @@ BEGIN
 END;
 """
 
+
+def escape_like(text: str) -> str:
+    """Escape SQL LIKE wildcards so operator/session-derived text matches
+    literally.  Pair with ``ESCAPE '\\'`` in the clause.
+
+    ``%`` and ``_`` are wildcards to LIKE, and ``_`` in particular is common
+    in the values these patterns run against (branch names, session titles,
+    filesystem paths).  A match documented as substring/prefix must not
+    silently widen.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 # ── Sessions FTS5 — normalized external-content trigram (v3 / issue #30) ──
 # Same canonical-source principle as the #25 Unicode sessions_fts: metadata
 # text is canonical ONLY in ``sessions`` (read through the named ``row_id``),

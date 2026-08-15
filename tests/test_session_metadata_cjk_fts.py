@@ -740,6 +740,25 @@ class TestCjkDegradation:
             d.close()
 
 
+class TestCjkNumberedTitleResolution:
+    """#15: CJK numbered-title resolution must be literal-safe on a
+    tokenizer-capable host (the CJK lane must not reuse the SQL-escaped
+    prefix as a Python literal check)."""
+
+    def test_resolve_cjk_numbered_plain(self, cjk_db):
+        """A plain CJK numbered continuation resolves (regression guard)."""
+        cjk_db.create_session("s1", source="cli")
+        cjk_db.set_session_title("s1", "專案 #2")
+        assert cjk_db.resolve_session_by_title("專案") == "s1"
+
+    def test_resolve_cjk_numbered_with_underscore(self, cjk_db):
+        """A CJK continuation whose base contains '_' must resolve via the
+        CJK lane ('專案_工作' must find '專案_工作 #2')."""
+        cjk_db.create_session("s1", source="cli")
+        cjk_db.set_session_title("s1", "專案_工作 #2")
+        assert cjk_db.resolve_session_by_title("專案_工作") == "s1"
+
+
 # =========================================================================
 # Group D — search seam: pending/unavailable/1-char fallback vs zero matches
 # =========================================================================

@@ -82,6 +82,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
     compact_session_metadata_text,
+    escape_like as _escape_like,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -151,6 +152,28 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     except (PermissionError, OSError, OverflowError):
         return False
     return False
+
+
+def _numbered_variant_value(title: Optional[str], base: str) -> Optional[int]:
+    """Return N when ``title`` is exactly ``base + " #N"`` for an ASCII
+    integer N, else None.
+
+    A numbered continuation is the base title followed by a literal ``" #"``
+    and an integer suffix (the grammar ``get_next_title_in_lineage`` uses to
+    strip/generate suffixes). This is a LITERAL comparison — no SQL LIKE
+    wildcard semantics — so ``%`` / ``_`` / ``\\`` in the base stay literal
+    (issue #15). Only ASCII digits are accepted so fullwidth digits are never
+    mistaken for a suffix.
+    """
+    if not title or not base:
+        return None
+    prefix = base + " #"
+    if not title.startswith(prefix):
+        return None
+    suffix = title[len(prefix):]
+    if not suffix.isascii() or not suffix.isdigit():
+        return None
+    return int(suffix)
 
 
 def _fts_unicode61_fold(text: Optional[str]) -> str:
@@ -7054,13 +7077,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def _like_numbered_variants(self, title: str) -> List[sqlite3.Row]:
         """Fallback: find numbered continuation variants via LIKE."""
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        escaped = _escape_like(title)
         with self._lock:
-            return list(self._conn.execute(
+            rows = list(self._conn.execute(
                 "SELECT id, title, started_at FROM sessions "
                 "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
                 (f"{escaped} #%",),
             ))
+        # The ' #%' LIKE prefix over-matches non-numeric suffixes such as
+        # "foo #bar"; keep only true integer "#N" continuations (issue #15).
+        return [
+            row for row in rows
+            if _numbered_variant_value(row["title"], title) is not None
+        ]
 
     def _session_fts_rebuild_gap(self) -> Optional[Tuple[int, int]]:
         """Bounded unindexed session-metadata gap ``(progress, high_water]``.
@@ -7513,7 +7542,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         when no matches.
         """
         is_cjk = self._contains_cjk(title)
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
         # An unsanitizable query must signal "use the LIKE fallback" (None),
         # not "no matches" ([]), for both lanes.
@@ -7526,7 +7554,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return None  # canonical LIKE fallback
             return [
                 c for c in candidates
-                if c["title"] and c["title"].startswith(f"{escaped} #")
+                if _numbered_variant_value(c["title"], title) is not None
             ]
 
         # Non-CJK: the shared raw Unicode lane already merges the FTS
@@ -7539,9 +7567,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         if not candidates:
             return candidates
+        # Literal "#N" validation on the RAW base — never the SQL-escaped
+        # prefix — so a "%" / "_" / "\\" in the base stays literal (issue #15).
         return [
             c for c in candidates
-            if c["title"] and c["title"].startswith(f"{escaped} #")
+            if _numbered_variant_value(c["title"], title) is not None
         ]
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
@@ -7551,7 +7581,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the highest existing number and increments.
         """
         # Strip existing #N suffix to find the true base
-        match = re.match(r'^(.*?) #(\d+)$', base_title)
+        match = re.match(r'^(.*?) #([0-9]+)$', base_title)
         if match:
             base = match.group(1)
         else:
@@ -7559,7 +7589,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Find all existing numbered variants
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
-        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        escaped = _escape_like(base)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
@@ -7567,15 +7597,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             existing = [row["title"] for row in cursor.fetchall()]
 
-        if not existing:
+        # Only the base itself and true integer "#N" variants occupy the
+        # lineage. The ' #%' LIKE over-matches non-numeric suffixes such as
+        # "foo #bar", which must not force a "#2" when the base is free
+        # (issue #15).
+        numbered = [
+            t for t in existing
+            if t == base or _numbered_variant_value(t, base) is not None
+        ]
+        if not numbered:
             return base  # No conflict, use the base name as-is
 
         # Find the highest number
         max_num = 1  # The unnumbered original counts as #1
-        for t in existing:
-            m = re.match(r'^.* #(\d+)$', t)
-            if m:
-                max_num = max(max_num, int(m.group(1)))
+        for t in numbered:
+            n = _numbered_variant_value(t, base)
+            if n is not None:
+                max_num = max(max_num, n)
 
         return f"{base} #{max_num + 1}"
 
