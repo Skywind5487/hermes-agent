@@ -72,6 +72,28 @@ describe('Hermes REST helpers', () => {
     )
   })
 
+  it('passes a whole-store search query to the all-profile session list', async () => {
+    await listAllProfileSessions(50, 1, 'exclude', 'recent', 'all', {}, '  an-94  ')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/profiles/sessions?limit=50&offset=0&min_messages=1&archived=exclude&order=recent&profile=all&q=an-94',
+        timeoutMs: 60_000
+      })
+    )
+  })
+
+  it('omits q when the search query is blank', async () => {
+    await listAllProfileSessions(50, 1, 'exclude', 'recent', 'all', {}, '   ')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/profiles/sessions?limit=50&offset=0&min_messages=1&archived=exclude&order=recent&profile=all',
+        timeoutMs: 60_000
+      })
+    )
+  })
+
   it('batches the sidebar slices into a single request with per-slice limits + excludes', async () => {
     api.mockResolvedValue({ recents: { sessions: [] }, cron: { sessions: [] }, messaging: { sessions: [] } })
 

@@ -311,31 +311,70 @@ async def search_sessions(
                     payload["id"] = sid
                 seen[root] = payload
 
-            # Direct ID matches first: users often paste a session id from CLI,
-            # logs, or another Hermes surface. FTS can't find those unless the
-            # id happens to appear in message text. search_sessions_by_id is
-            # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(
-                q,
-                limit=safe_limit,
-                include_archived=True,
-                source=source_filter,
-                sources=source_list or None,
-                exclude_sources=exclude_list or None,
-            ):
-                sid = row.get("id")
-                preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
+            # Exact ID B-tree hit first: a pasted session id jumps straight to
+            # that conversation before any broad discovery (deterministic,
+            # cheap, never a ranking system). The arbitrary-infix ID contract
+            # is now covered by the whole-store metadata lane below (trigram
+            # FTS over the raw id), so the old parallel search_sessions_by_id
+            # scan is no longer used for this consumer.
+            try:
+                exact = db.get_session(q)
+            except Exception:
+                exact = None
+            if exact and exact.get("id"):
+                _src = exact.get("source")
+                if (include_sources and _src not in include_sources) or (
+                    exclude_list and _src in exclude_list
+                ):
+                    exact = None
+            if exact and exact.get("id"):
+                preview = (exact.get("preview") or "").strip()
+                snippet = preview or f"Session ID: {exact['id']}"
                 add_lineage_result(
-                    sid,
+                    exact["id"],
                     {
                         "snippet": snippet,
                         "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
+                        "source": exact.get("source"),
+                        "model": exact.get("model"),
+                        "session_started": exact.get("started_at"),
                     },
                 )
+
+            # Whole-store metadata discovery through the common seam
+            # (list_sessions_rich): title / logical id / display_name matched
+            # via routed Unicode/CJK/trigram FTS with the bounded canonical
+            # LIKE fallback, candidates narrowed before lineage/projection,
+            # one visible tip per logical conversation. Over-fetch so lineage
+            # dedup can still surface `limit` distinct conversations.
+            if len(seen) < safe_limit:
+                meta_rows = db.list_sessions_rich(
+                    source=source_filter,
+                    sources=source_list or None,
+                    exclude_sources=exclude_list or None,
+                    limit=max(safe_limit * 4, safe_limit),
+                    order_by_last_active=True,
+                    search_query=q,
+                    include_archived=True,
+                )
+                for row in meta_rows:
+                    if len(seen) >= safe_limit:
+                        break
+                    sid = row.get("id")
+                    if not sid:
+                        continue
+                    preview = (row.get("preview") or "").strip()
+                    snippet = preview or f"Session ID: {sid}"
+                    add_lineage_result(
+                        sid,
+                        {
+                            "snippet": snippet,
+                            "role": None,
+                            "source": row.get("source"),
+                            "model": row.get("model"),
+                            "session_started": row.get("started_at"),
+                        },
+                    )
 
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"

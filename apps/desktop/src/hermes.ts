@@ -407,7 +407,8 @@ export async function listAllProfileSessions(
   archived: 'exclude' | 'include' | 'only' = 'exclude',
   order: 'created' | 'recent' = 'recent',
   profile: 'all' | (string & {}) = 'all',
-  filter: SessionSourceFilter = {}
+  filter: SessionSourceFilter = {},
+  q = ''
 ): Promise<PaginatedSessions> {
   const sourceParam = filter.source ? `&source=${encodeURIComponent(filter.source)}` : ''
 
@@ -415,10 +416,16 @@ export async function listAllProfileSessions(
     ? `&exclude_sources=${encodeURIComponent(filter.excludeSources.join(','))}`
     : ''
 
+  // Non-empty ``q`` searches the WHOLE store through the backend metadata
+  // seam (routed FTS + bounded LIKE fallback) instead of client-filtering the
+  // loaded recent page. The resume picker debounces and only sets q while the
+  // user is actively typing; the empty-query view keeps loading recents.
+  const qParam = q.trim() ? `&q=${encodeURIComponent(q.trim())}` : ''
+
   const result = await window.hermesDesktop.api<PaginatedSessions>({
     path:
       `/api/profiles/sessions?limit=${limit}&offset=0&min_messages=${Math.max(0, minMessages)}` +
-      `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
+      `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}${qParam}`,
     timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 

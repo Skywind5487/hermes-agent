@@ -1250,6 +1250,7 @@ export const en: Translations = {
     refresh: 'Refresh',
     refreshing: 'Refreshing...',
     noResults: 'No matching results found.',
+    searchFailed: 'Session search failed — check the backend and try again.',
     pinSession: 'Pin session',
     unpinSession: 'Unpin session',
     exportSession: 'Export session',

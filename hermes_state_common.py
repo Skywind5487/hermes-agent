@@ -103,6 +103,28 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
+def _compression_edge_sql(parent_alias: str, child_alias: str) -> str:
+    """The authoritative compression-continuation edge, shared by BOTH the
+    forward chain and the reverse candidate closure (issue #14 / #37).
+
+    A child continues its parent when the parent ended with ``compression``,
+    the child has no ``_branched_from`` / ``_delegate_from`` marker, and the
+    child is not a ``tool`` subagent run. No timestamp predicate: real
+    insert/end races can land the continuation before the parent's ``ended_at``
+    is written. ``parent_alias`` / ``child_alias`` are the SQL aliases of the
+    two ``sessions`` rows. Defining the edge once prevents the forward and
+    reverse walks from drifting apart.
+    """
+    return (
+        f"{parent_alias}.end_reason = 'compression'"
+        f" AND json_extract(COALESCE({child_alias}.model_config, '{{}}'), "
+        f"'$._branched_from') IS NULL"
+        f" AND json_extract(COALESCE({child_alias}.model_config, '{{}}'), "
+        f"'$._delegate_from') IS NULL"
+        f" AND COALESCE({child_alias}.source, '') != 'tool'"
+    )
+
+
 def _sql_session_last_active(alias: str = "s") -> str:
     """SQL expression for session recency used by list/status surfaces.
 

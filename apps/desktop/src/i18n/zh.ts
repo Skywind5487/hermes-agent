@@ -1446,6 +1446,7 @@ export const zh: Translations = {
     refresh: '刷新',
     refreshing: '刷新中…',
     noResults: '未找到匹配结果。',
+    searchFailed: '会话搜索失败 — 请检查后端后再试。',
     pinSession: '置顶会话',
     unpinSession: '取消置顶',
     exportSession: '导出会话',

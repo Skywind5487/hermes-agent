@@ -1095,6 +1095,7 @@ export interface Translations {
     refresh: string
     refreshing: string
     noResults: string
+    searchFailed: string
     pinSession: string
     unpinSession: string
     exportSession: string
