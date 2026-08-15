@@ -132,6 +132,13 @@ helper returns `(fts_ok, candidates)`: when the `sessions_fts` MATCH lane
 itself fails, `fts_ok` is False so title resolution falls back to the LIKE
 lane instead of trusting a partial result.
 
+Numbered-title resolution (issue #15) validates candidates with a strict
+literal grammar — `base + " #" + ASCII integer` — in BOTH the FTS post-filter
+and the LIKE fallback, so a `%` / `_` / `\` in the base stays literal and a
+non-numeric suffix such as `foo #bar` is never treated as a continuation.
+The SQL LIKE escape (`hermes_state_common.escape_like`) is used only for the
+SQL wildcard match; the Python literal check always uses the raw base.
+
 ## CJK variant (issue #26)
 
 `sessions_fts_cjk` is an **optional CJK specialization** of the same

@@ -1538,6 +1538,71 @@ class TestTitleSqlWildcards:
         assert db.resolve_session_by_title("test_project") == "s1"
 
 
+class TestNumberedTitleLiteralSafety:
+    """#15: numbered continuation resolution must accept only integer ``#N``
+    suffixes and must not confuse SQL LIKE escaping with a Python literal
+    comparison (titles containing ``%`` / ``_`` / ``\\``)."""
+
+    def test_resolve_title_with_percent_continuation(self, db):
+        """'100% done #2' is the continuation of '100% done'."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "100% done")
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "100% done #2")
+        # The numbered continuation (most recent) wins over the exact base.
+        assert db.resolve_session_by_title("100% done") == "s2"
+
+    def test_resolve_title_with_backslash_continuation(self, db):
+        """A backslash in the base must not break continuation resolution."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "a\\b #2")
+        assert db.resolve_session_by_title("a\\b") == "s1"
+
+    def test_resolve_title_with_underscore_continuation(self, db):
+        """The FTS lane must not reuse the SQL-escaped prefix as a Python
+        literal check ('my_notes' must find 'my_notes #2')."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "my_notes #2")
+        assert db.resolve_session_by_title("my_notes") == "s1"
+
+    @pytest.mark.parametrize(
+        "lookalike",
+        ["foo #bar", "foo #", "foo # 2", "foo #2x", "foo ##2", "foo #2.0"],
+    )
+    def test_resolve_title_non_numeric_suffix_rejected(self, db, lookalike):
+        """A non-integer '#...' suffix is not a numbered continuation."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", lookalike)
+        assert db.resolve_session_by_title("foo") is None
+
+    def test_next_title_ignores_non_numeric_lookalike(self, db):
+        """'foo #bar' is not a numbered variant, so base 'foo' stays free."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo #bar")
+        assert db.get_next_title_in_lineage("foo") == "foo"
+
+    def test_next_title_with_percent_base(self, db):
+        """'100% done #2' increments to '100% done #3'."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "100% done #2")
+        assert db.get_next_title_in_lineage("100% done") == "100% done #3"
+
+    def test_resolve_title_with_hash_in_base(self, db):
+        """A '#' inside the base stays literal ('my #project' must find
+        'my #project #2')."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "my #project")
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "my #project #2")
+        # The numbered continuation (most recent) wins over the exact base.
+        assert db.resolve_session_by_title("my #project") == "s2"
+
+    def test_next_title_fullwidth_suffix_not_stripped(self, db):
+        """A fullwidth-digit suffix is not an ASCII-integer '#N': the input
+        'foo #２' is a literal base, never 'foo' + a numbered suffix (#15)."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        assert db.get_next_title_in_lineage("foo #２") == "foo #２"
 
 
 class TestListSessionsRich:
