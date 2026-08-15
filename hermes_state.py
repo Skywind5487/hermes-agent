@@ -7849,6 +7849,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Defensive: an unknown classifier result never fabricates a match.
         return _like_fallback()
 
+    def _metadata_candidate_roots_cte(
+        self, candidate_json: str, where_sql: str
+    ) -> str:
+        """Recursive CTE mapping metadata candidate row_ids to visible roots.
+
+        Reverse-closes every candidate across the SAME compression edges the
+        forward chain uses (parent ``end_reason='compression'``, child has no
+        ``_branched_from`` / ``_delegate_from`` marker, child source !=
+        ``tool``), then applies the existing list eligibility predicates.
+
+        ``candidate_json`` is a JSON array of ``sessions.row_id`` values
+        consumed via ``json_each(?)`` — one parameter, no per-candidate binds
+        and no temp table on a read-only connection. ``where_sql`` is the base
+        eligibility predicate (with the ``WHERE`` keyword, bound to the ``s``
+        alias). Emitting the candidate itself plus every valid ancestor is
+        what preserves both ``include_children`` modes: the default logical
+        root/branch view and the explicit child-list view.
+        """
+        return f"""
+            candidate_row_ids(row_id) AS (
+                SELECT CAST(value AS INTEGER) FROM json_each(?)
+            ),
+            candidate_sessions(id) AS (
+                SELECT DISTINCT s.id
+                FROM sessions s
+                JOIN candidate_row_ids c ON c.row_id = s.row_id
+            ),
+            reverse_chain(id) AS (
+                SELECT id FROM candidate_sessions
+                UNION
+                SELECT p.id
+                FROM reverse_chain rc
+                JOIN sessions child ON child.id = rc.id
+                JOIN sessions p ON p.id = child.parent_session_id
+                WHERE p.end_reason = 'compression'
+                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                  AND COALESCE(child.source, '') != 'tool'
+            ),
+            eligible_roots(id) AS (
+                SELECT DISTINCT s.id
+                FROM sessions s
+                JOIN reverse_chain rc ON rc.id = s.id
+                {where_sql}
+            )
+        """
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -7897,11 +7944,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         a recursive CTE that walks compression-continuation edges, so LIMIT
         and OFFSET still apply efficiently.
 
-        ``search_query`` matches case-insensitive substrings against each
-        surfaced row's title and id (and, like ``id_query``, every title/id in
-        its forward compression chain). A punctuation-stripped variant is also
-        matched so e.g. ``an94`` finds ``AN-94``. Only honored in the
-        ``order_by_last_active`` path.
+        ``search_query`` routes metadata discovery through the whole-store
+        candidate seam (issue #14): the Unicode/CJK/trigram FTS lanes run
+        first, with a bounded canonical LIKE fallback only for a valid-zero,
+        direct, or route-failure query. Candidate ``row_id`` s are narrowed
+        BEFORE lineage/projection work, then mapped to visible logical roots
+        via a reverse compression closure, and only surviving roots run the
+        forward chain/activity + LIMIT/OFFSET + preview. ``an94`` finds
+        ``AN-94`` through the compact policy, and every title/id in a lineage
+        matches like ``id_query``. Only honored in the ``order_by_last_active``
+        path.
 
         Pass ``compact_rows=True`` for dashboard and picker callers that only
         need lightweight metadata. This omits the ``system_prompt`` blob from
@@ -7992,6 +8044,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # pass id_query=None.
         id_needle = (id_query or "").strip().lower()
         search_needle = (search_query or "").strip().lower()
+        # Set when the search path routed a query: JSON array of whole-store
+        # metadata ``row_id`` candidates ("[]" = a definite no-match). Reused
+        # by the search-constrained pinned back-fill so a non-matching pin can
+        # never leak into a search result.
+        candidate_json: Optional[str] = None
         if order_by_last_active:
             # Compute effective_last_active by walking each surfaced session's
             # compression-continuation chain forward in SQL and taking the MAX
@@ -8028,78 +8085,137 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "          AND LOWER(cq.cur_id) LIKE ? ESCAPE '\\')"
                 )
                 id_params.append(_like_pattern(id_needle))
-            if search_needle:
-                # Same chain-membership trick as id_query, but matching the
-                # title, logical id, or display_name of any session in the
-                # chain (issue #25 covers display_name in the raw metadata
-                # search). The compact (punctuation-stripped) variant lets
-                # `an94` match `AN-94`.
-                compact_needle = re.sub(r"[\W_]+", "", search_needle)
-                compact_sql = (
-                    "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
-                    " '-', ''), '_', ''), '.', ''), ' ', '')"
-                )
-                search_clause = (
-                    "EXISTS (SELECT 1 FROM chain cq"
-                    " JOIN sessions cs ON cs.id = cq.cur_id"
-                    " WHERE cq.root_id = s.id"
-                    " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
-                    " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
-                    " OR LOWER(COALESCE(cs.display_name, '')) LIKE ? ESCAPE '\\'"
-                )
-                id_params.extend([_like_pattern(search_needle)] * 3)
-                if compact_needle:
-                    search_clause += (
-                        f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"
-                    )
-                    id_params.append(_like_pattern(compact_needle))
-                filter_clauses.append(search_clause + "))")
-            if filter_clauses:
-                combined = " AND ".join(filter_clauses)
-                outer_where = (
-                    f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
-                )
+
             _sel = self._compact_session_cols() if compact_rows else "s.*"
-            query = f"""
-                WITH RECURSIVE chain(root_id, cur_id) AS (
-                    SELECT s.id, s.id FROM sessions s {where_sql}
-                    UNION ALL
-                    SELECT c.root_id, child.id
-                    FROM chain c
-                    JOIN sessions parent ON parent.id = c.cur_id
-                    JOIN sessions child ON child.parent_session_id = c.cur_id
-                    WHERE parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
-                ),
-                chain_max AS (
-                    SELECT
-                        root_id,
-                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
-                    FROM chain
-                    GROUP BY root_id
-                )
-                SELECT {_sel}{prompt_select},
-                    COALESCE(
-                        (SELECT {_PREVIEW_RAW_SELECT}
-                         FROM messages m
-                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                         ORDER BY m.timestamp, m.id LIMIT 1),
-                        ''
-                    ) AS _preview_raw,
-                    {_sql_session_last_active("s")} AS last_active,
-                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
-                FROM sessions s
-                LEFT JOIN chain_max cm ON cm.root_id = s.id
-                {prompt_join}
-                {outer_where}
-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
-                LIMIT ? OFFSET ?
-            """
-            # WHERE params apply twice (CTE seed + outer select); the id filter
-            # only applies to the outer select.
-            params = params + params + id_params + [limit, offset]
+            if search_needle:
+                # ===== #14 candidate-seeded whole-store search =====
+                # Route metadata discovery to stable ``row_id`` candidates
+                # across the WHOLE store (Unicode/CJK/trigram FTS lanes first;
+                # the router runs the bounded canonical LIKE fallback exactly
+                # once for a valid zero or route failure). The candidate set is
+                # never globally capped before lineage mapping, eligibility,
+                # and dedupe — invisible/source-mismatched rows and many
+                # matching segments in one lineage cannot starve a valid top-N.
+                # Route guards/H-P/MATCH/fallback and the candidate->root page
+                # query share ONE explicit read snapshot (BEGIN below), then a
+                # reverse compression closure maps candidates to eligible
+                # visible roots and the forward chain runs only for survivors.
+                if filter_clauses:
+                    outer_filter_where = (
+                        f"WHERE {' AND '.join(filter_clauses)}"
+                    )
+                else:
+                    outer_filter_where = ""
+                with self._read_ctx() as conn:
+                    conn.execute("BEGIN")
+                    try:
+                        route = self._metadata_candidate_row_ids(
+                            search_needle, conn=conn
+                        )
+                        candidate_json = json.dumps(route.row_ids)
+                        if not route.row_ids:
+                            rows = []
+                        else:
+                            candidate_cte = self._metadata_candidate_roots_cte(
+                                candidate_json, where_sql
+                            )
+                            query = f"""
+                                WITH RECURSIVE
+                                {candidate_cte},
+                                chain(root_id, cur_id) AS (
+                                    SELECT id, id FROM eligible_roots
+                                    UNION ALL
+                                    SELECT c.root_id, child.id
+                                    FROM chain c
+                                    JOIN sessions parent ON parent.id = c.cur_id
+                                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                                    WHERE parent.end_reason = 'compression'
+                                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                                      AND COALESCE(child.source, '') != 'tool'
+                                ),
+                                chain_max AS (
+                                    SELECT
+                                        root_id,
+                                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+                                    FROM chain
+                                    GROUP BY root_id
+                                )
+                                SELECT {_sel}{prompt_select},
+                                    COALESCE(
+                                        (SELECT {_PREVIEW_RAW_SELECT}
+                                         FROM messages m
+                                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                                         ORDER BY m.timestamp, m.id LIMIT 1),
+                                        ''
+                                    ) AS _preview_raw,
+                                    {_sql_session_last_active("s")} AS last_active,
+                                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                                FROM sessions s
+                                LEFT JOIN chain_max cm ON cm.root_id = s.id
+                                JOIN eligible_roots er ON er.id = s.id
+                                {prompt_join}
+                                {outer_filter_where}
+                                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                                LIMIT ? OFFSET ?
+                            """
+                            cursor = conn.execute(
+                                query,
+                                [candidate_json] + base_where_params
+                                + id_params + [limit, offset],
+                            )
+                            rows = cursor.fetchall()
+                    finally:
+                        conn.execute("ROLLBACK")
+            else:
+                if filter_clauses:
+                    combined = " AND ".join(filter_clauses)
+                    outer_where = (
+                        f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
+                    )
+                query = f"""
+                    WITH RECURSIVE chain(root_id, cur_id) AS (
+                        SELECT s.id, s.id FROM sessions s {where_sql}
+                        UNION ALL
+                        SELECT c.root_id, child.id
+                        FROM chain c
+                        JOIN sessions parent ON parent.id = c.cur_id
+                        JOIN sessions child ON child.parent_session_id = c.cur_id
+                        WHERE parent.end_reason = 'compression'
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                          AND COALESCE(child.source, '') != 'tool'
+                    ),
+                    chain_max AS (
+                        SELECT
+                            root_id,
+                            MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+                        FROM chain
+                        GROUP BY root_id
+                    )
+                    SELECT {_sel}{prompt_select},
+                        COALESCE(
+                            (SELECT {_PREVIEW_RAW_SELECT}
+                             FROM messages m
+                             WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                             ORDER BY m.timestamp, m.id LIMIT 1),
+                            ''
+                        ) AS _preview_raw,
+                        {_sql_session_last_active("s")} AS last_active,
+                        COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                    FROM sessions s
+                    LEFT JOIN chain_max cm ON cm.root_id = s.id
+                    {prompt_join}
+                    {outer_where}
+                    ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                    LIMIT ? OFFSET ?
+                """
+                # WHERE params apply twice (CTE seed + outer select); the id
+                # filter only applies to the outer select.
+                params = params + params + id_params + [limit, offset]
+                with self._read_ctx() as conn:
+                    cursor = conn.execute(query, params)
+                    rows = cursor.fetchall()
         else:
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
@@ -8119,9 +8235,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 LIMIT ? OFFSET ?
             """
             params.extend([limit, offset])
-        with self._read_ctx() as conn:
-            cursor = conn.execute(query, params)
-            rows = cursor.fetchall()
+            with self._read_ctx() as conn:
+                cursor = conn.execute(query, params)
+                rows = cursor.fetchall()
         sessions = []
         for row in rows:
             s = self._session_row_dict(row)
@@ -8137,30 +8253,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # number of pins (a handful), never N+1 per pin.
         if include_pinned:
             seen_ids = {s["id"] for s in sessions}
-            pinned_where = (
-                f"{where_sql} AND s.pinned = 1" if where_sql else "WHERE s.pinned = 1"
-            )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
-            pinned_query = f"""
-                SELECT {_sel}{prompt_select},
-                    COALESCE(
-                        (SELECT {_PREVIEW_RAW_SELECT}
-                         FROM messages m
-                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                         ORDER BY m.timestamp, m.id LIMIT 1),
-                        ''
-                    ) AS _preview_raw,
-                    COALESCE(
-                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                        s.started_at
-                    ) AS last_active
-                FROM sessions s
-                {prompt_join}
-                {pinned_where}
-                ORDER BY s.started_at DESC
-            """
+            if candidate_json is not None:
+                # Search-constrained back-fill: only pins whose lineage is a
+                # matching candidate root may surface — a non-matching pin must
+                # never leak into a search result. Runs the same candidate CTE
+                # (one shared lineage/eligibility definition) and keeps the
+                # page's existing filters.
+                candidate_cte = self._metadata_candidate_roots_cte(
+                    candidate_json, where_sql
+                )
+                pinned_query = f"""
+                    WITH RECURSIVE
+                    {candidate_cte}
+                    SELECT {_sel}{prompt_select},
+                        COALESCE(
+                            (SELECT {_PREVIEW_RAW_SELECT}
+                             FROM messages m
+                             WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                             ORDER BY m.timestamp, m.id LIMIT 1),
+                            ''
+                        ) AS _preview_raw,
+                        COALESCE(
+                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                            s.started_at
+                        ) AS last_active
+                    FROM sessions s
+                    JOIN eligible_roots er ON er.id = s.id
+                    {prompt_join}
+                    WHERE s.pinned = 1
+                    ORDER BY s.started_at DESC
+                """
+                pinned_params = [candidate_json] + base_where_params
+            else:
+                pinned_where = (
+                    f"{where_sql} AND s.pinned = 1" if where_sql else "WHERE s.pinned = 1"
+                )
+                pinned_query = f"""
+                    SELECT {_sel}{prompt_select},
+                        COALESCE(
+                            (SELECT {_PREVIEW_RAW_SELECT}
+                             FROM messages m
+                             WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                             ORDER BY m.timestamp, m.id LIMIT 1),
+                            ''
+                        ) AS _preview_raw,
+                        COALESCE(
+                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                            s.started_at
+                        ) AS last_active
+                    FROM sessions s
+                    {prompt_join}
+                    {pinned_where}
+                    ORDER BY s.started_at DESC
+                """
+                pinned_params = base_where_params
             with self._read_ctx() as conn:
-                pinned_cursor = conn.execute(pinned_query, base_where_params)
+                pinned_cursor = conn.execute(pinned_query, pinned_params)
                 pinned_rows = pinned_cursor.fetchall()
             for row in pinned_rows:
                 s = self._session_row_dict(row)
