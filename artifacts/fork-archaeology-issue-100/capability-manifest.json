@@ -13,7 +13,7 @@
       "current fork survival",
       "frozen upstream/prior art"
     ],
-    "rule": "A capability is a behavior boundary with a contract and verification surface; provisional provenance buckets are evidence containers only.",
+    "rule": "A capability is a behavior boundary with a contract and verification surface; provisional provenance buckets are evidence containers only. Runtime policy and diagnostics are split when a historical change both changes behavior and measures it. The adversarial coverage audit reviews every change record at hunk/intent level; a commit may have multiple semantic rows.",
     "non_capability_rule": "Research, operations, benchmarks, integration topology, and isolated maintenance are accounted explicitly without promotion to capabilities."
   },
   "accounting": {
@@ -78,6 +78,41 @@
       ],
       "change_record_count": 3,
       "merge_event_count": 2
+    },
+    {
+      "id": "capability:compression-session-boundary",
+      "record_class": "capability",
+      "capability": "Compression session-boundary semantics",
+      "intent_name": "Prevent compressor-reported no-op results from creating a false session boundary.",
+      "historical_commits": [],
+      "supporting_historical_commits": [
+        {
+          "sha": "176646d2cd6c95fa49b9414f21ed9e781b0aaa84",
+          "subject": "feat: add lifecycle and SQLite observability telemetry",
+          "role": "behavioral overlay; same commit also contains telemetry"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "The commit is retained in the lifecycle telemetry provenance bucket for runner accounting; the hunk-level audit promotes this independent behavior intent.",
+      "behavioral_contracts": [
+        "A context compressor reporting noop does not rotate or rewrite the session, even if it returns a newly allocated list.",
+        "The current system prompt and session lock are released safely on the no-op path."
+      ],
+      "current_dev_survival": "Survives in agent/conversation_compression.py and its compression lifecycle tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has a semantic no-progress guard for equal compressor output, but the explicit status-reported-noop case is a separate residual contract.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "SPLIT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Confirm the canonical status field for third-party context compressors before porting."
+      ],
+      "source_inventory_records": [
+        "behavior-overlay:commit:176646d2cd6c95fa49b9414f21ed9e781b0aaa84"
+      ],
+      "change_record_count": 0,
+      "merge_event_count": 0
     },
     {
       "id": "capability:configurable-reasoning-display",
@@ -306,44 +341,85 @@
         "commit:176646d2cd6c95fa49b9414f21ed9e781b0aaa84"
       ],
       "change_record_count": 1,
-      "merge_event_count": 0
+      "merge_event_count": 0,
+      "behavioral_overlays": [
+        "capability:compression-session-boundary"
+      ]
     },
     {
-      "id": "capability:memory-trim-observability",
+      "id": "capability:memory-trim-diagnostics",
       "record_class": "capability",
-      "capability": "Memory trim observability and cooldown",
-      "intent_name": "Instrument memory trim decisions with GC/trim split, fragmentation, VmSwap, low-water and cooldown signals.",
+      "capability": "Memory trim diagnostics",
+      "intent_name": "Attribute trim cost and memory pressure without making diagnostics a prerequisite for recovery.",
       "historical_commits": [
         {
           "sha": "04f1af72be078cef69de538f1519f93a73088b0d",
           "subject": "feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold"
-        },
-        {
-          "sha": "a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb",
-          "subject": "fix(mem-trim): gate gc.collect() behind gc_cooldown_seconds, measure frag before trim"
         }
       ],
       "historical_issues": [],
       "historical_prs": [],
       "merge_provenance": [],
-      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "merge_provenance_note": "04f1 is explicitly owned here for its instrumentation; its policy threshold is cited as supporting evidence by the policy capability.",
       "behavioral_contracts": [
-        "Telemetry distinguishes measurement from the trim action and cooldown prevents repeated gc.collect calls."
+        "gc_ms versus trim_ms identifies the freeze mechanism without changing the policy decision.",
+        "Fragmentation and VmSwap are best-effort diagnostics and never block memory recovery."
       ],
-      "current_dev_survival": "Survives in hermes_cli/mem_trim.py and related diagnostics.",
-      "upstream_prior_art_current_implementation": "Not yet compared at behavioral-contract level against frozen upstream.",
-      "status": "NEEDS_REVIEW",
-      "disposition": "NEEDS_REVIEW",
-      "confidence": "low",
+      "current_dev_survival": "Survives in hermes_cli/mem_trim.py through gc_ms/trim_ms, malloc_info fragmentation, VmSwap snapshots, and structured trim logs.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has basic RSS/RssAnon snapshots and trim logging, but not the fork's GC-versus-trim attribution, malloc_info fragmentation, or VmSwap diagnostics.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "KEEP",
+      "confidence": "medium",
       "unresolved_questions": [
-        "Is this a user-facing capability, internal diagnostic, or non-capability?",
-        "What evidence establishes the trim policy?"
+        "Which diagnostic fields are stable enough to expose as a long-term contract?",
+        "Should malloc_info remain best-effort Linux/glibc-only instrumentation?"
       ],
       "source_inventory_records": [
-        "commit:04f1af72be078cef69de538f1519f93a73088b0d",
+        "commit:04f1af72be078cef69de538f1519f93a73088b0d"
+      ],
+      "change_record_count": 1,
+      "merge_event_count": 0
+    },
+    {
+      "id": "capability:memory-trim-policy",
+      "record_class": "capability",
+      "capability": "Memory trim policy",
+      "intent_name": "Avoid expensive and low-value heap work while preserving cheap malloc_trim cadence.",
+      "historical_commits": [
+        {
+          "sha": "a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb",
+          "subject": "fix(mem-trim): gate gc.collect() behind gc_cooldown_seconds, measure frag before trim"
+        }
+      ],
+      "supporting_historical_commits": [
+        {
+          "sha": "04f1af72be078cef69de538f1519f93a73088b0d",
+          "subject": "feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold",
+          "role": "policy precursor"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "The policy was introduced by the two sequential mem-trim commits; 04f1 is mapped to diagnostics for explicit accounting and retained here as a supporting precursor.",
+      "behavioral_contracts": [
+        "RSS below threshold_mb skips the expensive trim work on housekeeping ticks.",
+        "gc.collect() runs at most once per gc_cooldown_seconds while malloc_trim remains eligible on the normal trim cadence.",
+        "The 99.7% GC attribution explains the policy split; force behavior and invalid configuration retain safe fallbacks."
+      ],
+      "current_dev_survival": "Survives in hermes_cli/mem_trim.py with threshold_mb, gc_cooldown_seconds, separate _last_gc_monotonic state, and independent malloc_trim cadence.",
+      "upstream_prior_art_current_implementation": "Frozen upstream hermes_cli/mem_trim.py has a general cooldown around gc.collect()+malloc_trim, but no RSS low-water gate or independent GC cooldown; this is partial prior art, not equivalence.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Which upstream housekeeping callers should own the cheap trim cadence after porting?",
+        "Should threshold_mb and gc_cooldown_seconds share the upstream config naming/default policy?"
+      ],
+      "source_inventory_records": [
         "commit:a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb"
       ],
-      "change_record_count": 2,
+      "change_record_count": 1,
       "merge_event_count": 0
     },
     {
@@ -1071,6 +1147,42 @@
       "merge_event_count": 0
     },
     {
+      "id": "capability:session-search-context-hydration",
+      "record_class": "capability",
+      "capability": "Session search context hydration",
+      "intent_name": "Hydrate bounded surrounding context with a predictable lock scope while preserving result semantics.",
+      "historical_commits": [],
+      "supporting_historical_commits": [
+        {
+          "sha": "b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70",
+          "subject": "perf(search): batch context queries — chunked session_id batches (20/sql)",
+          "role": "behavioral overlay; benchmark bucket also contains query-shape validation"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "The commit remains in performance-validation for one-to-one runner accounting; the context/lock hunk is promoted by the behavioral audit.",
+      "behavioral_contracts": [
+        "Each search match receives only its bounded preceding, matching, and following message context.",
+        "Context rows are fetched in bounded session batches and the position index is built outside the database lock.",
+        "Decode failures degrade each match to an empty context rather than corrupting the result set."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py session message search and context preview tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has per-match context hydration with equivalent -1/0/+1 semantics, but not the fork's bounded batch and lock-scope policy.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Confirm the current upstream search module seam and whether the batch size should remain 20."
+      ],
+      "source_inventory_records": [
+        "behavior-overlay:commit:b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70"
+      ],
+      "change_record_count": 0,
+      "merge_event_count": 0
+    },
+    {
       "id": "capability:session-search-lineage",
       "record_class": "capability",
       "capability": "Compression-lineage-aware session search",
@@ -1350,6 +1462,42 @@
       "merge_event_count": 2
     },
     {
+      "id": "capability:sqlite-write-contention-policy",
+      "record_class": "capability",
+      "capability": "SQLite write contention backoff policy",
+      "intent_name": "Bound write contention with rollback-safe exponential backoff and a finite delay cap.",
+      "historical_commits": [],
+      "supporting_historical_commits": [
+        {
+          "sha": "cc2531fbc6df8fdb34fca0b096b798eb53f970dd",
+          "subject": "fix: exponential backoff, slow-write log, and Discord API delivery log",
+          "role": "behavioral overlay; same commit also contains diagnostics"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "The commit remains in its original incidental-hardening provenance bucket for one-to-one runner accounting; the retry hunk is promoted by the behavioral audit.",
+      "behavioral_contracts": [
+        "SQLite write contention retries roll back before retrying.",
+        "Retry delay uses a 20ms base with jitter, exponential growth, and a 2s cap.",
+        "Retry exhaustion and non-lock failures retain explicit error behavior."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py _execute_write and write-contention tests/logging.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has uniform 20-150ms retry jitter and slow-write diagnostics, not the fork's exponential 20ms-to-2s policy.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Revalidate attempt/deadline semantics when porting onto the current upstream writer."
+      ],
+      "source_inventory_records": [
+        "behavior-overlay:commit:cc2531fbc6df8fdb34fca0b096b798eb53f970dd"
+      ],
+      "change_record_count": 0,
+      "merge_event_count": 0
+    },
+    {
       "id": "non-capability:incidental-hardening",
       "record_class": "non_capability",
       "capability": "Incidental hardening and maintenance",
@@ -1389,7 +1537,10 @@
         "commit:cc2531fbc6df8fdb34fca0b096b798eb53f970dd"
       ],
       "change_record_count": 3,
-      "merge_event_count": 0
+      "merge_event_count": 0,
+      "behavioral_overlays": [
+        "capability:sqlite-write-contention-policy"
+      ]
     },
     {
       "id": "non-capability:integration-merge",
@@ -1479,7 +1630,10 @@
         "commit:b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70"
       ],
       "change_record_count": 2,
-      "merge_event_count": 1
+      "merge_event_count": 1,
+      "behavioral_overlays": [
+        "capability:session-search-context-hydration"
+      ]
     },
     {
       "id": "non-capability:production-evidence",
@@ -1551,10 +1705,14 @@
     }
   ],
   "phase_2_boundaries": [
+    "Port memory-trim policy (RSS low-water threshold, independent GC cooldown, cheap malloc_trim cadence) as a runtime behavior slice.",
+    "Keep memory-trim diagnostics (GC/trim attribution, fragmentation, VmSwap) separate from policy and best-effort.",
     "Port session metadata FTS base, CJK, trigram, lifecycle, and storage-v2 as separate slices with explicit dependency ordering.",
     "Port session search routing only after index contracts and the lineage resolver are independently validated.",
     "Evaluate headroom output compression and CCR retrieval as separate optional plugin slices.",
     "Port configurable reasoning display and request transformation after upstream hook/config ordering is specified.",
-    "Keep lifecycle telemetry, memory-trim observability, and incidental hardening in NEEDS_REVIEW until contracts and upstream comparisons are complete."
+    "Port compression session-boundary no-op semantics separately from lifecycle telemetry.",
+    "Port SQLite write-contention backoff separately from incidental diagnostics.",
+    "Port session-search context hydration/lock scope separately from benchmark evidence."
   ]
 }

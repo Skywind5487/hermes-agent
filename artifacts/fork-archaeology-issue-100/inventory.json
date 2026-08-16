@@ -602,7 +602,7 @@
       ]
     },
     {
-      "id": "capability:memory-trim-observability",
+      "id": "capability:memory-trim-diagnostics",
       "record_type": "provenance_bucket",
       "subject": "feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold",
       "commits": [
@@ -614,24 +614,6 @@
           ],
           "is_merge": false,
           "patch_id": "b793dd29722b01e260b13a1b2e3be1c2708c1071",
-          "changed_files": [
-            "hermes_cli/mem_trim.py"
-          ],
-          "graph_presence": {
-            "upstream_reachable": false,
-            "fork_exclusive": true
-          },
-          "issue_refs": [],
-          "pr_refs": []
-        },
-        {
-          "sha": "a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb",
-          "subject": "fix(mem-trim): gate gc.collect() behind gc_cooldown_seconds, measure frag before trim",
-          "parents": [
-            "04f1af72be078cef69de538f1519f93a73088b0d"
-          ],
-          "is_merge": false,
-          "patch_id": "6c4c0e537ecff4d0df196c263683328d626be9cd",
           "changed_files": [
             "hermes_cli/mem_trim.py"
           ],
@@ -653,15 +635,16 @@
       },
       "patch_matches": [],
       "exact_upstream_commits": [],
-      "upstream_status": "NEEDS_REVIEW",
-      "disposition": "NEEDS_REVIEW",
-      "confidence": "low",
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "KEEP",
+      "confidence": "medium",
       "evidence": [
-        "Survives in hermes_cli/mem_trim.py and related diagnostics.",
-        "Not yet compared at behavioral-contract level against frozen upstream."
+        "Frozen fork splits gc_ms and trim_ms, records VmSwap, and measures malloc_info fragmentation.",
+        "Frozen upstream has basic RSS/RssAnon snapshots and trim logging but not the fork's attribution diagnostics."
       ],
       "behavioral_contracts": [
-        "Telemetry distinguishes measurement from the trim action and cooldown prevents repeated gc.collect calls."
+        "gc_ms versus trim_ms identifies the freeze mechanism without changing the policy decision.",
+        "Fragmentation and VmSwap are best-effort diagnostics and never block memory recovery."
       ]
     },
     {
@@ -3270,6 +3253,53 @@
         "Timeout cleanup clears in-memory browser state in a finally-equivalent path.",
         "Daemon termination is opt-in/config-gated.",
         "Cleanup failures are contained and test-covered."
+      ]
+    },
+    {
+      "id": "capability:memory-trim-policy",
+      "record_type": "provenance_bucket",
+      "subject": "fix(mem-trim): gate gc.collect() behind gc_cooldown_seconds, measure frag before trim",
+      "commits": [
+        {
+          "sha": "a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb",
+          "subject": "fix(mem-trim): gate gc.collect() behind gc_cooldown_seconds, measure frag before trim",
+          "parents": [
+            "04f1af72be078cef69de538f1519f93a73088b0d"
+          ],
+          "is_merge": false,
+          "patch_id": "6c4c0e537ecff4d0df196c263683328d626be9cd",
+          "changed_files": [
+            "hermes_cli/mem_trim.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [],
+      "affected_files": [
+        "hermes_cli/mem_trim.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Frozen fork hermes_cli/mem_trim.py adds threshold_mb and gc_cooldown_seconds policy gates.",
+        "Frozen upstream hermes_cli/mem_trim.py has a general trim cooldown but no RSS low-water gate or independent GC cooldown."
+      ],
+      "behavioral_contracts": [
+        "RSS below threshold_mb skips the expensive trim work on housekeeping ticks.",
+        "gc.collect() runs at most once per gc_cooldown_seconds while malloc_trim remains eligible on the normal trim cadence.",
+        "Force behavior and invalid configuration retain explicit safe fallbacks."
       ]
     },
     {

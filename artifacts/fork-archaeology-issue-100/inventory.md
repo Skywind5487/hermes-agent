@@ -8,7 +8,7 @@
 | --- | ---: | ---: | --- | --- | --- |
 | `capability:session-fts-storage-v2` | 9 | 1 | `FORK_ONLY` | `PORT` | `high` |
 | `capability:session-fts-lifecycle` | 15 | 1 | `FORK_ONLY` | `PORT` | `high` |
-| `capability:memory-trim-observability` | 2 | 0 | `NEEDS_REVIEW` | `NEEDS_REVIEW` | `low` |
+| `capability:memory-trim-diagnostics` | 1 | 0 | `PARTIAL_UPSTREAM` | `KEEP` | `medium` |
 | `capability:headroom-retrieval` | 5 | 1 | `FORK_ONLY` | `PORT` | `high` |
 | `capability:session-fts-cjk` | 12 | 1 | `FORK_ONLY` | `PORT` | `high` |
 | `capability:lifecycle-sqlite-telemetry` | 1 | 0 | `NEEDS_REVIEW` | `NEEDS_REVIEW` | `medium` |
@@ -21,6 +21,7 @@
 | `capability:headroom-compression` | 4 | 1 | `FORK_ONLY` | `PORT` | `high` |
 | `non-capability:integration-merge` | 0 | 4 | `NEEDS_REVIEW` | `NEEDS_REVIEW` | `high` |
 | `capability:browser-timeout-cleanup` | 3 | 2 | `FORK_ONLY` | `PORT` | `high` |
+| `capability:memory-trim-policy` | 1 | 0 | `PARTIAL_UPSTREAM` | `PORT` | `high` |
 | `non-capability:performance-validation` | 2 | 1 | `NEEDS_REVIEW` | `NEEDS_REVIEW` | `high` |
 | `capability:session-fts-unicode` | 5 | 0 | `FORK_ONLY` | `PORT` | `high` |
 | `capability:session-search-routing` | 7 | 1 | `FORK_ONLY` | `PORT` | `high` |
@@ -49,14 +50,14 @@
 - Evidence: Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_fts_lifecycle_registry.py.; Frozen upstream has message FTS primitives but no equivalent session six-index lifecycle boundary.
 - Behavioral contracts: The registry covers messages_fts, messages_fts_trigram, messages_fts_cjk, sessions_fts, sessions_fts_cjk, and sessions_fts_trigram.; Maintenance, health, read-only discovery, repair, and degraded runtime iterate the same descriptors.; Unknown or incomplete trigger state fails closed for serving.
 
-### `capability:memory-trim-observability` - feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold
+### `capability:memory-trim-diagnostics` - feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold
 
-- Changes: `04f1af72be07`, `a9d2b9af4f80`
+- Changes: `04f1af72be07`
 - Merge events: (none)
 - Files: `hermes_cli/mem_trim.py`
 - Upstream matches: none
-- Evidence: Survives in hermes_cli/mem_trim.py and related diagnostics.; Not yet compared at behavioral-contract level against frozen upstream.
-- Behavioral contracts: Telemetry distinguishes measurement from the trim action and cooldown prevents repeated gc.collect calls.
+- Evidence: Frozen fork splits gc_ms and trim_ms, records VmSwap, and measures malloc_info fragmentation.; Frozen upstream has basic RSS/RssAnon snapshots and trim logging but not the fork's attribution diagnostics.
+- Behavioral contracts: gc_ms versus trim_ms identifies the freeze mechanism without changing the policy decision.; Fragmentation and VmSwap are best-effort diagnostics and never block memory recovery.
 
 ### `capability:headroom-retrieval` - feat(headroom): add retrieval (CCR) support to Phase 1 compression plugin
 
@@ -165,6 +166,15 @@
 - Upstream matches: none
 - Evidence: Survives in tools/browser_tool.py and timeout cleanup/daemon tests.; Frozen upstream has timeout cleanup/orphan reaping but not terminate_daemon_on_timeout configuration behavior.
 - Behavioral contracts: Timeout cleanup clears in-memory browser state in a finally-equivalent path.; Daemon termination is opt-in/config-gated.; Cleanup failures are contained and test-covered.
+
+### `capability:memory-trim-policy` - fix(mem-trim): gate gc.collect() behind gc_cooldown_seconds, measure frag before trim
+
+- Changes: `a9d2b9af4f80`
+- Merge events: (none)
+- Files: `hermes_cli/mem_trim.py`
+- Upstream matches: none
+- Evidence: Frozen fork hermes_cli/mem_trim.py adds threshold_mb and gc_cooldown_seconds policy gates.; Frozen upstream hermes_cli/mem_trim.py has a general trim cooldown but no RSS low-water gate or independent GC cooldown.
+- Behavioral contracts: RSS below threshold_mb skips the expensive trim work on housekeeping ticks.; gc.collect() runs at most once per gc_cooldown_seconds while malloc_trim remains eligible on the normal trim cadence.; Force behavior and invalid configuration retain explicit safe fallbacks.
 
 ### `non-capability:performance-validation` - perf(search): batch context queries — chunked session_id batches (20/sql)
 

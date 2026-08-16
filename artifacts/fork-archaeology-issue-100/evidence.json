@@ -40,18 +40,6 @@
         "Operational records remain durable evidence and are not mistaken for code-level equivalence."
       ]
     },
-    "capability:memory-trim-observability": {
-      "upstream_status": "NEEDS_REVIEW",
-      "disposition": "NEEDS_REVIEW",
-      "confidence": "low",
-      "evidence": [
-        "Survives in hermes_cli/mem_trim.py and related diagnostics.",
-        "Not yet compared at behavioral-contract level against frozen upstream."
-      ],
-      "behavioral_contracts": [
-        "Telemetry distinguishes measurement from the trim action and cooldown prevents repeated gc.collect calls."
-      ]
-    },
     "capability:session-search-routing": {
       "upstream_status": "FORK_ONLY",
       "disposition": "PORT",
@@ -294,6 +282,33 @@
       "behavioral_contracts": [
         "NUL-bearing input does not reach unsafe process/lifecycle calls.",
         "Terminal fallback returns a clear failure rather than truncating at NUL."
+      ]
+    },
+    "capability:memory-trim-policy": {
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Frozen fork hermes_cli/mem_trim.py adds threshold_mb and gc_cooldown_seconds policy gates.",
+        "Frozen upstream hermes_cli/mem_trim.py has a general trim cooldown but no RSS low-water gate or independent GC cooldown."
+      ],
+      "behavioral_contracts": [
+        "RSS below threshold_mb skips the expensive trim work on housekeeping ticks.",
+        "gc.collect() runs at most once per gc_cooldown_seconds while malloc_trim remains eligible on the normal trim cadence.",
+        "Force behavior and invalid configuration retain explicit safe fallbacks."
+      ]
+    },
+    "capability:memory-trim-diagnostics": {
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "KEEP",
+      "confidence": "medium",
+      "evidence": [
+        "Frozen fork splits gc_ms and trim_ms, records VmSwap, and measures malloc_info fragmentation.",
+        "Frozen upstream has basic RSS/RssAnon snapshots and trim logging but not the fork's attribution diagnostics."
+      ],
+      "behavioral_contracts": [
+        "gc_ms versus trim_ms identifies the freeze mechanism without changing the policy decision.",
+        "Fragmentation and VmSwap are best-effort diagnostics and never block memory recovery."
       ]
     }
   }
