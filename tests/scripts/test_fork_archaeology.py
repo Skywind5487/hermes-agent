@@ -55,3 +55,95 @@ def test_refs_must_be_full_shas(tmp_path: Path):
     spec.loader.exec_module(module)
     with pytest.raises(module.AuditInputError, match="full 40-character"):
         module.build_inventory(tmp_path, "main", "0" * 40, "0" * 40)
+
+
+def test_pr_commits_are_grouped_and_mixed_patch_matches_are_partial(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    base = commit(repo, "base", "base.txt", "base\n")
+    commit(repo, "feat: shared capability (#7)", "feature.txt", "same\n")
+    fork_ref = commit(repo, "fix: follow-up for capability (#7)", "follow-up.txt", "fork-only\n")
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "upstream", base], check=True)
+    upstream_ref = commit(repo, "same capability upstream", "feature.txt", "same\n")
+
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("fork_archaeology_grouped", SCRIPT)
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    inventory = module.build_inventory(repo, fork_ref, upstream_ref, base)
+
+    assert [intent["id"] for intent in inventory["intents"]] == ["pr:7"]
+    assert inventory["intents"][0]["upstream_status"] == "PARTIAL_UPSTREAM"
+    assert inventory["intents"][0]["disposition"] == "SPLIT"
+    assert len(inventory["intents"][0]["commits"]) == 2
+    assert inventory["accounting"]["complete"] is True
+
+
+def test_evidence_override_is_validated_and_rendered(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    base = commit(repo, "base", "base.txt", "base\n")
+    fork_ref = commit(repo, "feat: retained behavior", "feature.txt", "fork\n")
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "upstream", base], check=True)
+    upstream_ref = commit(repo, "unrelated upstream", "other.txt", "other\n")
+
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("fork_archaeology_evidence", SCRIPT)
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    evidence = {
+        "intents": {
+            "commit:" + git(repo, "rev-parse", fork_ref): {
+                "upstream_status": "FORK_ONLY",
+                "disposition": "KEEP",
+                "confidence": "high",
+                "evidence": ["current upstream lacks the behavior"],
+                "behavioral_contracts": ["retained behavior remains user-visible"],
+            }
+        }
+    }
+    inventory = module.build_inventory(repo, fork_ref, upstream_ref, base, evidence["intents"])
+    markdown = module.render_markdown(inventory)
+
+    assert inventory["intents"][0]["upstream_status"] == "FORK_ONLY"
+    assert inventory["intents"][0]["disposition"] == "KEEP"
+    assert "retained behavior remains user-visible" in markdown
+    assert "`FORK_ONLY`" in markdown
+
+
+def test_explicit_intent_map_overrides_subject_grouping(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    base = commit(repo, "base", "base.txt", "base\n")
+    fork_ref = commit(repo, "unrelated wording", "feature.txt", "fork\n")
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "upstream", base], check=True)
+    upstream_ref = commit(repo, "unrelated upstream", "other.txt", "other\n")
+
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("fork_archaeology_map", SCRIPT)
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    inventory = module.build_inventory(
+        repo,
+        fork_ref,
+        upstream_ref,
+        base,
+        intent_map={git(repo, "rev-parse", fork_ref): "capability:explicit"},
+    )
+
+    assert inventory["intents"][0]["id"] == "capability:explicit"
