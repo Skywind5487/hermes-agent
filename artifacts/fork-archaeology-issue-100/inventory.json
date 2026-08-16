@@ -1,0 +1,4119 @@
+{
+  "schema_version": 3,
+  "inputs": {
+    "fork_ref": "35c8564c9c0af3d75bcbdf1d793e7207e5528f06",
+    "upstream_ref": "460d345642ee3d143a3e461abe39fd42b86a7e54",
+    "merge_base": "91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53"
+  },
+  "provenance_buckets": [
+    {
+      "id": "capability:session-fts-storage-v2",
+      "record_type": "provenance_bucket",
+      "subject": "test(fts): pin storage-v2 refusal states (#31)",
+      "commits": [
+        {
+          "sha": "00a2675a9270033325d53d7a3301a58f5f66d760",
+          "subject": "test(fts): pin storage-v2 refusal states (#31)",
+          "parents": [
+            "9d140c8594c67ed37729b190fd3733508d0d770c"
+          ],
+          "is_merge": false,
+          "patch_id": "ea3822aa15120604e3a6d5f5a852662423003e79",
+          "changed_files": [
+            "tests/test_fts_storage_v2_settlement.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        },
+        {
+          "sha": "b86e4f526ec377f7f958dc21ddaac87238882f19",
+          "subject": "fix(fts): unify storage-v2 settlement predicate (#31)",
+          "parents": [
+            "00a2675a9270033325d53d7a3301a58f5f66d760"
+          ],
+          "is_merge": false,
+          "patch_id": "e6c4a15ba13108650949d288ca82785d8166b51c",
+          "changed_files": [
+            "hermes_state_common.py",
+            "hermes_state_schema.py",
+            "hermes_state_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        },
+        {
+          "sha": "2c907113fd2c50edde60425c561ab8ca25192b1b",
+          "subject": "test(fts): cover storage-v2 interruption/reopen + acceptance matrix (#31)",
+          "parents": [
+            "b86e4f526ec377f7f958dc21ddaac87238882f19"
+          ],
+          "is_merge": false,
+          "patch_id": "8be42f87431ece49aef3ef6eda2ad8facc6b629e",
+          "changed_files": [
+            "tests/test_fts_storage_v2_settlement.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        },
+        {
+          "sha": "f887f44fa2d27c7ec4132fe70d337f7975fcde63",
+          "subject": "docs(research): record storage-v2 settlement implementation (#31)",
+          "parents": [
+            "2c907113fd2c50edde60425c561ab8ca25192b1b"
+          ],
+          "is_merge": false,
+          "patch_id": "36092365b27afdd43694a21941d8b1305fb7d4a7",
+          "changed_files": [
+            "docs/research/issue-31-storage-v2-settlement.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        },
+        {
+          "sha": "180ae82a2d7ec34a099665d68719c8579986d693",
+          "subject": "test(fts): pin structural refusal branches (#31)",
+          "parents": [
+            "f887f44fa2d27c7ec4132fe70d337f7975fcde63"
+          ],
+          "is_merge": false,
+          "patch_id": "a6766363f406ec162858de31b5d44c20a81f94ab",
+          "changed_files": [
+            "tests/test_fts_storage_v2_settlement.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        },
+        {
+          "sha": "1d6d73f3bb8ffeb599799c05b6e853da1758b4db",
+          "subject": "refactor(fts): settle review-round findings (#31)",
+          "parents": [
+            "180ae82a2d7ec34a099665d68719c8579986d693"
+          ],
+          "is_merge": false,
+          "patch_id": "dbc62ce587beeee1e059967839673e3aaa6e7661",
+          "changed_files": [
+            "docs/research/issue-31-storage-v2-settlement.md",
+            "hermes_state_schema.py",
+            "hermes_state_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        },
+        {
+          "sha": "0fafc1dd7b58f15982ce2833de2bc8826a1e116f",
+          "subject": "test(fts): pin mixed-capability optimize availability (#31)",
+          "parents": [
+            "1d6d73f3bb8ffeb599799c05b6e853da1758b4db"
+          ],
+          "is_merge": false,
+          "patch_id": "59e36add923089ed523051231c1299b4abf2d90d",
+          "changed_files": [
+            "tests/test_fts_storage_v2_settlement.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        },
+        {
+          "sha": "67d4f719d6b0717be024861ae2756fa49d6f1315",
+          "subject": "fix(fts): optimize-available sees any actionable blocker (#31)",
+          "parents": [
+            "0fafc1dd7b58f15982ce2833de2bc8826a1e116f"
+          ],
+          "is_merge": false,
+          "patch_id": "6e1e369dc56114dd292a0e4b3bd2e5416e3af4a5",
+          "changed_files": [
+            "docs/research/issue-31-storage-v2-settlement.md",
+            "hermes_state_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        },
+        {
+          "sha": "0ff8583e91c838088fde6cb55ba0488cf5a0ee93",
+          "subject": "docs(research): fix settlement test count in validation note (#31)",
+          "parents": [
+            "67d4f719d6b0717be024861ae2756fa49d6f1315"
+          ],
+          "is_merge": false,
+          "patch_id": "baae4280be968b7103ce48254bb258f2b197b653",
+          "changed_files": [
+            "docs/research/issue-31-storage-v2-settlement.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "31"
+          ]
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "276d497764feb7d4a71f1424ed44b8958da63b16",
+          "subject": "Merge pull request #78 from Skywind5487/feat/31-storage-v2-settlement",
+          "parents": [
+            "9d140c8594c67ed37729b190fd3733508d0d770c",
+            "0ff8583e91c838088fde6cb55ba0488cf5a0ee93"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "78"
+          ]
+        }
+      ],
+      "affected_files": [
+        "docs/research/issue-31-storage-v2-settlement.md",
+        "hermes_state_common.py",
+        "hermes_state_schema.py",
+        "hermes_state_search.py",
+        "tests/test_fts_storage_v2_settlement.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "31",
+          "78"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_fts_storage_v2_settlement.py.",
+        "Frozen upstream has no session six-index storage-v2 settlement state machine."
+      ],
+      "behavioral_contracts": [
+        "One predicate defines required-index settlement; startup and foreground paths use it.",
+        "Incomplete or interrupted required settlement refuses serving; reopen/resume reaches an explicit terminal state.",
+        "Optional indexes do not silently become required blockers."
+      ]
+    },
+    {
+      "id": "capability:session-fts-lifecycle",
+      "record_type": "provenance_bucket",
+      "subject": "feat(fts): authoritative six-index registry + registry-driven ordinary maintenance (#27)",
+      "commits": [
+        {
+          "sha": "00e680a8cb22e251f351b9f140b0679c4f96dabc",
+          "subject": "feat(fts): authoritative six-index registry + registry-driven ordinary maintenance (#27)",
+          "parents": [
+            "919f4469e832bc2b38bba0ea5af26b842bf91acd"
+          ],
+          "is_merge": false,
+          "patch_id": "4cc0cf6fd0285b48b07de0d623e5b6f71c89ced2",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_search.py",
+            "tests/test_fts_lifecycle_registry.py",
+            "tests/test_hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "e64af5e0f8a3e8816137fd083ca7d567e2f8a0a1",
+          "subject": "feat(fts): registry-driven health probes + trigger inventory/convergence (#27)",
+          "parents": [
+            "00e680a8cb22e251f351b9f140b0679c4f96dabc"
+          ],
+          "is_merge": false,
+          "patch_id": "c03104d48d06f2c67ded35771f87f567dc9772cf",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_schema.py",
+            "hermes_state_search.py",
+            "tests/test_fts_lifecycle_registry.py",
+            "tests/test_hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "474b88fe76e18dfcf397f11b3de6f069abac4a4c",
+          "subject": "fix(fts): registry-driven offline + destructive repair covers session indexes (#27)",
+          "parents": [
+            "e64af5e0f8a3e8816137fd083ca7d567e2f8a0a1"
+          ],
+          "is_merge": false,
+          "patch_id": "59a851149da5001ab1a18c3ad5c8ba10df56d4c2",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_fts_lifecycle_registry.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "f9ade6baff7f236b6b9401932c61bc0400375664",
+          "subject": "feat(fts): read-only session capability discovery + shared rebuild-lane iteration (#27)",
+          "parents": [
+            "474b88fe76e18dfcf397f11b3de6f069abac4a4c"
+          ],
+          "is_merge": false,
+          "patch_id": "d013bec5f0358ab899f7993e871a3093a7116025",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_search.py",
+            "tests/test_fts_lifecycle_registry.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "e64ad007b459871af42e312bc5dffd2da92ac900",
+          "subject": "test(fts): six-index regression matrix for maintenance/repair/read-only/degraded-runtime (#27)",
+          "parents": [
+            "f9ade6baff7f236b6b9401932c61bc0400375664"
+          ],
+          "is_merge": false,
+          "patch_id": "0a5b70525caec36a605aae57384aacac5b8e90c1",
+          "changed_files": [
+            "tests/test_fts_lifecycle_registry.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "bdd9d699f6dc13b32852a078c1ecf5664bcb837d",
+          "subject": "docs(fts): record six-index unified lifecycle implementation for #27",
+          "parents": [
+            "e64ad007b459871af42e312bc5dffd2da92ac900"
+          ],
+          "is_merge": false,
+          "patch_id": "02810363d2c8be19088f78ed7475b5d62f6e6924",
+          "changed_files": [
+            "docs/research/issue-27-unified-fts-lifecycle.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "0400c66f072d0f319331ea105cd8f7e059975388",
+          "subject": "refactor(fts): apply review round \u2014 drop dead lane keys, merge trigger-drop + CJK quarantine helpers, remove dead _FTS_TRIGGERS (#27)",
+          "parents": [
+            "bdd9d699f6dc13b32852a078c1ecf5664bcb837d"
+          ],
+          "is_merge": false,
+          "patch_id": "7e550cd252dbc36097b938f127f97b9b731c3185",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_schema.py",
+            "hermes_state_search.py",
+            "tests/test_hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "75223d19544ceb73cf24fb859fc0780ed9a099a5",
+          "subject": "docs(fts): record review round 1 for #27",
+          "parents": [
+            "0400c66f072d0f319331ea105cd8f7e059975388"
+          ],
+          "is_merge": false,
+          "patch_id": "f9316ca0aa136778ac398a53a627d57e32fd4f4a",
+          "changed_files": [
+            "docs/research/issue-27-unified-fts-lifecycle.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "933a2ce86c8a8c7379cbbfb1f50686e9bf2febec",
+          "subject": "fix(fts): reuse #30 ownership classifier in offline/global paths + read-only CJK worker fix (#27)",
+          "parents": [
+            "75223d19544ceb73cf24fb859fc0780ed9a099a5"
+          ],
+          "is_merge": false,
+          "patch_id": "6ef28296f1a5c6fcf5fa7184766aed7bec89a165",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_fts_lifecycle_registry.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "dc1f153a71d025d903f255861da57f94d649ca37",
+          "subject": "docs(fts): record review round 2 for #27 unified FTS lifecycle",
+          "parents": [
+            "933a2ce86c8a8c7379cbbfb1f50686e9bf2febec"
+          ],
+          "is_merge": false,
+          "patch_id": "49b9b7ecabfb5e7fa7fee5a2ce8b127141b6155c",
+          "changed_files": [
+            "docs/research/issue-27-unified-fts-lifecycle.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "ed5ab2e8ecd03a98d70fbf3dca20d830c51d460a",
+          "subject": "fix(fts): read-only trigram discovery gates on full #30 namespace ownership (#27)",
+          "parents": [
+            "dc1f153a71d025d903f255861da57f94d649ca37"
+          ],
+          "is_merge": false,
+          "patch_id": "3990d58681775d1e2600ae6aa742605ec0959bdd",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_fts_lifecycle_registry.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "a822d37d18064d1442eb20b6a2cb4e9f8b17d48d",
+          "subject": "docs(fts): record review round 3 for #27 unified FTS lifecycle",
+          "parents": [
+            "ed5ab2e8ecd03a98d70fbf3dca20d830c51d460a"
+          ],
+          "is_merge": false,
+          "patch_id": "5a24d3849b9501c6a79c01ee1a114b0a71f1e8bd",
+          "changed_files": [
+            "docs/research/issue-27-unified-fts-lifecycle.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "3bc7d3f58f808e269675404c9bbeada467b00e98",
+          "subject": "refactor(fts): ponytail pass \u2014 drop redundant tests, shrink review history + comments (#27)",
+          "parents": [
+            "a822d37d18064d1442eb20b6a2cb4e9f8b17d48d"
+          ],
+          "is_merge": false,
+          "patch_id": "fa519cb6863f833f9d6e38617139dc13eb873437",
+          "changed_files": [
+            "docs/research/issue-27-unified-fts-lifecycle.md",
+            "hermes_state.py",
+            "tests/test_fts_lifecycle_registry.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "d6a4d70483623cc3fad4eea8c96754d7d637d02c",
+          "subject": "fix(fts): read-only trigram serving requires a complete trigger set (#27)",
+          "parents": [
+            "3bc7d3f58f808e269675404c9bbeada467b00e98"
+          ],
+          "is_merge": false,
+          "patch_id": "b517dd7e0ef43f48969fad2401b82585453001ea",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_fts_lifecycle_registry.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "27"
+          ]
+        },
+        {
+          "sha": "0cf4cd0baffb68b571a44f2a39d3bf817cd38348",
+          "subject": "docs(fts): record review round 4 for #27 unified FTS lifecycle",
+          "parents": [
+            "d6a4d70483623cc3fad4eea8c96754d7d637d02c"
+          ],
+          "is_merge": false,
+          "patch_id": "2141bb1e322a2a97fc4e6a3e8c49f3442f440876",
+          "changed_files": [
+            "docs/research/issue-27-unified-fts-lifecycle.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "9d140c8594c67ed37729b190fd3733508d0d770c",
+          "subject": "Merge pull request #76 from Skywind5487/feat/27-unified-fts-lifecycle",
+          "parents": [
+            "919f4469e832bc2b38bba0ea5af26b842bf91acd",
+            "0cf4cd0baffb68b571a44f2a39d3bf817cd38348"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "76"
+          ]
+        }
+      ],
+      "affected_files": [
+        "docs/research/issue-27-unified-fts-lifecycle.md",
+        "hermes_state.py",
+        "hermes_state_common.py",
+        "hermes_state_schema.py",
+        "hermes_state_search.py",
+        "tests/test_fts_lifecycle_registry.py",
+        "tests/test_hermes_state.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "27",
+          "76"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_fts_lifecycle_registry.py.",
+        "Frozen upstream has message FTS primitives but no equivalent session six-index lifecycle boundary."
+      ],
+      "behavioral_contracts": [
+        "The registry covers messages_fts, messages_fts_trigram, messages_fts_cjk, sessions_fts, sessions_fts_cjk, and sessions_fts_trigram.",
+        "Maintenance, health, read-only discovery, repair, and degraded runtime iterate the same descriptors.",
+        "Unknown or incomplete trigger state fails closed for serving."
+      ]
+    },
+    {
+      "id": "capability:memory-trim-observability",
+      "record_type": "provenance_bucket",
+      "subject": "feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold",
+      "commits": [
+        {
+          "sha": "04f1af72be078cef69de538f1519f93a73088b0d",
+          "subject": "feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold",
+          "parents": [
+            "2ac803bd949f0aba96c0d4d500edd2ad65aa3036"
+          ],
+          "is_merge": false,
+          "patch_id": "b793dd29722b01e260b13a1b2e3be1c2708c1071",
+          "changed_files": [
+            "hermes_cli/mem_trim.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb",
+          "subject": "fix(mem-trim): gate gc.collect() behind gc_cooldown_seconds, measure frag before trim",
+          "parents": [
+            "04f1af72be078cef69de538f1519f93a73088b0d"
+          ],
+          "is_merge": false,
+          "patch_id": "6c4c0e537ecff4d0df196c263683328d626be9cd",
+          "changed_files": [
+            "hermes_cli/mem_trim.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [],
+      "affected_files": [
+        "hermes_cli/mem_trim.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "low",
+      "evidence": [
+        "Survives in hermes_cli/mem_trim.py and related diagnostics.",
+        "Not yet compared at behavioral-contract level against frozen upstream."
+      ],
+      "behavioral_contracts": [
+        "Telemetry distinguishes measurement from the trim action and cooldown prevents repeated gc.collect calls."
+      ]
+    },
+    {
+      "id": "capability:headroom-retrieval",
+      "record_type": "provenance_bucket",
+      "subject": "feat(headroom): add retrieval (CCR) support to Phase 1 compression plugin",
+      "commits": [
+        {
+          "sha": "0a4b567ff08776a3a10ee7a32d37332d873f20b2",
+          "subject": "feat(headroom): add retrieval (CCR) support to Phase 1 compression plugin",
+          "parents": [
+            "88d1d6206f399c134d1f4c0b7db27733aaa3c50c"
+          ],
+          "is_merge": false,
+          "patch_id": "07479905dc72c5af558b5f005436aae7a06883f7",
+          "changed_files": [
+            "plugins/headroom/__init__.py",
+            "tests/plugins/test_headroom_plugin.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "d3f44c9d63b7b3444e2cf4c71fcbde86020e6ea6",
+          "subject": "fix(headroom): add missing toolset param to register_tool call",
+          "parents": [
+            "0a4b567ff08776a3a10ee7a32d37332d873f20b2"
+          ],
+          "is_merge": false,
+          "patch_id": "0ca8a64059c02cff35fe7cf0ebdf21fae3357f35",
+          "changed_files": [
+            "plugins/headroom/__init__.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "ff4df5b71e1557660dbe994eb5569983f57c9901",
+          "subject": "fix(headroom): add missing toolset param to register_tool call",
+          "parents": [
+            "0a4b567ff08776a3a10ee7a32d37332d873f20b2"
+          ],
+          "is_merge": false,
+          "patch_id": "0ca8a64059c02cff35fe7cf0ebdf21fae3357f35",
+          "changed_files": [
+            "plugins/headroom/__init__.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "b527e4df996b859356c0c48c2b9c9eae4c74c4dc",
+          "subject": "fix(headroom): auto-enable headroom_retrieve tool when compression is active",
+          "parents": [
+            "ff4df5b71e1557660dbe994eb5569983f57c9901"
+          ],
+          "is_merge": false,
+          "patch_id": "dc4c2ce5d3bce995521b06c29054b914852ee826",
+          "changed_files": [
+            "hermes_cli/tools_config.py",
+            "plugins/headroom/plugin.yaml",
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "0b4e7601227a23bc653d0d3018a3a9591d02f2a1",
+          "subject": "fix: headroom_retrieve tool schema \u2014 add description and parameters wrapper",
+          "parents": [
+            "b527e4df996b859356c0c48c2b9c9eae4c74c4dc"
+          ],
+          "is_merge": false,
+          "patch_id": "a0f94a678e9036aeb39b681623ee5764600672d7",
+          "changed_files": [
+            "plugins/headroom/__init__.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "516d739f64a95a4f380b899fbb9a349d750fc2aa",
+          "subject": "Merge branch 'feat/headroom-retrieval-toolset-autoenable' into dev",
+          "parents": [
+            "c1a3e16c32896ea2d469536c657814049c29bec6",
+            "0b4e7601227a23bc653d0d3018a3a9591d02f2a1"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        }
+      ],
+      "affected_files": [
+        "hermes_cli/tools_config.py",
+        "plugins/headroom/__init__.py",
+        "plugins/headroom/plugin.yaml",
+        "pyproject.toml",
+        "tests/plugins/test_headroom_plugin.py",
+        "uv.lock"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in plugins/headroom, tools_config.py, plugin.yaml and plugin tests.",
+        "No equivalent retrieval tool is present in frozen upstream."
+      ],
+      "behavioral_contracts": [
+        "The retrieval tool has a stable schema.",
+        "It is auto-enabled only when compression is active and returns bounded context.",
+        "Registration failures are explicit and warning-visible."
+      ]
+    },
+    {
+      "id": "capability:session-fts-cjk",
+      "record_type": "provenance_bucket",
+      "subject": "fix: migrate FTS5 trigram tokenizer from trigram to simple for CJK search",
+      "commits": [
+        {
+          "sha": "15f5aa07a0a1e4ffcf12b5b90aeea6d187e37114",
+          "subject": "fix: migrate FTS5 trigram tokenizer from trigram to simple for CJK search",
+          "parents": [
+            "8a0a1a145e2290682e8d4e6f76ed6ec90b0b933f"
+          ],
+          "is_merge": false,
+          "patch_id": "90547021582ed1ce1d9c37bda280a80d647558e6",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "3053abf3b039a5b4c23637597cb076f2339250fb",
+          "subject": "fix: let all CJK queries use simple tokenizer; cache lineage resolves",
+          "parents": [
+            "3de538d32a3c076929c1d7c173dd77e4055100f9"
+          ],
+          "is_merge": false,
+          "patch_id": "5446586b216cfe21c08c62a3b49d1d951af35ea4",
+          "changed_files": [
+            "hermes_state.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "6311e77e27f4fd4009c73d0df16abebf56121f4a",
+          "subject": "docs(research): map CJK session metadata FTS lifecycle for #33",
+          "parents": [
+            "e94f2630a50d7585f78cfc06365753c033113cb9"
+          ],
+          "is_merge": false,
+          "patch_id": "f3deefc9bde4c1facfe27477a6ef48f5885e3925",
+          "changed_files": [
+            "docs/research/issue-33-cjk-session-metadata-fts-lifecycle.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "3e23375f7934e4315d45860e6992171fb5609c5c",
+          "subject": "test(session-fts): RED contract for CJK session metadata lifecycle (#26)",
+          "parents": [
+            "6311e77e27f4fd4009c73d0df16abebf56121f4a"
+          ],
+          "is_merge": false,
+          "patch_id": "15678e6d9746a859d981383597c72d3038eadf46",
+          "changed_files": [
+            "tests/test_session_metadata_cjk_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "26"
+          ]
+        },
+        {
+          "sha": "7b4d37c2727ce8b1a12d9ccb22e8a936ca87fab7",
+          "subject": "feat(session-fts): external-content CJK metadata DDL + capability/quarantine (#26)",
+          "parents": [
+            "3e23375f7934e4315d45860e6992171fb5609c5c"
+          ],
+          "is_merge": false,
+          "patch_id": "a97596e01ae3dcfbfacf20ae77704385338130b1",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_schema.py",
+            "hermes_state_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "26"
+          ]
+        },
+        {
+          "sha": "8ec0ec3bf85a7414bb4244027b7f018e7eebf1e5",
+          "subject": "feat(session-fts): plug CJK session rebuild into the generic engine (#26)",
+          "parents": [
+            "7b4d37c2727ce8b1a12d9ccb22e8a936ca87fab7"
+          ],
+          "is_merge": false,
+          "patch_id": "267b89f092edf92cac9805b7d81d32c8aa0fbc81",
+          "changed_files": [
+            "hermes_state_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "26"
+          ]
+        },
+        {
+          "sha": "47c537c766bb72d7dfbd6a3fe0cbc2bd9985c128",
+          "subject": "feat(session-fts): CJK metadata candidate seam + all-3-field search (#26)",
+          "parents": [
+            "8ec0ec3bf85a7414bb4244027b7f018e7eebf1e5"
+          ],
+          "is_merge": false,
+          "patch_id": "17de1b8d50273afbc3e1c4b59af7c5aabc8d25fe",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_session_metadata_cjk_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "26"
+          ]
+        },
+        {
+          "sha": "83431f775a9e3798611e03b16a2f7d9a7ac74a57",
+          "subject": "docs(design): document the #26 CJK session metadata FTS variant",
+          "parents": [
+            "4270ea5b9a903d0dcf692db2365875ac5b3fe319"
+          ],
+          "is_merge": false,
+          "patch_id": "4931fa1241c6fda8361f416be00c5cfb6f4c0568",
+          "changed_files": [
+            "docs/design/session-metadata-fts.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "8efead2600a3f932f9881b53cd0c7eabc755f82f",
+          "subject": "fix(session-fts): address #26 code-review findings",
+          "parents": [
+            "83431f775a9e3798611e03b16a2f7d9a7ac74a57"
+          ],
+          "is_merge": false,
+          "patch_id": "b10a9c6b1a918355e6b6227802b594659fc393f7",
+          "changed_files": [
+            "docs/design/session-metadata-fts.md",
+            "hermes_cli/session_recovery.py",
+            "hermes_state.py",
+            "hermes_state_search.py",
+            "tests/hermes_cli/test_session_recovery.py",
+            "tests/test_session_metadata_cjk_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "6b3402ea05566fa1553a93aceb285eb517d7e67d",
+          "subject": "fix(session-fts): three lifecycle/capability seams for CJK session FTS (round-3 review)",
+          "parents": [
+            "a4ceb2521b8bb14e753e6f02242d0a29f6d57fb2"
+          ],
+          "is_merge": false,
+          "patch_id": "739564b9c7167f08cd333d370571a3cd6eee4b9a",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_session_metadata_cjk_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "0eee69ef43f16c63f29db414e1acb40253212125",
+          "subject": "fix(session-fts): run CJK guard+MATCH in one SQLite snapshot (PR #65 P1)",
+          "parents": [
+            "6b3402ea05566fa1553a93aceb285eb517d7e67d"
+          ],
+          "is_merge": false,
+          "patch_id": "56e4c8cbae6fd638c7dd752e22c786b2b15ea542",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_session_metadata_cjk_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "65"
+          ]
+        },
+        {
+          "sha": "6447a52cd994bf30c2811814f21095d12aba83ae",
+          "subject": "fix(state): short-circuit CJK-unservable to direct LIKE + single compression edge",
+          "parents": [
+            "b97d00e7319e5147d569519b6a34ef63c6635551"
+          ],
+          "is_merge": false,
+          "patch_id": "79b6a387eaf7db3bd4f797dc1a0a0a94e83c49b3",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "tests/test_session_metadata_picker_routing.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "bdf2fc218264538c4f3238b58532488fe665ff9e",
+          "subject": "Merge pull request #65 from Skywind5487/fts/session-cjk-highwater",
+          "parents": [
+            "19e6e6223bb58a4a53c8c02c86a0127d34afaf5a",
+            "0eee69ef43f16c63f29db414e1acb40253212125"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "65"
+          ]
+        }
+      ],
+      "affected_files": [
+        "docs/design/session-metadata-fts.md",
+        "docs/research/issue-33-cjk-session-metadata-fts-lifecycle.md",
+        "hermes_cli/session_recovery.py",
+        "hermes_state.py",
+        "hermes_state_common.py",
+        "hermes_state_schema.py",
+        "hermes_state_search.py",
+        "tests/hermes_cli/test_session_recovery.py",
+        "tests/test_session_metadata_cjk_fts.py",
+        "tests/test_session_metadata_picker_routing.py",
+        "tools/session_search_tool.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "26",
+          "65"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_session_metadata_cjk_fts.py.",
+        "Frozen upstream has no session CJK metadata index or equivalent optional lifecycle."
+      ],
+      "behavioral_contracts": [
+        "CJK search covers title, id, and display_name through external-content FTS.",
+        "Unavailable tokenizer/index state degrades safely without hiding the base path.",
+        "Guard and MATCH run against one SQLite snapshot; rebuild is independent and resumable."
+      ]
+    },
+    {
+      "id": "capability:lifecycle-sqlite-telemetry",
+      "record_type": "provenance_bucket",
+      "subject": "feat: add lifecycle and SQLite observability telemetry",
+      "commits": [
+        {
+          "sha": "176646d2cd6c95fa49b9414f21ed9e781b0aaa84",
+          "subject": "feat: add lifecycle and SQLite observability telemetry",
+          "parents": [
+            "237176ed1d973910972984ba83d876d01c00f3db"
+          ],
+          "is_merge": false,
+          "patch_id": "124834046966eb0142fabdd8849eafdc9df72403",
+          "changed_files": [
+            "agent/conversation_compression.py",
+            "agent/conversation_loop.py",
+            "agent/diagnostic_config.py",
+            "agent/kernel_telemetry.py",
+            "agent/lifecycle_telemetry.py",
+            "agent/sqlite_native_telemetry.py",
+            "agent/tool_executor.py",
+            "agent/turn_context.py",
+            "docs/observability/session-db-api-handoff.md",
+            "gateway/run.py",
+            "gateway/stream_consumer.py",
+            "hermes_cli/config.py",
+            "hermes_state.py",
+            "plugins/memory/holographic/__init__.py",
+            "plugins/platforms/discord/adapter.py",
+            "scripts/hermes_kernel_trace.py",
+            "tests/agent/test_lifecycle_telemetry.py",
+            "tests/agent/test_tool_lifecycle_telemetry.py",
+            "tests/gateway/test_discord_delivery_lifecycle_telemetry.py",
+            "tests/gateway/test_stream_lifecycle_telemetry.py",
+            "tests/plugins/memory/test_holographic_prefetch_gate.py",
+            "tests/test_machine_health_collector.py",
+            "tests/test_optional_cjk_tokenizer_fallback.py",
+            "tests/test_session_db_lock_telemetry.py",
+            "tests/test_sqlite_kernel_telemetry.py",
+            "tests/test_sqlite_owner_telemetry.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [],
+      "affected_files": [
+        "agent/conversation_compression.py",
+        "agent/conversation_loop.py",
+        "agent/diagnostic_config.py",
+        "agent/kernel_telemetry.py",
+        "agent/lifecycle_telemetry.py",
+        "agent/sqlite_native_telemetry.py",
+        "agent/tool_executor.py",
+        "agent/turn_context.py",
+        "docs/observability/session-db-api-handoff.md",
+        "gateway/run.py",
+        "gateway/stream_consumer.py",
+        "hermes_cli/config.py",
+        "hermes_state.py",
+        "plugins/memory/holographic/__init__.py",
+        "plugins/platforms/discord/adapter.py",
+        "scripts/hermes_kernel_trace.py",
+        "tests/agent/test_lifecycle_telemetry.py",
+        "tests/agent/test_tool_lifecycle_telemetry.py",
+        "tests/gateway/test_discord_delivery_lifecycle_telemetry.py",
+        "tests/gateway/test_stream_lifecycle_telemetry.py",
+        "tests/plugins/memory/test_holographic_prefetch_gate.py",
+        "tests/test_machine_health_collector.py",
+        "tests/test_optional_cjk_tokenizer_fallback.py",
+        "tests/test_session_db_lock_telemetry.py",
+        "tests/test_sqlite_kernel_telemetry.py",
+        "tests/test_sqlite_owner_telemetry.py",
+        "tools/session_search_tool.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "medium",
+      "evidence": [
+        "Survives across lifecycle_telemetry.py, sqlite_native_telemetry.py, turn_context.py, gateway code and tests.",
+        "Frozen upstream comparison was not completed per telemetry surface; absence is not treated as proof."
+      ],
+      "behavioral_contracts": [
+        "Important boundaries emit structured telemetry rather than only ad-hoc logs.",
+        "SQLite lock/owner and stream/tool failures remain diagnosable."
+      ]
+    },
+    {
+      "id": "capability:request-transform-hook",
+      "record_type": "provenance_bucket",
+      "subject": "feat: add transform_api_request plugin hook for full-payload request transformation",
+      "commits": [
+        {
+          "sha": "296d9c6e2e5a6f852344ad8fa9b90f5687912be1",
+          "subject": "feat: add transform_api_request plugin hook for full-payload request transformation",
+          "parents": [
+            "eed6ba2734bc7aaabbd1e8cf08cd794badc72d71"
+          ],
+          "is_merge": false,
+          "patch_id": "ff3b268ee596e2ce358d5d1df44c76d54b5d88d7",
+          "changed_files": [
+            "agent/conversation_loop.py",
+            "hermes_cli/hooks.py",
+            "hermes_cli/plugins.py",
+            "tests/run_agent/test_run_agent.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [],
+      "affected_files": [
+        "agent/conversation_loop.py",
+        "hermes_cli/hooks.py",
+        "hermes_cli/plugins.py",
+        "tests/run_agent/test_run_agent.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in agent/conversation_loop.py, hermes_cli/hooks.py, hermes_cli/plugins.py and run-agent tests.",
+        "Frozen upstream has pre_llm_call but not a full-payload transform hook at dispatch."
+      ],
+      "behavioral_contracts": [
+        "transform_api_request receives and returns the complete payload at a documented boundary.",
+        "The hook is optional and preserves the request when absent.",
+        "Hook errors are explicit and do not dispatch partial data."
+      ]
+    },
+    {
+      "id": "capability:session-fts-trigram",
+      "record_type": "provenance_bucket",
+      "subject": "feat(title-fts5): add sessions_fts + sessions_fts_trigram FTS5 tables with CJK dispatch",
+      "commits": [
+        {
+          "sha": "37811327cdc65c85c4b0bd565b1cdb3a4590dd91",
+          "subject": "feat(title-fts5): add sessions_fts + sessions_fts_trigram FTS5 tables with CJK dispatch",
+          "parents": [
+            "a34da2c31ca60f9b5280558c514a3a1880035036"
+          ],
+          "is_merge": false,
+          "patch_id": "9c276d00c28333451c952522cd07793dc39f3a1f",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "19e6e6223bb58a4a53c8c02c86a0127d34afaf5a",
+          "subject": "docs(research): map normalized session trigram FTS",
+          "parents": [
+            "6311e77e27f4fd4009c73d0df16abebf56121f4a"
+          ],
+          "is_merge": false,
+          "patch_id": "b9c2c784c05bb406213054d376b6c98bd2feb8e2",
+          "changed_files": [
+            "docs/research/issue-34-normalized-session-metadata-trigram-fts.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "ad0c45f0924349f6f0453d4941c3d76ad5258cdc",
+          "subject": "test(fts): pin modern session trigram and legacy-simple states",
+          "parents": [
+            "e94f2630a50d7585f78cfc06365753c033113cb9"
+          ],
+          "is_merge": false,
+          "patch_id": "6899521fc12538eb9dc0129d2863bc3b87f8bb92",
+          "changed_files": [
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "48b04dae36d6577b06de0efc67ebe1eb1a479d4c",
+          "subject": "feat(fts): add normalized external-content session trigram index (#30)",
+          "parents": [
+            "ad0c45f0924349f6f0453d4941c3d76ad5258cdc"
+          ],
+          "is_merge": false,
+          "patch_id": "b8e035ae4b6b1c9e4e5cce7b1190a290b5a14cd5",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_schema.py",
+            "hermes_state_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "6f82bcbb3c5f714148a17da47577e862493a55d6",
+          "subject": "test(fts): cover normalized session trigram end to end (#30)",
+          "parents": [
+            "48b04dae36d6577b06de0efc67ebe1eb1a479d4c"
+          ],
+          "is_merge": false,
+          "patch_id": "cdc779c773f3856e71e403ba1787270dd2bd16ba",
+          "changed_files": [
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "0f29f1454ea2227229e4056d66ed09f749a06e46",
+          "subject": "docs(research): document normalized session trigram FTS implementation (#30)",
+          "parents": [
+            "6f82bcbb3c5f714148a17da47577e862493a55d6"
+          ],
+          "is_merge": false,
+          "patch_id": "cbaa4bf962d983e59eb764e6cd28798f689e19c1",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "dc2cd8cfaf9462316e0140a27a7f5edaf90f3fb3",
+          "subject": "fix(fts): clear unfulfillable trigram claim on tokenizer-less host + de-dup shared seams (#30)",
+          "parents": [
+            "0f29f1454ea2227229e4056d66ed09f749a06e46"
+          ],
+          "is_merge": false,
+          "patch_id": "0ffb111eb64fc8a9e80a3373f97e76ac3b796b76",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_search.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "252920f02442b68391fcafba35bef2c9567e9ab8",
+          "subject": "style(fts): consolidate session trigram ensure epilogue + spec-driven transition columns (#30)",
+          "parents": [
+            "dc2cd8cfaf9462316e0140a27a7f5edaf90f3fb3"
+          ],
+          "is_merge": false,
+          "patch_id": "1231df15565fbd033918e08b660707cbca26ea50",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "4483194b81495dab9b3c4c282c08adad89e0f2d9",
+          "subject": "fix(fts): classify session trigram schema by exact logical columns + VIEW projection (#30)",
+          "parents": [
+            "252920f02442b68391fcafba35bef2c9567e9ab8"
+          ],
+          "is_merge": false,
+          "patch_id": "be11555049e9ec52dd80b13d2acd5d918c4fe06b",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "bfa928d53da7c61814816c10f83fef75bfef7e43",
+          "subject": "fix(fts): require canonical source VIEW + FTS5 root for modern trigram identity (#30)",
+          "parents": [
+            "4483194b81495dab9b3c4c282c08adad89e0f2d9"
+          ],
+          "is_merge": false,
+          "patch_id": "d8134dfc7967102cd493d1858ec78ec46fae13ac",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "cc5261ce775c8db6a7099d411f16030d24e71f2f",
+          "subject": "fix(fts): classify legacy session trigram by DDL, never PRAGMA table_info (#30)",
+          "parents": [
+            "bfa928d53da7c61814816c10f83fef75bfef7e43"
+          ],
+          "is_merge": false,
+          "patch_id": "1866b109815970cec2afd7bfe33acc92393e6adf",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "e33b533e1d2421fb18941463b6fe51752a8ad345",
+          "subject": "fix(fts): classify modern session trigram by DDL, never PRAGMA table_info (#30)",
+          "parents": [
+            "cc5261ce775c8db6a7099d411f16030d24e71f2f"
+          ],
+          "is_merge": false,
+          "patch_id": "6a3e15bffb010d61a4cd01938a1857fdbde253d6",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "b5155410abbf04c1fc4bb433ae3f5e546f5bf426",
+          "subject": "fix(fts): gate trigram source VIEW ensure on source compatibility (#30)",
+          "parents": [
+            "e33b533e1d2421fb18941463b6fe51752a8ad345"
+          ],
+          "is_merge": false,
+          "patch_id": "436fcf2cc4247cafe5e93960272ed36328ac2755",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "9aad13bcad68a292f708fe30698405c2016b2626",
+          "subject": "fix(fts): classify same-name root VIEW as unknown, not absent (#30)",
+          "parents": [
+            "b5155410abbf04c1fc4bb433ae3f5e546f5bf426"
+          ],
+          "is_merge": false,
+          "patch_id": "23a52086a686f6df207c1790e01f0fe0ed29d666",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "3172c9f4611cc2b872f2083829577cc73152f9dc",
+          "subject": "fix(fts): exact shadow allowlist + classify same-name root index as unknown (#30)",
+          "parents": [
+            "9aad13bcad68a292f708fe30698405c2016b2626"
+          ],
+          "is_merge": false,
+          "patch_id": "1c240e6ff04b0e1ea6c47a63c818feca035cf6f8",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "6467a30563fb1da2bd5c1f42dc7cd1f574697d31",
+          "subject": "fix(fts): hardening pass \u2014 literal-safe identity, trigger/shadow ownership, demotion CAS, stale lifecycle, serving gates, empty-claim, query cap (#30)",
+          "parents": [
+            "3172c9f4611cc2b872f2083829577cc73152f9dc"
+          ],
+          "is_merge": false,
+          "patch_id": "a1e6155cc7099629cb10f15c9ac2f517ddb604fa",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_search.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "e1ef573d3feb4e89082e8ff5fe7c941dd3620a9c",
+          "subject": "fix(fts): harden session trigram transition namespaces (#30)",
+          "parents": [
+            "6467a30563fb1da2bd5c1f42dc7cd1f574697d31"
+          ],
+          "is_merge": false,
+          "patch_id": "a5bf42fb900263d57e79ad16677f7a04305dd1f3",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_search.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "72388ff87f0baf99910edefab2b2fc2e00b40284",
+          "subject": "fix(fts): preserve session trigram claims across capability handoff (#30)",
+          "parents": [
+            "e1ef573d3feb4e89082e8ff5fe7c941dd3620a9c"
+          ],
+          "is_merge": false,
+          "patch_id": "5cc7da92fc79657a17848c9d582f163fe8e1be12",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "0c02b83d4d8702267481a5f196606e19e3d303cc",
+          "subject": "fix(fts): gate session trigram mutations on durable ownership (#30)",
+          "parents": [
+            "72388ff87f0baf99910edefab2b2fc2e00b40284"
+          ],
+          "is_merge": false,
+          "patch_id": "424d76b37989b6d5d3a296b2ce1ad21ec0078a86",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_search.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "a9c1b2d11bab435cda80fcfc81fc223d210b4755",
+          "subject": "fix(fts): serve session trigram candidates from one snapshot (#30)",
+          "parents": [
+            "0c02b83d4d8702267481a5f196606e19e3d303cc"
+          ],
+          "is_merge": false,
+          "patch_id": "4247c3fcb1e33dc9ec06927b5427275499967715",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "2142e2fa1b491ce904e0dbbbd2cc446863d0fe48",
+          "subject": "test(fts): drop fork-only legacy simple convergence tests (#30)",
+          "parents": [
+            "a9c1b2d11bab435cda80fcfc81fc223d210b4755"
+          ],
+          "is_merge": false,
+          "patch_id": "523ef02eeb02a99000aec84b6410a97b9cb444a3",
+          "changed_files": [
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "c7163001f23feb31f94fec1ebb3c41badaebdb97",
+          "subject": "refactor(fts): drop fork-only legacy simple demotion lane (#30)",
+          "parents": [
+            "2142e2fa1b491ce904e0dbbbd2cc446863d0fe48"
+          ],
+          "is_merge": false,
+          "patch_id": "3bd484e442014f2fdf2a7184ebab188f6a9defb3",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "6f534c8760a30a318ae0d874b7a6323f5f0337df",
+          "subject": "docs(fts): record scope correction and legacy lane removal (#30)",
+          "parents": [
+            "c7163001f23feb31f94fec1ebb3c41badaebdb97"
+          ],
+          "is_merge": false,
+          "patch_id": "9cfd3d181f8e6bb79358c9dfd5035ca53184e986",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "10e3419d10e938c979c701246457cbd6f9c10ad4",
+          "subject": "test(fts): drop round-11 CAS and shadow-preflight tests (#30)",
+          "parents": [
+            "6f534c8760a30a318ae0d874b7a6323f5f0337df"
+          ],
+          "is_merge": false,
+          "patch_id": "7af1a6ec209a2ef1077276829e70eca10d18edd1",
+          "changed_files": [
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "69591fe659774a4e61a3f754211f5602e96a7381",
+          "subject": "fix(fts): quarantine healthy modern target on no-trigram runtime; drop unsupported hardening (#30)",
+          "parents": [
+            "10e3419d10e938c979c701246457cbd6f9c10ad4"
+          ],
+          "is_merge": false,
+          "patch_id": "cd5f71e16d3d57d527193b063c641f85a6e907c0",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_schema.py",
+            "hermes_state_search.py",
+            "tests/test_session_metadata_trigram_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "7b513c6bf2f698f612fceb0c64de84c8c5e0ddea",
+          "subject": "docs(fts): record round-12 re-review and subtractive hardening removal (#30)",
+          "parents": [
+            "69591fe659774a4e61a3f754211f5602e96a7381"
+          ],
+          "is_merge": false,
+          "patch_id": "8bbd416b4080e3c255c84a1e7498775b58e47e5e",
+          "changed_files": [
+            "docs/research/issue-30-normalized-session-metadata-trigram-fts.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "783d3fa59ae28010368368e3dafddc19750f9b55",
+          "subject": "test(recovery): pin session-trigram derived markers as generated meta (#79)",
+          "parents": [
+            "276d497764feb7d4a71f1424ed44b8958da63b16"
+          ],
+          "is_merge": false,
+          "patch_id": "3b6d866e33eb926b4f6be293edcc411ea6cd5077",
+          "changed_files": [
+            "tests/hermes_cli/test_session_recovery.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "79"
+          ]
+        },
+        {
+          "sha": "4aefa3abbbe4f9c3eba29988fa772e45d70000f9",
+          "subject": "fix(recovery): exclude session-trigram derived markers from recovered DB (#79)",
+          "parents": [
+            "783d3fa59ae28010368368e3dafddc19750f9b55"
+          ],
+          "is_merge": false,
+          "patch_id": "de138bf28952f63a6aef45822350031081923296",
+          "changed_files": [
+            "hermes_cli/session_recovery.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "79"
+          ]
+        },
+        {
+          "sha": "d4c9a165c5abe6cf8c0503005b18e55de58e28cc",
+          "subject": "docs(research): record session-trigram recovery marker fix (#79)",
+          "parents": [
+            "4aefa3abbbe4f9c3eba29988fa772e45d70000f9"
+          ],
+          "is_merge": false,
+          "patch_id": "411f66a119ca4c46d97a06d4085792041b171bda",
+          "changed_files": [
+            "docs/research/issue-79-session-recovery-trigram-markers.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "79"
+          ]
+        },
+        {
+          "sha": "f17ab58979753a9ee342d258595e8d076ef2f309",
+          "subject": "test(recovery): guard verifier detection of leftover session-trigram markers (#79)",
+          "parents": [
+            "d4c9a165c5abe6cf8c0503005b18e55de58e28cc"
+          ],
+          "is_merge": false,
+          "patch_id": "7a4972e80b9db112cd5af724eb72fb13a2db5dd2",
+          "changed_files": [
+            "tests/hermes_cli/test_session_recovery.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "79"
+          ]
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "f18b3c90c2309ee7616010f99c1c927c9f05013f",
+          "subject": "Merge remote-tracking branch 'origin/dev' into fts/session-trigram-external-content",
+          "parents": [
+            "7b513c6bf2f698f612fceb0c64de84c8c5e0ddea",
+            "2f90c254d524d618b1c866a10bb519f2c1b6f5dc"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "919f4469e832bc2b38bba0ea5af26b842bf91acd",
+          "subject": "feat(fts): normalized external-content session trigram metadata index (#30)",
+          "parents": [
+            "2f90c254d524d618b1c866a10bb519f2c1b6f5dc",
+            "f18b3c90c2309ee7616010f99c1c927c9f05013f"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "30"
+          ]
+        },
+        {
+          "sha": "4e5ad5c2230300d1ffae84b089ffc70e368c8a23",
+          "subject": "fix(recovery): exclude session-trigram derived markers from recovered DB (#79)",
+          "parents": [
+            "276d497764feb7d4a71f1424ed44b8958da63b16",
+            "f17ab58979753a9ee342d258595e8d076ef2f309"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "79"
+          ]
+        }
+      ],
+      "affected_files": [
+        "docs/research/issue-30-normalized-session-metadata-trigram-fts.md",
+        "docs/research/issue-34-normalized-session-metadata-trigram-fts.md",
+        "docs/research/issue-79-session-recovery-trigram-markers.md",
+        "hermes_cli/session_recovery.py",
+        "hermes_state.py",
+        "hermes_state_common.py",
+        "hermes_state_schema.py",
+        "hermes_state_search.py",
+        "tests/hermes_cli/test_session_recovery.py",
+        "tests/test_session_metadata_trigram_fts.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "30",
+          "79"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_session_metadata_trigram_fts.py.",
+        "Frozen upstream has no sessions_fts_trigram external-content index; generic message trigram is not equivalent."
+      ],
+      "behavioral_contracts": [
+        "The external-content source normalizes title/display_name and keeps raw id searchable.",
+        "Serving requires complete trigger/namespace ownership; unknown same-name objects fail closed.",
+        "Recovery markers support resumable rebuild without treating a partial index as healthy."
+      ]
+    },
+    {
+      "id": "capability:session-search-lineage",
+      "record_type": "provenance_bucket",
+      "subject": "perf: reduce SELECT * in get_compression_lineage to 4 columns",
+      "commits": [
+        {
+          "sha": "3de538d32a3c076929c1d7c173dd77e4055100f9",
+          "subject": "perf: reduce SELECT * in get_compression_lineage to 4 columns",
+          "parents": [
+            "433a49f66b447f41fdd488dc4858a07c7cd7154d"
+          ],
+          "is_merge": false,
+          "patch_id": "c93153ba8a766a189a6fd3c9ae44c17ef1b9c5cd",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "6fa6c557257175f26c1689799d352fdf948cb787",
+          "subject": "fix: replace SELECT * with specific columns in get_anchored_view and get_messages_around",
+          "parents": [
+            "cc2531fbc6df8fdb34fca0b096b798eb53f970dd"
+          ],
+          "is_merge": false,
+          "patch_id": "8412299a818e0b42f7d6911c180cad3da0710f8c",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/hermes_state/test_get_messages_around.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "2732c47e28fbf7aaea97bd8c5cf82045a4c34159",
+          "subject": "wip(session-search): move winner selection into SQL",
+          "parents": [
+            "176646d2cd6c95fa49b9414f21ed9e781b0aaa84"
+          ],
+          "is_merge": false,
+          "patch_id": "ad8d732bb386962695417cd36f99490d9497a1c4",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_session_search_sql_winners.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "2d2bad204ec644455ad1273f2934f388eb4111dd",
+          "subject": "fix(session-search): defer winner snippets",
+          "parents": [
+            "2732c47e28fbf7aaea97bd8c5cf82045a4c34159"
+          ],
+          "is_merge": false,
+          "patch_id": "def0769bc836f46501f776b616908b3bfb592aae",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "9a1f477df5c8f25fd7ba4f57318e9f5ffcb2fc32",
+          "subject": "fix(session-search): ranked Top-N pre-limit for relevance sort",
+          "parents": [
+            "2d2bad204ec644455ad1273f2934f388eb4111dd"
+          ],
+          "is_merge": false,
+          "patch_id": "2e150449ebe907705459b4930b499d4dd7e49505",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "d72f99eb1b897dd29a46692a310aa15b1bfd77e8",
+          "subject": "docs(research): index session-lineage research",
+          "parents": [
+            "9b25b0c8bd7408eaf2398529b6a04ed1a068b892"
+          ],
+          "is_merge": false,
+          "patch_id": "e1a04706478dc2a890dba533afd92cc9c99fffa1",
+          "changed_files": [
+            "research/session-lineage/README.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "8838d16060bb7610c6d7ad3697f384df3edb70c1",
+          "subject": "test(search): RED contracts for #68 compression-lineage resolver",
+          "parents": [
+            "bdf2fc218264538c4f3238b58532488fe665ff9e"
+          ],
+          "is_merge": false,
+          "patch_id": "c3542d1ed1f8a153f905fefb9b6c4c1cc8f1c3e4",
+          "changed_files": [
+            "tests/test_session_search_sql_winners.py",
+            "tests/tools/test_session_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "46907bc8b55ba36ef73e0d96c10eccb9b28b0310",
+          "subject": "feat(search): compression-lineage resolver for #68 winner seam",
+          "parents": [
+            "8838d16060bb7610c6d7ad3697f384df3edb70c1"
+          ],
+          "is_merge": false,
+          "patch_id": "da306b1612a426d054dfbeec5be2893fe1f53978",
+          "changed_files": [
+            "hermes_state_search.py",
+            "tests/test_session_search_sql_winners.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "2f12b03079cb7ae28acf666d16cfd748e5eaac74",
+          "subject": "feat(session-search): tool parity + truncation contract for #68",
+          "parents": [
+            "46907bc8b55ba36ef73e0d96c10eccb9b28b0310"
+          ],
+          "is_merge": false,
+          "patch_id": "9cee1fa8910525a439c281470ec59cc172e0f33d",
+          "changed_files": [
+            "tests/tools/test_session_search.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "2e1b2e64d7a452f524f703a99d68b1b110b93d3e",
+          "subject": "test(search): drop stale generic-parent oracle import after #68 flip",
+          "parents": [
+            "2f12b03079cb7ae28acf666d16cfd748e5eaac74"
+          ],
+          "is_merge": false,
+          "patch_id": "506042112841967f593cc6cb1368e22cab1fde5e",
+          "changed_files": [
+            "tests/test_session_search_sql_winners.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "a13d012e5b8736928662f27269d9f2a7cf84f0af",
+          "subject": "docs(session-storage): document #68 compression-lineage resolution",
+          "parents": [
+            "2e1b2e64d7a452f524f703a99d68b1b110b93d3e"
+          ],
+          "is_merge": false,
+          "patch_id": "9f0b60b610bf34cd8cd86ca7724779d4810d27db",
+          "changed_files": [
+            "website/docs/developer-guide/session-storage.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "66eb2fad76abf150043ffd899fbdfbd328aba2d0",
+          "subject": "fix(search): title/current share in-snapshot roots + compacted anchor fallback (#68 review)",
+          "parents": [
+            "a13d012e5b8736928662f27269d9f2a7cf84f0af"
+          ],
+          "is_merge": false,
+          "patch_id": "932f7f87fefd133797c06f8fc051bfedc32fbfd9",
+          "changed_files": [
+            "hermes_state_search.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "f32b51764e43e48195d10e62d64b195a052d4968",
+          "subject": "test(search): #68 review acceptance \u2014 title parity, compacted anchor, real B boundaries, snapshot, 10k, internal-K",
+          "parents": [
+            "66eb2fad76abf150043ffd899fbdfbd328aba2d0"
+          ],
+          "is_merge": false,
+          "patch_id": "a750f9adc96a4ca3f1d2004f8353c443b9420c85",
+          "changed_files": [
+            "tests/test_session_search_sql_winners.py",
+            "tests/tools/test_session_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "42c421f68b6556757c17b4dc78756cf31babd239",
+          "subject": "fix(search): distinct-owner candidates + title-only K=1 snapshot contract (#68 review round-2)",
+          "parents": [
+            "f32b51764e43e48195d10e62d64b195a052d4968"
+          ],
+          "is_merge": false,
+          "patch_id": "a0684b71490f432735b53dd98c3edef3a7c41060",
+          "changed_files": [
+            "hermes_state_search.py",
+            "tests/test_session_search_sql_winners.py",
+            "tests/tools/test_session_search.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "c81ab321ec4bb3d5a33429b28907cd5836e41789",
+          "subject": "fix(search): displayable-anchor ranking + drop unproven title on B-hit (#68 review round-3)",
+          "parents": [
+            "42c421f68b6556757c17b4dc78756cf31babd239"
+          ],
+          "is_merge": false,
+          "patch_id": "3d8e178a16804038bb27736d649c1d0a0a92a814",
+          "changed_files": [
+            "hermes_state_search.py",
+            "tests/test_session_search_sql_winners.py",
+            "tests/tools/test_session_search.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "dcd10233d32eee72df93ec7ff5f8f9efcec4eef6",
+          "subject": "fix(search): don't gate exact-title on unrun content snapshot (#68 review round-4)",
+          "parents": [
+            "c81ab321ec4bb3d5a33429b28907cd5836e41789"
+          ],
+          "is_merge": false,
+          "patch_id": "88241624668272f5662c662be321ba1515214ee9",
+          "changed_files": [
+            "hermes_state_search.py",
+            "tests/tools/test_session_search.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "55dc24391f92d71d9e293c7990089075f2ff49c9",
+          "subject": "refactor(search): drop title/current lineage-proof protocol per #68 review round-5",
+          "parents": [
+            "dcd10233d32eee72df93ec7ff5f8f9efcec4eef6"
+          ],
+          "is_merge": false,
+          "patch_id": "a71f4989baf40f079979748453464dc6eb64647c",
+          "changed_files": [
+            "hermes_state_search.py",
+            "tests/test_session_search_sql_winners.py",
+            "tests/tools/test_session_search.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "b2710666a29eed6fc46f3b6ce23c72f4dc766181",
+          "subject": "test(search): rename title==current test, correct misleading scope claim (#68 review final)",
+          "parents": [
+            "55dc24391f92d71d9e293c7990089075f2ff49c9"
+          ],
+          "is_merge": false,
+          "patch_id": "f96724aea81c1b2c6d039696b95eec56335e6939",
+          "changed_files": [
+            "tests/tools/test_session_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "1f5edc591353a0a65ec7aa2f02c6916fd67fd505",
+          "subject": "perf(state): narrow session listing before lineage hydration",
+          "parents": [
+            "5882274ff6c868c24f9d36f3796de08e5de8a245"
+          ],
+          "is_merge": false,
+          "patch_id": "a147ecf6c85ea4f4e0483e02ae7baa638cf3e17f",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "a615feaea695123d1b3a832417a9a76554301af8",
+          "subject": "test(state): cover whole-store lineage visibility and pagination",
+          "parents": [
+            "1f5edc591353a0a65ec7aa2f02c6916fd67fd505"
+          ],
+          "is_merge": false,
+          "patch_id": "776704c477343cd0a3efda03d9fe61c5c73d46ee",
+          "changed_files": [
+            "tests/test_session_metadata_picker_routing.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "2f90c254d524d618b1c866a10bb519f2c1b6f5dc",
+          "subject": "Merge pull request #72 from Skywind5487/fix/68-compression-lineage-resolver",
+          "parents": [
+            "bdf2fc218264538c4f3238b58532488fe665ff9e",
+            "b2710666a29eed6fc46f3b6ce23c72f4dc766181"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "72"
+          ]
+        }
+      ],
+      "affected_files": [
+        "hermes_state.py",
+        "hermes_state_search.py",
+        "research/session-lineage/README.md",
+        "tests/hermes_state/test_get_messages_around.py",
+        "tests/test_session_metadata_picker_routing.py",
+        "tests/test_session_search_sql_winners.py",
+        "tests/tools/test_session_search.py",
+        "tools/session_search_tool.py",
+        "website/docs/developer-guide/session-storage.md"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "72"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "SPLIT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state_search.py and session-search tools/tests, including bounded winner hydration.",
+        "Frozen upstream has _lineage_root_id/basic lookup but not the stronger resolver, memo, B-boundary, or explicit truncation contract."
+      ],
+      "behavioral_contracts": [
+        "Only positive compression edges are followed; branch/delegate markers and tool children do not become roots.",
+        "Missing/cyclic lineage fails closed; query-local memo/path compression is bounded by B=2000 successful uncached row fetches.",
+        "B exhaustion returns truncated/warning without poisoned memo; one snapshot, early-K and deferred hydration are preserved."
+      ]
+    },
+    {
+      "id": "capability:outbound-code-fence-safety",
+      "record_type": "provenance_bucket",
+      "subject": "test: code fence tracking coverage for all send/split paths",
+      "commits": [
+        {
+          "sha": "44afcc8d3f869c7780beb1bc0bece86df1e45cb2",
+          "subject": "test: code fence tracking coverage for all send/split paths",
+          "parents": [
+            "426f321e84062e00fd5e6e9271aef48263cafffb"
+          ],
+          "is_merge": false,
+          "patch_id": "b895a539fdb73b927cacb2adbbb0a94a342a95b4",
+          "changed_files": [
+            "tests/gateway/test_code_fence_tracking.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "47cc1764dc2c2c65cc83fe20500da939698d72d3",
+          "subject": "fix: close orphaned code fences on all send paths",
+          "parents": [
+            "44afcc8d3f869c7780beb1bc0bece86df1e45cb2"
+          ],
+          "is_merge": false,
+          "patch_id": "430d612330245f9678d3de304083e690872ccf34",
+          "changed_files": [
+            "gateway/platforms/base.py",
+            "gateway/stream_consumer.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "347442ddc80a2658582cb62dd268a0be024b1bcf",
+          "subject": "fix: escape triple-backtick in reasoning before wrapping in outer code block",
+          "parents": [
+            "426f321e84062e00fd5e6e9271aef48263cafffb"
+          ],
+          "is_merge": false,
+          "patch_id": "53c0ea1134e01cc4feecbc1eb1c0a753beae0544",
+          "changed_files": [
+            "gateway/run.py",
+            "gateway/stream_consumer.py",
+            "tests/gateway/test_escape_reasoning_fences.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "efd68fe044001c57c5d148a66469209589c344d9",
+          "subject": "fix: ensure balanced code fences after Discord edit_message brute-force truncation",
+          "parents": [
+            "426f321e84062e00fd5e6e9271aef48263cafffb"
+          ],
+          "is_merge": false,
+          "patch_id": "e791c1b195b0e428fcb2f296a13a381aec9cb518",
+          "changed_files": [
+            "plugins/platforms/discord/adapter.py",
+            "tests/gateway/test_truncation_fence_edge_case.py",
+            "tests/plugins/platforms/discord/test_edit_message_fence.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "c1a3e16c32896ea2d469536c657814049c29bec6",
+          "subject": "fix: also close orphaned single-backtick inline-code spans",
+          "parents": [
+            "915913db360de5fe5b147d4895276ff39a6e8686"
+          ],
+          "is_merge": false,
+          "patch_id": "5591f76faf75f108e2596e380cde46f395c37087",
+          "changed_files": [
+            "gateway/stream_consumer.py",
+            "tests/gateway/test_code_fence_tracking.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "535b33c95f9465bb3e05b281b17fceee3ba24d22",
+          "subject": "Merge PR #2: escape reasoning fences (resolve conflict)",
+          "parents": [
+            "47cc1764dc2c2c65cc83fe20500da939698d72d3",
+            "347442ddc80a2658582cb62dd268a0be024b1bcf"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "2"
+          ]
+        },
+        {
+          "sha": "eed6ba2734bc7aaabbd1e8cf08cd794badc72d71",
+          "subject": "Merge branch 'fix/truncation-fence-edge-case' into dev",
+          "parents": [
+            "9fe97e2aa1b05306ed626e5ae3db540d24bb4678",
+            "efd68fe044001c57c5d148a66469209589c344d9"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        }
+      ],
+      "affected_files": [
+        "gateway/platforms/base.py",
+        "gateway/run.py",
+        "gateway/stream_consumer.py",
+        "plugins/platforms/discord/adapter.py",
+        "tests/gateway/test_code_fence_tracking.py",
+        "tests/gateway/test_escape_reasoning_fences.py",
+        "tests/gateway/test_truncation_fence_edge_case.py",
+        "tests/plugins/platforms/discord/test_edit_message_fence.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "2"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "evidence": [
+        "Survives in gateway/stream_consumer.py and Discord adapter/tests.",
+        "Frozen upstream already has escape_code_fences_for_display, ensure_closed_code_fences, and chunk balancing with equivalent behavior."
+      ],
+      "behavioral_contracts": [
+        "Untrusted backticks are escaped before outer wrapping.",
+        "Chunk balancing and truncation close open triple-backtick and inline-code spans.",
+        "Discord edit/truncation preserves the same user-visible balance guarantee."
+      ]
+    },
+    {
+      "id": "capability:session-fts-simple-eol",
+      "record_type": "provenance_bucket",
+      "subject": "fix: load simple FTS5 tokenizer and apply read-performance PRAGMAs",
+      "commits": [
+        {
+          "sha": "44dd4c5e586e60c22a322a9eb89d1aed63892e36",
+          "subject": "fix: load simple FTS5 tokenizer and apply read-performance PRAGMAs",
+          "parents": [
+            "b03c94dbed5ee72e97eace2376e02092cc854f6a"
+          ],
+          "is_merge": false,
+          "patch_id": "f0a0986406e7ad9f35acf9468e22096c12863e24",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "a4e2c52f1582952686ee56aaedd7285874326102",
+          "subject": "fix: address Copilot review \u2014 init hermes_home, load simple in ro path, v21 migration",
+          "parents": [
+            "dc2270aad84242da42f4342ac137e243ca181aa5"
+          ],
+          "is_merge": false,
+          "patch_id": "393d1d77f8315c21a5c34cbe151b1cb47b625e44",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "a1136e548ea1f2200429bf44f8f1a7297cc84246",
+          "subject": "fix: load simple FTS5 tokenizer and apply read-performance PRAGMAs",
+          "parents": [
+            "b03c94dbed5ee72e97eace2376e02092cc854f6a"
+          ],
+          "is_merge": false,
+          "patch_id": "f0a0986406e7ad9f35acf9468e22096c12863e24",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "c20cb64b4b79468c641626e9b9d3957790f7a671",
+          "subject": "fix: address Copilot review \u2014 init hermes_home, load simple in ro path, v21 migration",
+          "parents": [
+            "a1136e548ea1f2200429bf44f8f1a7297cc84246"
+          ],
+          "is_merge": false,
+          "patch_id": "393d1d77f8315c21a5c34cbe151b1cb47b625e44",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "f779b5320c6008e1c8b49bf7386fdfe76dea7a8a",
+          "subject": "fix(state): load simple tokenizer so legacy trigram tables stay writable",
+          "parents": [
+            "d53e209b3b620abce55f2cc57a80c69bc0cd9369"
+          ],
+          "is_merge": false,
+          "patch_id": "9feec0370bda997dee075b1c9477969a125e9e97",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "196b904417371cf233f3eb9b560c80a079ab8d72",
+          "subject": "docs(research): map simple-tokenizer EOL for #40",
+          "parents": [
+            "bee13fc085079d78d0334722ad4c37a1144e3102"
+          ],
+          "is_merge": false,
+          "patch_id": "a144398c69ababcec83ff82c28e880e3d74f8667",
+          "changed_files": [
+            "docs/research/issue-40-simple-tokenizer-eol.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "85fd91fd7c7be20d63356f27654d399ca1da4fa0",
+          "subject": "test(fts): pin simple-tokenizer EOL policy (#19)",
+          "parents": [
+            "196b904417371cf233f3eb9b560c80a079ab8d72"
+          ],
+          "is_merge": false,
+          "patch_id": "19ab3fe510b98e6c0fa30e79b79eda2b10a975b7",
+          "changed_files": [
+            "tests/test_simple_tokenizer_eol.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "19"
+          ]
+        },
+        {
+          "sha": "186986a447080ae74a1d17fd1e32aaf039cb2ff2",
+          "subject": "fix(fts): retire simple-tokenizer residue; drop global shim (#19)",
+          "parents": [
+            "85fd91fd7c7be20d63356f27654d399ca1da4fa0"
+          ],
+          "is_merge": false,
+          "patch_id": "37ec3e8508489924e6dcb38f55fc89de71963699",
+          "changed_files": [
+            "hermes_state.py",
+            "tests/test_optional_cjk_tokenizer_fallback.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "19"
+          ]
+        },
+        {
+          "sha": "deb10243ccebd6153cdfab8e9869faba2e105f0e",
+          "subject": "docs(fts): close simple compatibility contract (#19)",
+          "parents": [
+            "186986a447080ae74a1d17fd1e32aaf039cb2ff2"
+          ],
+          "is_merge": false,
+          "patch_id": "13b475b0deeaca573780c59048aa6d4df5189ca6",
+          "changed_files": [
+            "docs/research/issue-19-simple-tokenizer-eol-implementation.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "19"
+          ]
+        },
+        {
+          "sha": "1d5b80cab802e6ae932c97342e328e76faa496fa",
+          "subject": "fix(fts): harden simple EOL sanitation per review (#19)",
+          "parents": [
+            "deb10243ccebd6153cdfab8e9869faba2e105f0e"
+          ],
+          "is_merge": false,
+          "patch_id": "4759f05b9edac98c6ff1e825406938cc1bbc5ed3",
+          "changed_files": [
+            "docs/research/issue-19-simple-tokenizer-eol-implementation.md",
+            "hermes_state.py",
+            "tests/test_simple_tokenizer_eol.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "19"
+          ]
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "dc2270aad84242da42f4342ac137e243ca181aa5",
+          "subject": "Merge branch 'fix/fts-simple-tokenizer-complete' into dev",
+          "parents": [
+            "15f5aa07a0a1e4ffcf12b5b90aeea6d187e37114",
+            "44dd4c5e586e60c22a322a9eb89d1aed63892e36"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "433a49f66b447f41fdd488dc4858a07c7cd7154d",
+          "subject": "Merge branch 'fix/fts-simple-tokenizer-complete' into dev",
+          "parents": [
+            "a4e2c52f1582952686ee56aaedd7285874326102",
+            "c20cb64b4b79468c641626e9b9d3957790f7a671"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "53da9e89f8f3d2b051bf4c719b9f09b355392c00",
+          "subject": "Merge pull request #87 from Skywind5487/feat/19-simple-tokenizer-eol",
+          "parents": [
+            "196b904417371cf233f3eb9b560c80a079ab8d72",
+            "1d5b80cab802e6ae932c97342e328e76faa496fa"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "87"
+          ]
+        }
+      ],
+      "affected_files": [
+        "docs/research/issue-19-simple-tokenizer-eol-implementation.md",
+        "docs/research/issue-40-simple-tokenizer-eol.md",
+        "hermes_state.py",
+        "tests/test_optional_cjk_tokenizer_fallback.py",
+        "tests/test_simple_tokenizer_eol.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "19",
+          "87"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py sanitizer/repair logic and the #19/#87 research and tests.",
+        "Frozen upstream has no load_simple_extension/simple-tokenizer compatibility shim; the legacy debt is already absent there."
+      ],
+      "behavioral_contracts": [
+        "Supported post-#12 databases do not require simple-tokenizer loading or repair branches.",
+        "Unsupported legacy residue is sanitized or rejected explicitly rather than silently kept writable.",
+        "Modern trigram/CJK lifecycle remains the canonical path."
+      ]
+    },
+    {
+      "id": "capability:configurable-reasoning-display",
+      "record_type": "provenance_bucket",
+      "subject": "feat: configurable reasoning max lines via display.reasoning_max_lines",
+      "commits": [
+        {
+          "sha": "895ba96014ecf934dbc140306ffe578a0a533ea3",
+          "subject": "feat: configurable reasoning max lines via display.reasoning_max_lines",
+          "parents": [
+            "426f321e84062e00fd5e6e9271aef48263cafffb"
+          ],
+          "is_merge": false,
+          "patch_id": "59ff3b007ae023acbd6f006ba3242d2996f7f004",
+          "changed_files": [
+            "cli.py",
+            "gateway/run.py",
+            "tests/gateway/test_reasoning_max_lines.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "9fe97e2aa1b05306ed626e5ae3db540d24bb4678",
+          "subject": "Merge PR #3: configurable reasoning max lines",
+          "parents": [
+            "535b33c95f9465bb3e05b281b17fceee3ba24d22",
+            "895ba96014ecf934dbc140306ffe578a0a533ea3"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "3"
+          ]
+        }
+      ],
+      "affected_files": [
+        "cli.py",
+        "gateway/run.py",
+        "tests/gateway/test_reasoning_max_lines.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "3"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in cli.py/config parsing and gateway display code.",
+        "Frozen upstream hardcodes the first 15 lines and has no reasoning_max_lines seam."
+      ],
+      "behavioral_contracts": [
+        "reasoning_max_lines controls display truncation.",
+        "Invalid or absent configuration falls back safely.",
+        "Fence escaping remains applied before wrapping."
+      ]
+    },
+    {
+      "id": "capability:headroom-compression",
+      "record_type": "provenance_bucket",
+      "subject": "Add opt-in headroom tool-output compression plugin",
+      "commits": [
+        {
+          "sha": "915913db360de5fe5b147d4895276ff39a6e8686",
+          "subject": "Add opt-in headroom tool-output compression plugin",
+          "parents": [
+            "296d9c6e2e5a6f852344ad8fa9b90f5687912be1"
+          ],
+          "is_merge": false,
+          "patch_id": "b68450d1d31e7788f570959684c620c497cd1ed8",
+          "changed_files": [
+            "hermes_cli/config.py",
+            "plugins/headroom/__init__.py",
+            "plugins/headroom/plugin.yaml",
+            "tests/plugins/test_headroom_plugin.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "5eb552458de9828f4496880fd878f58015a63389",
+          "subject": "feat(headroom): add ContentRouter + SmartCrusher integration behind config flag",
+          "parents": [
+            "cc2531fbc6df8fdb34fca0b096b798eb53f970dd"
+          ],
+          "is_merge": false,
+          "patch_id": "2c8da083a6ab3548f7ef00afffdaefe7faf17f0d",
+          "changed_files": [
+            "plugins/headroom/__init__.py",
+            "plugins/headroom/plugin.yaml",
+            "tests/plugins/test_headroom_plugin.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "c16ebe6b8649c570b688fd82d6b66f9a8416d59c",
+          "subject": "fix(headroom): logger.warning for ContentRouter/CacheAligner failures + warning E2E tests",
+          "parents": [
+            "5eb552458de9828f4496880fd878f58015a63389"
+          ],
+          "is_merge": false,
+          "patch_id": "8d2445a5faad27650a7666507fd9d6fd4b025419",
+          "changed_files": [
+            "plugins/headroom/__init__.py",
+            "tests/plugins/test_headroom_plugin.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "237176ed1d973910972984ba83d876d01c00f3db",
+          "subject": "fix(headroom): prevent metadata from expanding tool results",
+          "parents": [
+            "b7e62647bd657a429d967cfa77034632ee490f9a"
+          ],
+          "is_merge": false,
+          "patch_id": "01605c62358b5fa3574a4d392ad37783879af619",
+          "changed_files": [
+            "plugins/headroom/__init__.py",
+            "plugins/headroom/plugin.yaml",
+            "tests/plugins/test_headroom_plugin.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "b7e62647bd657a429d967cfa77034632ee490f9a",
+          "subject": "feat(headroom): merge ContentRouter + warning E2E tests into dev",
+          "parents": [
+            "6fa6c557257175f26c1689799d352fdf948cb787",
+            "c16ebe6b8649c570b688fd82d6b66f9a8416d59c"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        }
+      ],
+      "affected_files": [
+        "hermes_cli/config.py",
+        "plugins/headroom/__init__.py",
+        "plugins/headroom/plugin.yaml",
+        "tests/plugins/test_headroom_plugin.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in plugins/headroom, tools_config.py, plugin.yaml, pyproject.toml/uv.lock and plugin tests.",
+        "Frozen upstream has no headroom ContentRouter/SmartCrusher implementation."
+      ],
+      "behavioral_contracts": [
+        "Compression activates only at configured thresholds and does not expand tool-result metadata.",
+        "Failures degrade with warning/logging and preserve usable content.",
+        "Plugin registration and schema remain valid when active."
+      ]
+    },
+    {
+      "id": "non-capability:integration-merge",
+      "record_type": "provenance_bucket",
+      "subject": "Merge remote-tracking branch 'origin/main' into dev",
+      "commits": [],
+      "merge_events": [
+        {
+          "sha": "9d6accc0f3de1e99c8c4fde24a8f5e3fcf5ef140",
+          "subject": "Merge remote-tracking branch 'origin/main' into dev",
+          "parents": [
+            "516d739f64a95a4f380b899fbb9a349d750fc2aa",
+            "104232979d6ec24e82a42dfbf14ac98f3df3c827"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "1602d06f5045d173ee31161b92e387de69ab821c",
+          "subject": "merge(session-search): ranked Top-N + late-snippet into dev",
+          "parents": [
+            "237176ed1d973910972984ba83d876d01c00f3db",
+            "ca4d3041a5e0b6d2b792cdf3c9f2689c9a18683e"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "b66c149de0c8240e84ded1a2f983b8c42f7b984b",
+          "subject": "merge(main): absorb upstream main 91937a6dc into dev \u2014 keep session-search fix chain",
+          "parents": [
+            "1602d06f5045d173ee31161b92e387de69ab821c",
+            "91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "637ef2e193b6b2dada5d0b79173461fca03fbf20",
+          "subject": "Merge remote-tracking branch 'origin/dev' into fts/routed-session-metadata-candidates",
+          "parents": [
+            "7b66bbf8e2af4fc27959f58b5ca70cfaba0346d0",
+            "dcf8096413c7ee40fe0ab512ac86927fb2092df1"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        }
+      ],
+      "affected_files": [],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "evidence": [
+        "Integrated behavior is represented by capability records on either side.",
+        "Merge topology is provenance, not semantic upstream evidence."
+      ],
+      "behavioral_contracts": [
+        "A merge event is not silently omitted merely because it has no patch-id or changed-file payload."
+      ]
+    },
+    {
+      "id": "capability:browser-timeout-cleanup",
+      "record_type": "provenance_bucket",
+      "subject": "fix(browser): config-gated daemon kill on timeout",
+      "commits": [
+        {
+          "sha": "a2450695db0e99f3dd8362f129024cb74c700bb8",
+          "subject": "fix(browser): config-gated daemon kill on timeout",
+          "parents": [
+            "d3f44c9d63b7b3444e2cf4c71fcbde86020e6ea6"
+          ],
+          "is_merge": false,
+          "patch_id": "6adb5a7810ede0e0a7b0ab155cb017db044d0640",
+          "changed_files": [
+            "tools/browser_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "b42bc25e622c11230998cc57f7050ec2a2cdd090",
+          "subject": "fix(browser): add tests and crash-resilience for daemon-kill on timeout",
+          "parents": [
+            "9e3439835e9dbbad0d0076d539d769db1f84de0a"
+          ],
+          "is_merge": false,
+          "patch_id": "8ce16b114c337a7d1e177e5f422bcaed8aa9fd6a",
+          "changed_files": [
+            "tests/tools/test_browser_terminate_daemon_timeout.py",
+            "tests/tools/test_browser_timeout_cleanup.py",
+            "tools/browser_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "cfb2636a6a3ed02ff773f106beb71c88576f1284",
+          "subject": "fix(browser): move dict cleanup to finally block on timeout (P1 fix)",
+          "parents": [
+            "b42bc25e622c11230998cc57f7050ec2a2cdd090"
+          ],
+          "is_merge": false,
+          "patch_id": "50e4470b0565c38927129a73ef07bbba59294cb0",
+          "changed_files": [
+            ".github/actions/hermes-smoke-test/action.yml",
+            ".github/workflows/build-windows-installer.yml",
+            ".github/workflows/docker-publish.yml",
+            ".github/workflows/nix-lockfile-fix.yml",
+            ".github/workflows/nix.yml",
+            "agent/gemini_cloudcode_adapter.py",
+            "agent/google_code_assist.py",
+            "agent/google_oauth.py",
+            "apps/desktop/src/app/chat/composer/skin-slash-popover.tsx",
+            "apps/desktop/src/app/cron/cron-job-actions-menu.tsx",
+            "apps/desktop/src/app/overlays/overlay-search-input.tsx",
+            "apps/desktop/src/app/right-sidebar/terminal/index.tsx",
+            "apps/desktop/src/app/session/hooks/use-message-stream.ts",
+            "apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx",
+            "apps/desktop/src/app/session/hooks/use-prompt-actions.ts",
+            "apps/desktop/src/app/session/hooks/use-session-actions.ts",
+            "apps/desktop/src/components/assistant-ui/streaming.test.tsx",
+            "apps/desktop/src/components/assistant-ui/thread-virtualizer.tsx",
+            "apps/desktop/src/components/assistant-ui/thread.tsx",
+            "apps/desktop/src/components/assistant-ui/todo-tool.tsx",
+            "apps/desktop/src/components/assistant-ui/tool-approval-group.test.tsx",
+            "apps/desktop/src/components/assistant-ui/tool-approval.test.tsx",
+            "apps/desktop/src/components/assistant-ui/tool-approval.tsx",
+            "apps/desktop/src/components/assistant-ui/tool-fallback-model.test.ts",
+            "apps/desktop/src/components/assistant-ui/tool-fallback-model.ts",
+            "apps/desktop/src/components/assistant-ui/tool-fallback.tsx",
+            "apps/desktop/src/components/assistant-ui/user-message-text.tsx",
+            "apps/desktop/src/components/chat/generated-image-context.tsx",
+            "apps/desktop/src/components/desktop-onboarding-overlay.test.tsx",
+            "apps/desktop/src/components/desktop-onboarding-overlay.tsx",
+            "apps/desktop/src/components/ui/braille-spinner.tsx",
+            "apps/desktop/src/lib/gateway-ws-url.ts",
+            "gateway/platforms/dingtalk.py",
+            "gateway/platforms/email.py",
+            "gateway/platforms/feishu.py",
+            "gateway/platforms/feishu_comment.py",
+            "gateway/platforms/feishu_comment_rules.py",
+            "gateway/platforms/feishu_meeting_invite.py",
+            "gateway/platforms/homeassistant.py",
+            "gateway/platforms/matrix.py",
+            "gateway/platforms/slack.py",
+            "gateway/platforms/sms.py",
+            "gateway/platforms/telegram.py",
+            "gateway/platforms/telegram_network.py",
+            "gateway/platforms/wecom.py",
+            "gateway/platforms/wecom_callback.py",
+            "gateway/platforms/wecom_crypto.py",
+            "gateway/platforms/whatsapp.py",
+            "optional-skills/productivity/shop-app/SKILL.md",
+            "plans/gemini-oauth-provider.md",
+            "tests/tools/test_browser_timeout_cleanup.py",
+            "tools/browser_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "9e3439835e9dbbad0d0076d539d769db1f84de0a",
+          "subject": "Merge remote-tracking branch 'origin/main' into fix/browser-timeout-daemon-kill-toggle",
+          "parents": [
+            "a2450695db0e99f3dd8362f129024cb74c700bb8",
+            "104232979d6ec24e82a42dfbf14ac98f3df3c827"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "8a0a1a145e2290682e8d4e6f76ed6ec90b0b933f",
+          "subject": "Merge branch 'fix/browser-timeout-daemon-kill-toggle' into dev",
+          "parents": [
+            "9d6accc0f3de1e99c8c4fde24a8f5e3fcf5ef140",
+            "cfb2636a6a3ed02ff773f106beb71c88576f1284"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        }
+      ],
+      "affected_files": [
+        ".github/actions/hermes-smoke-test/action.yml",
+        ".github/workflows/build-windows-installer.yml",
+        ".github/workflows/docker-publish.yml",
+        ".github/workflows/nix-lockfile-fix.yml",
+        ".github/workflows/nix.yml",
+        "agent/gemini_cloudcode_adapter.py",
+        "agent/google_code_assist.py",
+        "agent/google_oauth.py",
+        "apps/desktop/src/app/chat/composer/skin-slash-popover.tsx",
+        "apps/desktop/src/app/cron/cron-job-actions-menu.tsx",
+        "apps/desktop/src/app/overlays/overlay-search-input.tsx",
+        "apps/desktop/src/app/right-sidebar/terminal/index.tsx",
+        "apps/desktop/src/app/session/hooks/use-message-stream.ts",
+        "apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx",
+        "apps/desktop/src/app/session/hooks/use-prompt-actions.ts",
+        "apps/desktop/src/app/session/hooks/use-session-actions.ts",
+        "apps/desktop/src/components/assistant-ui/streaming.test.tsx",
+        "apps/desktop/src/components/assistant-ui/thread-virtualizer.tsx",
+        "apps/desktop/src/components/assistant-ui/thread.tsx",
+        "apps/desktop/src/components/assistant-ui/todo-tool.tsx",
+        "apps/desktop/src/components/assistant-ui/tool-approval-group.test.tsx",
+        "apps/desktop/src/components/assistant-ui/tool-approval.test.tsx",
+        "apps/desktop/src/components/assistant-ui/tool-approval.tsx",
+        "apps/desktop/src/components/assistant-ui/tool-fallback-model.test.ts",
+        "apps/desktop/src/components/assistant-ui/tool-fallback-model.ts",
+        "apps/desktop/src/components/assistant-ui/tool-fallback.tsx",
+        "apps/desktop/src/components/assistant-ui/user-message-text.tsx",
+        "apps/desktop/src/components/chat/generated-image-context.tsx",
+        "apps/desktop/src/components/desktop-onboarding-overlay.test.tsx",
+        "apps/desktop/src/components/desktop-onboarding-overlay.tsx",
+        "apps/desktop/src/components/ui/braille-spinner.tsx",
+        "apps/desktop/src/lib/gateway-ws-url.ts",
+        "gateway/platforms/dingtalk.py",
+        "gateway/platforms/email.py",
+        "gateway/platforms/feishu.py",
+        "gateway/platforms/feishu_comment.py",
+        "gateway/platforms/feishu_comment_rules.py",
+        "gateway/platforms/feishu_meeting_invite.py",
+        "gateway/platforms/homeassistant.py",
+        "gateway/platforms/matrix.py",
+        "gateway/platforms/slack.py",
+        "gateway/platforms/sms.py",
+        "gateway/platforms/telegram.py",
+        "gateway/platforms/telegram_network.py",
+        "gateway/platforms/wecom.py",
+        "gateway/platforms/wecom_callback.py",
+        "gateway/platforms/wecom_crypto.py",
+        "gateway/platforms/whatsapp.py",
+        "optional-skills/productivity/shop-app/SKILL.md",
+        "plans/gemini-oauth-provider.md",
+        "tests/tools/test_browser_terminate_daemon_timeout.py",
+        "tests/tools/test_browser_timeout_cleanup.py",
+        "tools/browser_tool.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in tools/browser_tool.py and timeout cleanup/daemon tests.",
+        "Frozen upstream has timeout cleanup/orphan reaping but not terminate_daemon_on_timeout configuration behavior."
+      ],
+      "behavioral_contracts": [
+        "Timeout cleanup clears in-memory browser state in a finally-equivalent path.",
+        "Daemon termination is opt-in/config-gated.",
+        "Cleanup failures are contained and test-covered."
+      ]
+    },
+    {
+      "id": "non-capability:performance-validation",
+      "record_type": "provenance_bucket",
+      "subject": "perf(search): batch context queries \u2014 chunked session_id batches (20/sql)",
+      "commits": [
+        {
+          "sha": "b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70",
+          "subject": "perf(search): batch context queries \u2014 chunked session_id batches (20/sql)",
+          "parents": [
+            "ff4df5b71e1557660dbe994eb5569983f57c9901"
+          ],
+          "is_merge": false,
+          "patch_id": "640fc71b9783c17f14327fe3bee772129ef31c89",
+          "changed_files": [
+            "hermes_state.py",
+            "tools/session_search_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "7b66bbf8e2af4fc27959f58b5ca70cfaba0346d0",
+          "subject": "perf(search): benchmark cold-open + fallback-invariant self-check",
+          "parents": [
+            "3ebb2592c141b232ecd0717adf32279afa6bee3f"
+          ],
+          "is_merge": false,
+          "patch_id": "b6beb6e939deb9a52d5d34e24f046539743092ec",
+          "changed_files": [
+            "scripts/benchmarks/session_metadata_picker.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "a34da2c31ca60f9b5280558c514a3a1880035036",
+          "subject": "Merge branch 'fix/session-search-perf' of /home/skywind5487/hermes_worktrees/fix/session-search-perf into dev",
+          "parents": [
+            "3053abf3b039a5b4c23637597cb076f2339250fb",
+            "b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        }
+      ],
+      "affected_files": [
+        "hermes_state.py",
+        "scripts/benchmarks/session_metadata_picker.py",
+        "tools/session_search_tool.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "evidence": [
+        "Benchmark and query-shape changes remain visible in history.",
+        "No upstream equivalence is inferred from local measurements."
+      ],
+      "behavioral_contracts": [
+        "A benchmark supports a decision but does not prove equivalence or impose an unreviewed target."
+      ]
+    },
+    {
+      "id": "capability:session-fts-unicode",
+      "record_type": "provenance_bucket",
+      "subject": "fix: use _rowid_ (INT) instead of id (TEXT) for sessions_fts triggers and queries",
+      "commits": [
+        {
+          "sha": "c3f1abc5cc34f1a356740529c9f17dfc0f4157b0",
+          "subject": "fix: use _rowid_ (INT) instead of id (TEXT) for sessions_fts triggers and queries",
+          "parents": [
+            "37811327cdc65c85c4b0bd565b1cdb3a4590dd91"
+          ],
+          "is_merge": false,
+          "patch_id": "2e7ebdeacf2f068145cf24e23acc81ca0d1d0d85",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "2ac803bd949f0aba96c0d4d500edd2ad65aa3036",
+          "subject": "feat(session-search): port sessions FTS5 title index (unicode61 + cjk_unicode61) from dev",
+          "parents": [
+            "b66c149de0c8240e84ded1a2f983b8c42f7b984b"
+          ],
+          "is_merge": false,
+          "patch_id": "5c37e63fdd564f04c6c5275ee37ac7d7ce35dc7c",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_schema.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "9b25b0c8bd7408eaf2398529b6a04ed1a068b892",
+          "subject": "docs: research #32 session row_id unicode FTS",
+          "parents": [
+            "9f3056cb3a9642c39056af8409cc3198007e68a8"
+          ],
+          "is_merge": false,
+          "patch_id": "368ddfb0bf2cc28000410f3a099081f34cd453f5",
+          "changed_files": [
+            "docs/research/issue-32-stable-row-id-unicode-session-fts.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "e94f2630a50d7585f78cfc06365753c033113cb9",
+          "subject": "Session metadata FTS: stable row_id + resumable Unicode external-content index (#25) (#59)",
+          "parents": [
+            "311bf7d6d28b204f0aa977ddcd05d44141d2d4ba"
+          ],
+          "is_merge": false,
+          "patch_id": "96d200731949e4ff95efcefeeef9e80dc5f47fc0",
+          "changed_files": [
+            "docs/design/session-metadata-fts.md",
+            "hermes_cli/session_recovery.py",
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "hermes_state_schema.py",
+            "hermes_state_search.py",
+            "tests/test_session_metadata_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [
+            "25"
+          ],
+          "pr_refs": [
+            "59"
+          ]
+        },
+        {
+          "sha": "a4ceb2521b8bb14e753e6f02242d0a29f6d57fb2",
+          "subject": "style(session-fts): drop duplicate @staticmethod (round-2 review)",
+          "parents": [
+            "8efead2600a3f932f9881b53cd0c7eabc755f82f"
+          ],
+          "is_merge": false,
+          "patch_id": "2619728a0a90d3f0bf8f9ca26357b383e895e595",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [],
+      "affected_files": [
+        "docs/design/session-metadata-fts.md",
+        "docs/research/issue-32-stable-row-id-unicode-session-fts.md",
+        "hermes_cli/session_recovery.py",
+        "hermes_state.py",
+        "hermes_state_common.py",
+        "hermes_state_schema.py",
+        "hermes_state_search.py",
+        "tests/test_session_metadata_fts.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [
+          "25"
+        ],
+        "pr_refs": [
+          "59"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py, hermes_cli/session_recovery.py and tests/test_session_metadata_fts.py.",
+        "Frozen upstream has messages_fts but no equivalent sessions_fts metadata index."
+      ],
+      "behavioral_contracts": [
+        "Stable sessions.row_id is retained across hidden rows and gaps.",
+        "External-content FTS indexes title, id, and display_name with resumable high-water backfill.",
+        "Backfill and triggers preserve delete correctness and never expose hidden sessions."
+      ]
+    },
+    {
+      "id": "capability:session-search-routing",
+      "record_type": "provenance_bucket",
+      "subject": "fix(session-search): define ranked_candidates for LIKE route",
+      "commits": [
+        {
+          "sha": "ca4d3041a5e0b6d2b792cdf3c9f2689c9a18683e",
+          "subject": "fix(session-search): define ranked_candidates for LIKE route",
+          "parents": [
+            "9a1f477df5c8f25fd7ba4f57318e9f5ffcb2fc32"
+          ],
+          "is_merge": false,
+          "patch_id": "32a3bd65e89fbf0255bd6fea58c2bf13386d7853",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "0990803323497a36761c9627a20ceb57be56d5a3",
+          "subject": "test(state): pin session metadata route and fallback contract",
+          "parents": [
+            "196b904417371cf233f3eb9b560c80a079ab8d72"
+          ],
+          "is_merge": false,
+          "patch_id": "93d8f3d69bcc25ace9213068d009e2d5b442b721",
+          "changed_files": [
+            "tests/test_session_metadata_picker_routing.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "5882274ff6c868c24f9d36f3796de08e5de8a245",
+          "subject": "refactor(state): add snapshot-aware metadata candidate router",
+          "parents": [
+            "0990803323497a36761c9627a20ceb57be56d5a3"
+          ],
+          "is_merge": false,
+          "patch_id": "9cfd759f545ca7f542f068883f5017767e784705",
+          "changed_files": [
+            "hermes_state.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "3f4795a9fbc70c39cbfbe11ed93e66d36b91c01d",
+          "subject": "feat(api): route session metadata discovery through the common seam",
+          "parents": [
+            "a615feaea695123d1b3a832417a9a76554301af8"
+          ],
+          "is_merge": false,
+          "patch_id": "6a16e8da3c72078417110de5201378d7a1a01de0",
+          "changed_files": [
+            "hermes_cli/web_routers/profiles.py",
+            "hermes_cli/web_routers/sessions.py",
+            "tests/hermes_cli/test_web_server.py",
+            "tests/hermes_cli/test_web_server_session_search.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "b4efc640fab0517571bd05447cf2be2ace9cf3e1",
+          "subject": "feat(desktop): search the whole session store in the resume picker",
+          "parents": [
+            "3f4795a9fbc70c39cbfbe11ed93e66d36b91c01d"
+          ],
+          "is_merge": false,
+          "patch_id": "0b08ae048db2918949822a3781f615a65e504f8a",
+          "changed_files": [
+            "apps/desktop/src/components/session-picker.test.tsx",
+            "apps/desktop/src/components/session-picker.tsx",
+            "apps/desktop/src/hermes.test.ts",
+            "apps/desktop/src/hermes.ts",
+            "apps/desktop/src/i18n/en.ts",
+            "apps/desktop/src/i18n/types.ts",
+            "apps/desktop/src/i18n/zh.ts"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "b97d00e7319e5147d569519b6a34ef63c6635551",
+          "subject": "perf(search): benchmark routed session metadata candidates",
+          "parents": [
+            "b4efc640fab0517571bd05447cf2be2ace9cf3e1"
+          ],
+          "is_merge": false,
+          "patch_id": "19e1e455ef97845723d5c2418e0c398657189166",
+          "changed_files": [
+            "scripts/benchmarks/session_metadata_picker.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "3ebb2592c141b232ecd0717adf32279afa6bee3f",
+          "subject": "test(api): cross-profile resume search + desktop stale-response ordering",
+          "parents": [
+            "6447a52cd994bf30c2811814f21095d12aba83ae"
+          ],
+          "is_merge": false,
+          "patch_id": "ac5fe312a1856bb33dae36d22f8c12139ce58f01",
+          "changed_files": [
+            "apps/desktop/src/components/session-picker.test.tsx",
+            "tests/hermes_cli/test_web_server.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "35c8564c9c0af3d75bcbdf1d793e7207e5528f06",
+          "subject": "feat(session): route session-metadata picker candidates through FTS (#14)",
+          "parents": [
+            "dcf8096413c7ee40fe0ab512ac86927fb2092df1",
+            "637ef2e193b6b2dada5d0b79173461fca03fbf20"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "14"
+          ]
+        }
+      ],
+      "affected_files": [
+        "apps/desktop/src/components/session-picker.test.tsx",
+        "apps/desktop/src/components/session-picker.tsx",
+        "apps/desktop/src/hermes.test.ts",
+        "apps/desktop/src/hermes.ts",
+        "apps/desktop/src/i18n/en.ts",
+        "apps/desktop/src/i18n/types.ts",
+        "apps/desktop/src/i18n/zh.ts",
+        "hermes_cli/web_routers/profiles.py",
+        "hermes_cli/web_routers/sessions.py",
+        "hermes_state.py",
+        "scripts/benchmarks/session_metadata_picker.py",
+        "tests/hermes_cli/test_web_server.py",
+        "tests/hermes_cli/test_web_server_session_search.py",
+        "tests/test_session_metadata_picker_routing.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "14"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_search.py, web session/profile routers, desktop picker code and routing tests.",
+        "Frozen upstream has session ID/title primitives but no equivalent metadata-index router."
+      ],
+      "behavioral_contracts": [
+        "Unicode, CJK, and infix queries select their intended index; LIKE is bounded fallback.",
+        "FTS narrows IDs before lineage hydration; only empty successful FTS triggers fallback.",
+        "Visibility, archive/pin/source filters, lineage, branch markers, whole-store scope, and limits remain correct."
+      ]
+    },
+    {
+      "id": "non-capability:incidental-hardening",
+      "record_type": "provenance_bucket",
+      "subject": "fix: exponential backoff, slow-write log, and Discord API delivery log",
+      "commits": [
+        {
+          "sha": "cc2531fbc6df8fdb34fca0b096b798eb53f970dd",
+          "subject": "fix: exponential backoff, slow-write log, and Discord API delivery log",
+          "parents": [
+            "c3f1abc5cc34f1a356740529c9f17dfc0f4157b0"
+          ],
+          "is_merge": false,
+          "patch_id": "7db3fd75db58976898a37f9b5e0f1f86a17c7eff",
+          "changed_files": [
+            "hermes_state.py",
+            "plugins/platforms/discord/adapter.py",
+            "tests/tools/test_web_searxng_e2e.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "9f3056cb3a9642c39056af8409cc3198007e68a8",
+          "subject": "ignore agents",
+          "parents": [
+            "f779b5320c6008e1c8b49bf7386fdfe76dea7a8a"
+          ],
+          "is_merge": false,
+          "patch_id": "10bfbeb338458c810deaa1bad23c658c89312887",
+          "changed_files": [
+            ".gitignore"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "4270ea5b9a903d0dcf692db2365875ac5b3fe319",
+          "subject": "chore: ignore fts5_cjk Windows build artifact (.dll)",
+          "parents": [
+            "47c537c766bb72d7dfbd6a3fe0cbc2bd9985c128"
+          ],
+          "is_merge": false,
+          "patch_id": "cb5d25e94b43ca47ae67c178b3659682cb1ca145",
+          "changed_files": [
+            ".gitignore"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [],
+      "affected_files": [
+        ".gitignore",
+        "hermes_state.py",
+        "plugins/platforms/discord/adapter.py",
+        "tests/tools/test_web_searxng_e2e.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": []
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "medium",
+      "evidence": [
+        "Record-specific survival is visible in the frozen tree.",
+        "No equivalence claim is made without focused comparison."
+      ],
+      "behavioral_contracts": [
+        "The safety invariant remains visible in record subject/files while capability ownership is unresolved."
+      ]
+    },
+    {
+      "id": "non-capability:production-evidence",
+      "record_type": "provenance_bucket",
+      "subject": "docs(recovery): attest production gateway runtime surface",
+      "commits": [
+        {
+          "sha": "cea5282a181d23af471f4467f449fd9bfc022ca5",
+          "subject": "docs(recovery): attest production gateway runtime surface",
+          "parents": [
+            "d72f99eb1b897dd29a46692a310aa15b1bfd77e8"
+          ],
+          "is_merge": false,
+          "patch_id": "7220d2c770e0afce5b241c590b084d2080c668ee",
+          "changed_files": [
+            "research/recovery/issue-41-production-gateway-runtime-attestation.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "311bf7d6d28b204f0aa977ddcd05d44141d2d4ba",
+          "subject": "docs(recovery): add production runtime repair runbook",
+          "parents": [
+            "cea5282a181d23af471f4467f449fd9bfc022ca5"
+          ],
+          "is_merge": false,
+          "patch_id": "76b7fa3ba383db6dc4cc01a0d84dbb8ee9cb3d9f",
+          "changed_files": [
+            "research/recovery/issue-21-production-runtime-runbook.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "0460c1944c8c7c40c6d9d7b7ebdb9e036aa49d57",
+          "subject": "docs(research): record #22 production-ready state.db build and freeze",
+          "parents": [
+            "4e5ad5c2230300d1ffae84b089ffc70e368c8a23"
+          ],
+          "is_merge": false,
+          "patch_id": "3445dddcd1a9f3590543c01fe8be46376d09bdc0",
+          "changed_files": [
+            "docs/research/issue-22-production-ready-state-db-execution.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "8b085795df0359adbf3c81315f888bc7041fb044",
+          "subject": "docs(research): record #22 redo with SQLite 3.51.3 + CJK + fuzz",
+          "parents": [
+            "0460c1944c8c7c40c6d9d7b7ebdb9e036aa49d57"
+          ],
+          "is_merge": false,
+          "patch_id": "48ed043d3ba486e84c373a04e82cf337a744f4b6",
+          "changed_files": [
+            "docs/research/issue-22-production-ready-state-db-execution.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "4292711d0a7cdcef9ef20399b1da6d4b1c87d9ba",
+          "subject": "docs(research): correct #22 path/router evidence with executing-query validation",
+          "parents": [
+            "8b085795df0359adbf3c81315f888bc7041fb044"
+          ],
+          "is_merge": false,
+          "patch_id": "599bf839a067e86fa019becd0d2281c855e70bcd",
+          "changed_files": [
+            "docs/research/issue-22-production-ready-state-db-execution.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": []
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "bee13fc085079d78d0334722ad4c37a1144e3102",
+          "subject": "Merge pull request #82 from Skywind5487/feat/22-production-ready-state-db-execution",
+          "parents": [
+            "4e5ad5c2230300d1ffae84b089ffc70e368c8a23",
+            "4292711d0a7cdcef9ef20399b1da6d4b1c87d9ba"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "82"
+          ]
+        }
+      ],
+      "affected_files": [
+        "docs/research/issue-22-production-ready-state-db-execution.md",
+        "research/recovery/issue-21-production-runtime-runbook.md",
+        "research/recovery/issue-41-production-gateway-runtime-attestation.md"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "82"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "evidence": [
+        "Survives as docs/research and research/recovery artifacts.",
+        "No code-level equivalence is claimed from operational documents."
+      ],
+      "behavioral_contracts": [
+        "Operational records remain durable evidence and are not mistaken for code-level equivalence."
+      ]
+    },
+    {
+      "id": "capability:session-title-safety",
+      "record_type": "provenance_bucket",
+      "subject": "test(session): pin literal-safe numbered-title resolution (#15)",
+      "commits": [
+        {
+          "sha": "d18dadb5f3b517ec69f14428dc78e7af1a86a30e",
+          "subject": "test(session): pin literal-safe numbered-title resolution (#15)",
+          "parents": [
+            "196b904417371cf233f3eb9b560c80a079ab8d72"
+          ],
+          "is_merge": false,
+          "patch_id": "bd61d76f62622a833ac9338561d3e08e73b70e97",
+          "changed_files": [
+            "tests/test_hermes_state.py",
+            "tests/test_session_metadata_cjk_fts.py",
+            "tests/test_session_metadata_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "15"
+          ]
+        },
+        {
+          "sha": "faf96ef221ddfba2618abc8dae8368f7b82c1c2a",
+          "subject": "fix(session): literal-safe numbered-title escaping and #N suffix validation (#15)",
+          "parents": [
+            "d18dadb5f3b517ec69f14428dc78e7af1a86a30e"
+          ],
+          "is_merge": false,
+          "patch_id": "b5d0d7483995873297fe25582c921eff0f231152",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "15"
+          ]
+        },
+        {
+          "sha": "69bee0838ae15936ae4beb13cdf5d6907c19c707",
+          "subject": "docs: record #38 numbered-title research note and design contract (#15)",
+          "parents": [
+            "faf96ef221ddfba2618abc8dae8368f7b82c1c2a"
+          ],
+          "is_merge": false,
+          "patch_id": "2df8b0d2801a3c4d573c57a1fa703c32aa097c3d",
+          "changed_files": [
+            "docs/design/session-metadata-fts.md",
+            "docs/research/issue-38-numbered-title-literal-safety.md"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "15"
+          ]
+        },
+        {
+          "sha": "17b0d2c9135d38728109592860677c4abbaddf4f",
+          "subject": "fix(session): unify #N grammar to ASCII digits; tidy escape_like placement (#15)",
+          "parents": [
+            "69bee0838ae15936ae4beb13cdf5d6907c19c707"
+          ],
+          "is_merge": false,
+          "patch_id": "131b1db23e2621d2d293fa1816b61c6c2da0e0fe",
+          "changed_files": [
+            "hermes_state.py",
+            "hermes_state_common.py",
+            "tests/test_hermes_state.py",
+            "tests/test_session_metadata_fts.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "15"
+          ]
+        }
+      ],
+      "merge_events": [
+        {
+          "sha": "984eff15df1fb749f00aece7fc24c43e9afcb7e8",
+          "subject": "Merge remote-tracking branch 'origin/dev' into fix/15-numbered-title-literal-safety",
+          "parents": [
+            "17b0d2c9135d38728109592860677c4abbaddf4f",
+            "53da9e89f8f3d2b051bf4c719b9f09b355392c00"
+          ],
+          "changed_files": [],
+          "pr_refs": []
+        },
+        {
+          "sha": "dcf8096413c7ee40fe0ab512ac86927fb2092df1",
+          "subject": "fix(session): literal-safe numbered-title escaping and #N suffix validation (#15)",
+          "parents": [
+            "53da9e89f8f3d2b051bf4c719b9f09b355392c00",
+            "984eff15df1fb749f00aece7fc24c43e9afcb7e8"
+          ],
+          "changed_files": [],
+          "pr_refs": [
+            "15"
+          ]
+        }
+      ],
+      "affected_files": [
+        "docs/design/session-metadata-fts.md",
+        "docs/research/issue-38-numbered-title-literal-safety.md",
+        "hermes_state.py",
+        "hermes_state_common.py",
+        "tests/test_hermes_state.py",
+        "tests/test_session_metadata_cjk_fts.py",
+        "tests/test_session_metadata_fts.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "15"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "SPLIT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py and title/metadata tests.",
+        "Frozen upstream escapes LIKE but does not enforce the fork's strict numeric suffix filter."
+      ],
+      "behavioral_contracts": [
+        "Escape SQL LIKE literals independently from Python literals.",
+        "Only strict ASCII #N suffixes are variants; %, _, \\, #, CJK, and literal titles stay exact and safe.",
+        "The public resolution API and root/current exclusion semantics remain unchanged."
+      ]
+    },
+    {
+      "id": "capability:cron-nul-safety",
+      "record_type": "provenance_bucket",
+      "subject": "fix(cron): harden lifecycle guard + terminal fallback against NUL-bearing paths (#76762)",
+      "commits": [
+        {
+          "sha": "d53e209b3b620abce55f2cc57a80c69bc0cd9369",
+          "subject": "fix(cron): harden lifecycle guard + terminal fallback against NUL-bearing paths (#76762)",
+          "parents": [
+            "a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb"
+          ],
+          "is_merge": false,
+          "patch_id": "9c58ec803f99f92c66b88ef1ef1dbfb6cb47aa0b",
+          "changed_files": [
+            "cron/lifecycle_guard.py",
+            "tools/terminal_tool.py"
+          ],
+          "graph_presence": {
+            "upstream_reachable": false,
+            "fork_exclusive": true
+          },
+          "issue_refs": [],
+          "pr_refs": [
+            "76762"
+          ]
+        }
+      ],
+      "merge_events": [],
+      "affected_files": [
+        "cron/lifecycle_guard.py",
+        "tools/terminal_tool.py"
+      ],
+      "work_item_provenance": {
+        "issue_refs": [],
+        "pr_refs": [
+          "76762"
+        ]
+      },
+      "patch_matches": [],
+      "exact_upstream_commits": [],
+      "upstream_status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "evidence": [
+        "Survives in cron/lifecycle_guard.py and tools/terminal_tool.py.",
+        "Frozen upstream contains the corresponding NUL/binary-safe guard and terminal fallback."
+      ],
+      "behavioral_contracts": [
+        "NUL-bearing input does not reach unsafe process/lifecycle calls.",
+        "Terminal fallback returns a clear failure rather than truncating at NUL."
+      ]
+    }
+  ],
+  "accounting": {
+    "discovery_coverage": {
+      "historical_commits": 171,
+      "emitted_commit_records": 171,
+      "complete": true
+    },
+    "capability_accounting": {
+      "explicitly_accounted_commits": 171,
+      "unaccounted_commits": [],
+      "complete": true
+    }
+  }
+}
