@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 
@@ -90,6 +91,29 @@ def test_relationship_references_and_hard_dependency_dag_are_valid():
     assert not hard_dependency_has_cycle(plan)
     assert plan["verification"]["unresolved_composition_blockers"] == []
     assert plan["verification"]["phase1_drift"] == []
+
+
+def test_composition_waves_reference_every_line_and_match_markdown():
+    plan = load(COMPOSITION / "feature-line-plan.json")
+    report = (COMPOSITION / "feature-line-plan.md").read_text(encoding="utf-8")
+    feature_line_ids = {line["id"] for line in plan["feature_lines"]}
+    wave_line_ids = []
+
+    for wave in plan["composition_waves"]:
+        ids = wave["line_ids"]
+        assert set(ids) <= feature_line_ids
+        assert len(ids) == len(set(ids))
+        wave_line_ids.extend(ids)
+
+        heading = f"### Wave {wave['wave']}"
+        assert heading in report
+        section = report.split(heading, 1)[1]
+        section = section.split("### ", 1)[0]
+        markdown_ids = re.findall(r"^- `([^`]+)`$", section, flags=re.MULTILINE)
+        assert markdown_ids == ids
+
+    assert len(wave_line_ids) == len(set(wave_line_ids))
+    assert set(wave_line_ids) == feature_line_ids
 
 
 def test_feature_lines_have_acceptance_and_report_matches_machine_plan():

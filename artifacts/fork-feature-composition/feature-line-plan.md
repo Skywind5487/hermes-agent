@@ -111,7 +111,7 @@ Extensions and coordinators follow the substrate or optional base lines they con
 - `line:session-metadata-search-cjk`
 - `line:session-metadata-search-trigram`
 - `line:session-metadata-search-routing`
-- `line:session-metadata-search-title-safety`
+- `line:session-title-safety`
 - `line:session-search-context-hydration`
 - `line:headroom-retrieval`
 - `line:memory-trim-diagnostics`
