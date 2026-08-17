@@ -1,0 +1,6 @@
+name: headroom
+version: "0.2.0"
+description: "Opt-in bounded compression for selected oversized tool results. Structured compression works without extra dependencies; optional headroom-ai ContentRouter and local retrieval store add content-aware compression and paginated redacted-original retrieval. Retrieval is fail-open and never required for compression."
+author: "NousResearch"
+hooks:
+  - transform_tool_result
