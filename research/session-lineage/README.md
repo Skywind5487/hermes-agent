@@ -1,77 +1,73 @@
 # Session-search lineage research
 
-This directory is the durable repo home for the research that supersedes the long-form discussion in issue #29.
+This directory is the durable repo home for session-lineage winner-resolution research.
 
-## Source of truth
+## Current source of truth
 
-- Active algorithm / benchmark decision ticket: #45
-- Code / exact-line / provenance research: #46
-- Upstream and analogous prior-art research: #47
-- Historical ADR / exploratory benchmark log: #29
-- Production candidate-search dependency: #14
+- **#54 — current umbrella/final gate.**
+- **`benchmark/FOCUSED_GATE.md` — current resolver decision surface and VM handoff.**
+- `benchmark/run.py --focused-gate` — current production-VM measurement entry point.
+- #60 — separate ChatGPT historical import/merge provenance archaeology; it does not block the focused resolver VM run unless it produces evidence that changes the historical workload interpretation.
 
-Issue #29 is historical evidence, not the active decision record.
+> Older `benchmark/README.md`, `benchmark/GATE.md`, TEMP-vs-Fixed duel material, and early #54 comments remain historical measurement evidence. Their "Pure TEMP vs Fixed3 only" finalist framing is superseded by `FOCUSED_GATE.md`.
 
-## Current research model
+No production winner or final global work budget `B` is selected yet.
 
-Every algorithm is described on three independent axes:
+## Current decision surface
 
-1. **Scheduling / 走法** — sequential, shared, rank-priority shared, or memory-preserving scheduler switch.
-2. **Reuse / 記憶** — none, result-only memory, or accumulated known coverage.
-3. **Representation / 容器** — recursive SQL set/queue, completed CTE results, Python dict, or another query-local representation.
+The focused gate compares:
 
-Cycle protection, missing-parent behavior, compression-edge semantics, and runaway-work bounds are cross-cutting safety requirements rather than separate algorithm families.
+1. **simple ranked sequential point traversal, no memo**;
+2. **the same scheduler with a tiny query-local Python `node -> root` memo/path compression**;
+3. **Pure TEMP** as the established memo/overlap reference;
+4. **Fixed3 shared CTE** as the established one-statement SQL reference.
 
-## Benchmark provenance
+The first two are the current KISS production candidates. TEMP and Fixed3 are references, not privileged finalists.
 
-The current `hermes_lineage_benchmark.py` is a reconstructed harness created on 2026-08-09 after the original exploratory source was not persisted. Its exact reconstructed source is preserved in four comments on #29 and in the saved benchmark bundle. It is useful for algorithm-shape evidence, but its existing correctness oracle and scenario matrix are not authoritative enough for the next decision.
+A lazy-candidate SQL state machine remains a separate SQL exploration direction and is intentionally not implemented in this gate.
 
-The next benchmark revision should live in this directory as normal versioned repo code, e.g.:
+## Workload classes
 
-- `benchmark.py` — algorithm runners + measurements;
-- `scenarios.md` or a data module — workload definitions and rationale;
-- correctness fixtures separated from performance workloads.
+Keep these separate rather than blending them into one average:
 
-Do not paste another large benchmark source into an issue once the repo version exists.
+### Hermes-normal
 
-## Benchmark-v2 workload model
+Observed current positive compression ancestry is shallow. The focused fixtures use depth 0/1 with `K=3` reached immediately, so candidate-level early stop is visible.
 
-Model the ranked **candidate-to-lineage distribution after search**. Topic similarity is not lineage identity.
+### Historical/import compatibility
 
-Canonical axes:
+The robust frozen-corpus extreme is depth 14 / lineage size 15. The focused fixture ranks all 15 members deepest-to-root before two independent roots, maximizing repeated ancestry before `K=3`.
 
-- lineage diversity: one / few / many / dominant + long tail;
-- rank placement: winners early / duplicate prefix / interleaved / clustered;
-- ancestry depth: boundary / shallow / deep;
-- candidate density within lineage: dense / sparse-gapped / one-per-lineage;
-- candidate count: small / medium / upper scan regime;
-- result K: at least 1 / 3 / 10, without assuming 3 is fixed.
+### Safety only
 
-Representative user-facing shapes:
+Synthetic 5k/10k chains exist only for cycle/missing/runaway-work and global-`B` safety. They are not normal performance weighting.
 
-- project-focused query: concentrated in one/few project lineages;
-- handoff/fresh-session continuation: same semantic project across independent roots;
-- common/daily lookup: many unrelated roots;
-- mixed/Zipf: one dominant lineage plus incidental roots.
+## Focused benchmark artifacts
 
-Correctness/adversarial fixtures must separately cover compression vs branch/delegation/tool boundaries, cycle, missing parent, current-lineage exclusions, legacy rotated histories vs in-place compaction, and work-budget safety.
+- `benchmark/FOCUSED_GATE.md` — current gate rationale and handoff.
+- `benchmark/python_memo.py` — hardened Python dict/path-compression candidate.
+- `benchmark/per_seed.py` — simple no-memo sequential candidate.
+- `benchmark/focused_scenarios.py` — shallow normal + depth14/size15 historical fixtures.
+- `benchmark/focused_vm_gate.py` — production-VM focused runner.
+- `benchmark/tests/test_focused_gate.py` — correctness/reuse/bound checks.
+- `benchmark/temp_memo.py` — TEMP reference.
+- `benchmark/fixed3_optimized.py` — Fixed3 SQL reference.
 
-## Explicit discussion-only directions
+## Evidence / historical research
 
-Do not promote these without new evidence:
+- #45 — algorithm/design-space convergence and local graveyard/final-duel discussion; superseded as current status by #54.
+- #46 / PR #49 — code / exact-line / production semantic discrepancy.
+- #47 / PR #48 — upstream and analogous prior art.
+- #50 / PR #53 — TEMP connection lifecycle, WAL read connection, snapshot transaction, and non-WAL fallback mechanics.
+- #51 / PR #52 — depth-fuse provenance and bounded-work safety intent.
+- #58 — Hermes-native compaction lifecycle vs imported ChatGPT-history provenance boundary.
+- #60 — ChatGPT DB/chat archaeology.
+- #29 — historical ADR / exploratory benchmark log.
 
-- TEMP-table memo;
-- single-row recursive state machine / encoded `covered` blob;
-- persistent root column except as a theoretical read-path lower bound;
-- full sessions-graph load into Python;
-- downward component flood relying on unique compression child;
-- candidate contraction followed by independent per-head traversal.
+## Important invariants
 
-## Immediate research questions
+The resolver operates after ranked **distinct owning-session candidates** already exist. Duplicate FTS message rows are not lineage work.
 
-- What minimum knowledge representation can be consumed by both sequential and shared schedulers?
-- Can a scheduler switch preserve already-discovered coverage instead of restarting?
-- Can candidate-local shared contraction add anything beyond shared traversal itself?
-- How far can SQLite queue priority + streaming limits go before seed-specific state prevents merging?
-- Is Python dict memo the simpler solution once SQL requires mutable coverage semantics?
-- What failure intent does the current depth fuse protect, and can a clearer work guard replace it?
+Cycle protection, missing-parent fail-closed behavior, positive compression-edge semantics, one logical read snapshot, and a global work budget are requirements independent of the chosen scheduler.
+
+Do not paste another large benchmark implementation into issues now that the repo package exists.

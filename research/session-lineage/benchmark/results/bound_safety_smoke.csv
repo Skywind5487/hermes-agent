@@ -1,0 +1,11 @@
+budget,algorithm,roots,work,bound_hit
+5,pure_temp,,5,True
+5,fixed3_shared,,5,True
+10,pure_temp,,10,True
+10,fixed3_shared,,10,True
+64,pure_temp,,64,True
+64,fixed3_shared,,64,True
+256,pure_temp,,256,True
+256,fixed3_shared,,256,True
+2000,pure_temp,s0000001,1001,False
+2000,fixed3_shared,s0000001,1001,False
