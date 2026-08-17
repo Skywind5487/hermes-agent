@@ -1,12 +1,14 @@
 # Phase-1.5 Feature-Line Composition Plan
 
-This report composes Phase-1 capability contracts into reconstruction units. Capability remains the preservation/accounting unit; feature line is the reconstruction/maintenance unit.
+This report composes Phase-1 capability contracts into component/work lines and maintainer-facing merge units. Capability remains the preservation/accounting unit; component lines preserve implementation decomposition; merge units are the reconstruction/maintenance boundaries.
 
 - Phase-1 manifest head: `f81cd921a89516d855b5b69906ce99e6351bc741`
 - Current fork reconstruction base: `fa5ed679cc6559c619038f327e6276f4b7e8d735`
 - Current upstream main: `56526bc0d36522ab7a87ee0056f70e3847d2f0e6`
 - Capabilities covered: **22**
 - Non-capability groups accounted: **4**
+- Component/work lines: **17**
+- Maintainer-facing merge units: **9**
 - Final hard-dependency blockers: **0**
 
 ## Composition decisions
@@ -18,8 +20,26 @@ This report composes Phase-1 capability contracts into reconstruction units. Cap
 - Memory diagnostics extends policy and must fail open.
 - Compression session-boundary and compression-lineage search share substrate only.
 - Lifecycle telemetry is an optional independent observability line, not a hidden dependency of every feature.
+- Feature families remain taxonomy/navigation; merge units are a separate maintainer-facing axis.
+- The 17 component lines are internal work packages and commit boundaries, not automatically independent long-lived PRs or branches.
 
-## Feature-line summary
+## Merge-unit summary
+
+| Merge unit | Kind | Component/work lines | Maintainer-facing completion claim |
+|---|---|---|---|
+| `repair:session-search` | repair | 7 | Hermes session search is reconstructed end to end. |
+| `repair:memory-runtime` | repair | 2 | Memory housekeeping and recovery are reconstructed. |
+| `repair:headroom-context` | repair | 2 | Headroom compression and retrieval are reconstructed. |
+| `repair:compression-lifecycle` | repair | 1 | Compression no-op/session-boundary semantics are repaired. |
+| `repair:sqlite-reliability` | repair | 1 | SQLite write contention behavior is repaired. |
+| `feature:runtime-observability` | feature | 1 | The optional runtime observability subsystem is complete. |
+| `repair:browser-runtime` | repair | 1 | Browser timeout cleanup is repaired. |
+| `feature:reasoning-display` | feature | 1 | Configurable reasoning display is complete. |
+| `feature:request-transform` | feature | 1 | The request transform extension point is complete. |
+
+The merge-unit projection is the later Phase-2 PR/branch boundary. Each unit retains its component-line list, acceptance, and internal dependency graph.
+
+## Component/work-line summary
 
 | Line | Family | Role | Owned capabilities |
 |---|---|---|---|
@@ -41,7 +61,7 @@ This report composes Phase-1 capability contracts into reconstruction units. Cap
 | `line:configurable-reasoning-display` | `display-and-request` | `vertical_feature` | `capability:configurable-reasoning-display` |
 | `line:request-transform-hook` | `display-and-request` | `vertical_feature` | `capability:request-transform-hook` |
 
-## Relationship graph
+## Component relationship graph
 
 | From | Type | To | Meaning |
 |---|---|---|---|
@@ -125,26 +145,18 @@ Extensions and coordinators follow the substrate or optional base lines they con
 | `non-capability:performance-validation` | `line:session-search-context-hydration`, `line:session-metadata-search-routing` | Benchmark evidence informs the two affected acceptance seams; the benchmark record itself is not a feature line. |
 | `non-capability:production-evidence` | none | Accounting/provenance evidence only; no feature line owns this group. |
 
-## /to-tickets projection
+## /to-tickets merge-unit projection
 
-No implementation tickets or Phase-2 branches are created by this issue. The following is the later projection:
+No implementation tickets or Phase-2 branches are created by this issue. The following is the later merge-unit PR projection; component lines become internal work packages/subtasks/commit boundaries:
 
-- `line:session-metadata-search-core` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:session-metadata-search-cjk` — proposed implementation ticket; requires none; wave 2; targeted research preflight: yes.
-- `line:session-metadata-search-trigram` — proposed implementation ticket; requires none; wave 2; targeted research preflight: yes.
-- `line:session-metadata-search-routing` — proposed implementation ticket; requires `line:session-metadata-search-core`, `line:session-search-lineage`; wave 2; targeted research preflight: yes.
-- `line:session-title-safety` — proposed implementation ticket; requires none; wave 2; targeted research preflight: yes.
-- `line:session-search-lineage` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:session-search-context-hydration` — proposed implementation ticket; requires none; wave 2; targeted research preflight: yes.
-- `line:headroom-compression` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:headroom-retrieval` — proposed implementation ticket; requires `line:headroom-compression`; wave 2; targeted research preflight: yes.
-- `line:memory-trim-policy` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:memory-trim-diagnostics` — proposed implementation ticket; requires none; wave 2; targeted research preflight: yes.
-- `line:compression-session-boundary` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:runtime-lifecycle-observability` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:sqlite-write-contention-policy` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:browser-timeout-cleanup` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:configurable-reasoning-display` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
-- `line:request-transform-hook` — proposed implementation ticket; requires none; wave 1; targeted research preflight: yes.
+- `repair:session-search` — proposed implementation PR; 7 internal component lines; wave 1; targeted research preflight: yes.
+- `repair:memory-runtime` — proposed implementation PR; 2 internal component lines; wave 1; targeted research preflight: yes.
+- `repair:headroom-context` — proposed implementation PR; 2 internal component lines; wave 1; targeted research preflight: yes.
+- `repair:compression-lifecycle` — proposed implementation PR; 1 internal component line; wave 1; targeted research preflight: yes.
+- `repair:sqlite-reliability` — proposed implementation PR; 1 internal component line; wave 1; targeted research preflight: yes.
+- `feature:runtime-observability` — proposed implementation PR; 1 internal component line; wave 1; targeted research preflight: yes.
+- `repair:browser-runtime` — proposed implementation PR; 1 internal component line; wave 1; targeted research preflight: yes.
+- `feature:reasoning-display` — proposed implementation PR; 1 internal component line; wave 1; targeted research preflight: yes.
+- `feature:request-transform` — proposed implementation PR; 1 internal component line; wave 1; targeted research preflight: yes.
 
 Upstream-owned capabilities receive no reconstruction ticket: `capability:cron-nul-safety`, `capability:outbound-code-fence-safety`, `capability:session-fts-simple-eol`.

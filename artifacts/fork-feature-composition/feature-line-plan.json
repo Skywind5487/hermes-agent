@@ -467,6 +467,147 @@
       "rationale": "Shared vicinity in request/display code is not a semantic dependency."
     }
   ],
+  "merge_units": [
+    {
+      "id": "repair:session-search",
+      "name": "Session Search reconstruction",
+      "kind": "repair",
+      "purpose": "Reconstruct the complete session-search subsystem as one maintainer-facing merge boundary.",
+      "component_line_ids": [
+        "line:session-metadata-search-core",
+        "line:session-metadata-search-cjk",
+        "line:session-metadata-search-trigram",
+        "line:session-metadata-search-routing",
+        "line:session-search-lineage",
+        "line:session-search-context-hydration",
+        "line:session-title-safety"
+      ],
+      "acceptance": [
+        "Metadata, content, lineage, optional index variants, hydration, and title-resolution behavior pass together through the public session-search contract.",
+        "Core/index correctness is independently attributable to its component line while bundle-level tests verify route selection, visibility, fallback, lineage, and bounded context end to end.",
+        "The bundle can be merged as one coherent session-search repair without requiring every optional component to become a separate long-lived branch."
+      ],
+      "landing_state": "Session Search is either accepted as a complete repair unit or remains explicitly incomplete; component lines are internal work packages and commit boundaries.",
+      "rationale": "These components answer one maintainer-facing completion claim: Hermes session search is fixed. The feature families remain taxonomy only; this unit intentionally crosses metadata-search, content-search, and safety families."
+    },
+    {
+      "id": "repair:memory-runtime",
+      "name": "Memory runtime reconstruction",
+      "kind": "repair",
+      "purpose": "Restore memory housekeeping policy and its diagnostics as one operational recovery repair.",
+      "component_line_ids": [
+        "line:memory-trim-policy",
+        "line:memory-trim-diagnostics"
+      ],
+      "acceptance": [
+        "Low-water and GC-cooldown policy is correct while malloc_trim remains eligible.",
+        "Timing, fragmentation, and VmSwap diagnostics are best effort and cannot block recovery."
+      ],
+      "landing_state": "Memory runtime is merged as one repair; diagnostics may degrade internally but policy behavior remains covered.",
+      "rationale": "Policy and diagnostics are separate implementation concerns but one maintainer-facing memory-recovery outcome."
+    },
+    {
+      "id": "repair:headroom-context",
+      "name": "Headroom context reconstruction",
+      "kind": "repair",
+      "purpose": "Restore the complete Headroom context feature, including compression and retrieval.",
+      "component_line_ids": [
+        "line:headroom-compression",
+        "line:headroom-retrieval"
+      ],
+      "acceptance": [
+        "Oversized allowlisted tool results compress with bounded, metadata-safe output.",
+        "Retrieval handles are produced and bounded retrieval succeeds when compression has stored context; unavailable retrieval degrades explicitly."
+      ],
+      "landing_state": "Headroom context is merged as one optional subsystem; compression remains useful if retrieval is unavailable.",
+      "rationale": "Compression and retrieval retain their internal dependency, but the maintainer-facing feature is the complete Headroom context subsystem."
+    },
+    {
+      "id": "repair:compression-lifecycle",
+      "name": "Compression lifecycle reconstruction",
+      "kind": "repair",
+      "purpose": "Repair compressor no-op and session-boundary transition semantics.",
+      "component_line_ids": [
+        "line:compression-session-boundary"
+      ],
+      "acceptance": [
+        "Compressor no-op status never causes false session rotation or rewrite, including equal newly allocated output."
+      ],
+      "landing_state": "Compression lifecycle boundary behavior is independently mergeable.",
+      "rationale": "This is already a complete, narrowly scoped lifecycle repair."
+    },
+    {
+      "id": "repair:sqlite-reliability",
+      "name": "SQLite reliability reconstruction",
+      "kind": "repair",
+      "purpose": "Repair rollback-safe SQLite write contention handling.",
+      "component_line_ids": [
+        "line:sqlite-write-contention-policy"
+      ],
+      "acceptance": [
+        "Lock contention retries roll back first, use bounded exponential backoff, and preserve explicit exhaustion/non-lock errors."
+      ],
+      "landing_state": "SQLite write reliability is independently mergeable.",
+      "rationale": "The policy has one clear runtime contract and one maintainer-facing completion claim."
+    },
+    {
+      "id": "feature:runtime-observability",
+      "name": "Runtime observability subsystem",
+      "kind": "feature",
+      "purpose": "Provide optional structured lifecycle, tool, stream, SQLite, and delivery telemetry.",
+      "component_line_ids": [
+        "line:runtime-lifecycle-observability"
+      ],
+      "acceptance": [
+        "The stable event subset, sink, and redaction contract are finalized and tested.",
+        "Telemetry failure cannot change the observed runtime result."
+      ],
+      "landing_state": "Optional observability is merged independently after its Phase-2 preflight resolves event and sink ownership.",
+      "rationale": "This is a complete optional subsystem rather than a bug repair, and its remaining preflight is explicit."
+    },
+    {
+      "id": "repair:browser-runtime",
+      "name": "Browser runtime reconstruction",
+      "kind": "repair",
+      "purpose": "Repair browser timeout cleanup and bounded shutdown behavior.",
+      "component_line_ids": [
+        "line:browser-timeout-cleanup"
+      ],
+      "acceptance": [
+        "Browser timeout paths clean up owned resources without masking the original failure."
+      ],
+      "landing_state": "Browser timeout cleanup is independently mergeable.",
+      "rationale": "The component already represents a complete browser-runtime repair."
+    },
+    {
+      "id": "feature:reasoning-display",
+      "name": "Configurable reasoning display",
+      "kind": "feature",
+      "purpose": "Expose bounded, safely configured reasoning display behavior.",
+      "component_line_ids": [
+        "line:configurable-reasoning-display"
+      ],
+      "acceptance": [
+        "Configured display limits apply with safe fallback for invalid or absent configuration and preserve fence escaping."
+      ],
+      "landing_state": "Reasoning display is independently mergeable.",
+      "rationale": "This component has a complete user-visible display contract and should not be coupled to request transformation."
+    },
+    {
+      "id": "feature:request-transform",
+      "name": "Request transform hook",
+      "kind": "feature",
+      "purpose": "Provide the request transformation extension point with explicit registration behavior.",
+      "component_line_ids": [
+        "line:request-transform-hook"
+      ],
+      "acceptance": [
+        "The hook registration and invocation contract remain stable and preserve request behavior when unused."
+      ],
+      "landing_state": "Request transformation is independently mergeable.",
+      "rationale": "This is a standalone extension point, not part of the reasoning-display merge boundary."
+    }
+  ],
   "edges": [
     {
       "from": "line:session-metadata-search-cjk",
@@ -1422,126 +1563,100 @@
   ],
   "ticket_projection": [
     {
-      "line_id": "line:session-metadata-search-core",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
-      "parallelizable_wave": 1,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:session-metadata-search-cjk",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
-      "parallelizable_wave": 2,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:session-metadata-search-trigram",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
-      "parallelizable_wave": 2,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:session-metadata-search-routing",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [
+      "merge_unit_id": "repair:session-search",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
         "line:session-metadata-search-core",
-        "line:session-search-lineage"
+        "line:session-metadata-search-cjk",
+        "line:session-metadata-search-trigram",
+        "line:session-metadata-search-routing",
+        "line:session-search-lineage",
+        "line:session-search-context-hydration",
+        "line:session-title-safety"
       ],
-      "parallelizable_wave": 2,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:session-title-safety",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
-      "parallelizable_wave": 2,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:session-search-lineage",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
+      "depends_on_merge_units": [],
       "parallelizable_wave": 1,
       "fresh_targeted_research": true
     },
     {
-      "line_id": "line:session-search-context-hydration",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
-      "parallelizable_wave": 2,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:headroom-compression",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
-      "parallelizable_wave": 1,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:headroom-retrieval",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [
-        "line:headroom-compression"
+      "merge_unit_id": "repair:memory-runtime",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:memory-trim-policy",
+        "line:memory-trim-diagnostics"
       ],
-      "parallelizable_wave": 2,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:memory-trim-policy",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
+      "depends_on_merge_units": [],
       "parallelizable_wave": 1,
       "fresh_targeted_research": true
     },
     {
-      "line_id": "line:memory-trim-diagnostics",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
-      "parallelizable_wave": 2,
-      "fresh_targeted_research": true
-    },
-    {
-      "line_id": "line:compression-session-boundary",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
+      "merge_unit_id": "repair:headroom-context",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:headroom-compression",
+        "line:headroom-retrieval"
+      ],
+      "depends_on_merge_units": [],
       "parallelizable_wave": 1,
       "fresh_targeted_research": true
     },
     {
-      "line_id": "line:runtime-lifecycle-observability",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
+      "merge_unit_id": "repair:compression-lifecycle",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:compression-session-boundary"
+      ],
+      "depends_on_merge_units": [],
       "parallelizable_wave": 1,
       "fresh_targeted_research": true
     },
     {
-      "line_id": "line:sqlite-write-contention-policy",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
+      "merge_unit_id": "repair:sqlite-reliability",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:sqlite-write-contention-policy"
+      ],
+      "depends_on_merge_units": [],
       "parallelizable_wave": 1,
       "fresh_targeted_research": true
     },
     {
-      "line_id": "line:browser-timeout-cleanup",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
+      "merge_unit_id": "feature:runtime-observability",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:runtime-lifecycle-observability"
+      ],
+      "depends_on_merge_units": [],
       "parallelizable_wave": 1,
       "fresh_targeted_research": true
     },
     {
-      "line_id": "line:configurable-reasoning-display",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
+      "merge_unit_id": "repair:browser-runtime",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:browser-timeout-cleanup"
+      ],
+      "depends_on_merge_units": [],
       "parallelizable_wave": 1,
       "fresh_targeted_research": true
     },
     {
-      "line_id": "line:request-transform-hook",
-      "ticket_action": "PROPOSE_IMPLEMENTATION_TICKET",
-      "depends_on": [],
+      "merge_unit_id": "feature:reasoning-display",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:configurable-reasoning-display"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "feature:request-transform",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:request-transform-hook"
+      ],
+      "depends_on_merge_units": [],
       "parallelizable_wave": 1,
       "fresh_targeted_research": true
     }
@@ -1563,6 +1678,8 @@
   "verification": {
     "phase1_capability_count": 22,
     "phase1_non_capability_count": 4,
+    "component_line_count": 17,
+    "merge_unit_count": 9,
     "behavioral_audit_unique_change_records": 145,
     "hard_dependency_dag": true,
     "unresolved_composition_blockers": [],

@@ -93,6 +93,31 @@ def test_relationship_references_and_hard_dependency_dag_are_valid():
     assert plan["verification"]["phase1_drift"] == []
 
 
+def test_merge_units_cover_component_lines_without_reusing_feature_families():
+    plan = load(COMPOSITION / "feature-line-plan.json")
+    feature_line_ids = {line["id"] for line in plan["feature_lines"]}
+    merge_units = plan["merge_units"]
+    merge_unit_ids = {unit["id"] for unit in merge_units}
+    assigned_lines = []
+
+    assert len(merge_units) == 9
+    assert len(merge_unit_ids) == len(merge_units)
+    for unit in merge_units:
+        assert unit["kind"] in {"repair", "feature"}
+        assert unit["purpose"]
+        assert unit["acceptance"]
+        assert unit["landing_state"]
+        assert unit["component_line_ids"]
+        assert set(unit["component_line_ids"]) <= feature_line_ids
+        assigned_lines.extend(unit["component_line_ids"])
+
+    assert len(assigned_lines) == len(set(assigned_lines))
+    assert set(assigned_lines) == feature_line_ids
+    assert merge_unit_ids.isdisjoint(
+        {family["id"] for family in plan["feature_families"]}
+    )
+
+
 def test_composition_waves_reference_every_line_and_match_markdown():
     plan = load(COMPOSITION / "feature-line-plan.json")
     report = (COMPOSITION / "feature-line-plan.md").read_text(encoding="utf-8")
@@ -126,20 +151,20 @@ def test_feature_lines_have_acceptance_and_report_matches_machine_plan():
         assert f"`{line['id']}`" in report
     for item in plan["coverage"]:
         assert f"`{item['capability_id']}`" in report
+    for unit in plan["merge_units"]:
+        assert f"`{unit['id']}`" in report
     assert "Final hard-dependency blockers: **0**" in report
 
 
 def test_ticket_projection_matches_hard_dependency_edges():
     plan = load(COMPOSITION / "feature-line-plan.json")
-    expected = {
-        line["id"]: set()
-        for line in plan["feature_lines"]
-    }
-    for edge in plan["edges"]:
-        if edge["type"] == "REQUIRES":
-            expected[edge["from"]].add(edge["to"])
+    merge_units = {unit["id"]: unit for unit in plan["merge_units"]}
     actual = {
-        item["line_id"]: set(item["depends_on"])
+        item["merge_unit_id"]: item
         for item in plan["ticket_projection"]
     }
-    assert actual == expected
+    assert set(actual) == set(merge_units)
+    for merge_unit_id, item in actual.items():
+        assert item["ticket_action"] == "PROPOSE_IMPLEMENTATION_PR"
+        assert item["depends_on_merge_units"] == []
+        assert item["component_line_ids"] == merge_units[merge_unit_id]["component_line_ids"]
