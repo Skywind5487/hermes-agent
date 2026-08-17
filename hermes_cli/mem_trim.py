@@ -15,10 +15,12 @@ from __future__ import annotations
 import ctypes
 import gc
 import logging
+import os
 import platform
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -135,8 +137,9 @@ def _read_proc_status() -> str | None:
 def collect_memory_snapshot(history_bytes: int | None = None) -> dict[str, int | None]:
     """Return lightweight process-memory telemetry for trim logs and canaries.
 
-    ``VmRSS`` and ``RssAnon`` are Linux-only best effort fields. The helper is
-    intentionally dependency-free so allocation recovery never requires psutil.
+    ``VmRSS``, ``RssAnon``, and ``VmSwap`` are Linux-only best-effort fields.
+    The helper is intentionally dependency-free so allocation recovery never
+    requires psutil.
     """
     snapshot: dict[str, int | None] = {
         "rss_kib": None,
@@ -145,18 +148,104 @@ def collect_memory_snapshot(history_bytes: int | None = None) -> dict[str, int |
     }
     status = _read_proc_status()
     if status:
+        field_names = {
+            "VmRSS": "rss_kib",
+            "RssAnon": "rss_anon_kib",
+            "VmSwap": "vm_swap_kib",
+        }
         for line in status.splitlines():
             key, separator, raw_value = line.partition(":")
-            if not separator or key not in {"VmRSS", "RssAnon"}:
+            if not separator or key not in field_names:
                 continue
             value = raw_value.strip().split(maxsplit=1)
             if value and value[0].isdigit():
-                snapshot["rss_kib" if key == "VmRSS" else "rss_anon_kib"] = int(
-                    value[0]
-                )
+                snapshot[field_names[key]] = int(value[0])
     if isinstance(history_bytes, int) and history_bytes >= 0:
         snapshot["history_bytes"] = history_bytes
     return snapshot
+
+
+def _parse_malloc_info(xml_text: str) -> dict[str, float | int | None] | None:
+    """Parse glibc malloc_info(3) top-level totals into fragmentation evidence.
+
+    ``malloc_info`` repeats per-heap totals inside ``<heap>`` elements and then
+    emits process-wide totals at the root. Only root-level values are summed so
+    multi-arena processes are not double-counted.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+        system_bytes = sum(
+            int(node.attrib["size"])
+            for node in root.findall("system")
+            if node.attrib.get("type") == "current" and "size" in node.attrib
+        )
+        free_bytes = sum(
+            int(node.attrib["size"])
+            for node in root.findall("total")
+            if node.attrib.get("type") in {"fast", "rest"}
+            and "size" in node.attrib
+        )
+    except (ET.ParseError, KeyError, TypeError, ValueError):
+        return None
+
+    frag_pct = (
+        round(free_bytes * 100.0 / system_bytes, 1) if system_bytes > 0 else None
+    )
+    return {
+        "system_bytes": system_bytes,
+        "free_bytes": free_bytes,
+        "frag_pct": frag_pct,
+    }
+
+
+def _malloc_info_stats() -> dict[str, float | int | None] | None:
+    """Return best-effort glibc heap fragmentation diagnostics.
+
+    Use libc ``tmpfile()`` instead of a predictable path under /tmp. The stream
+    is process-local/temporary and always closed. Any platform, libc, stdio,
+    parser, or filesystem failure degrades to ``None`` and cannot veto recovery.
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        libc = ctypes.CDLL(None)
+
+        libc.malloc_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        libc.malloc_info.restype = ctypes.c_int
+        libc.tmpfile.argtypes = []
+        libc.tmpfile.restype = ctypes.c_void_p
+        libc.fflush.argtypes = [ctypes.c_void_p]
+        libc.fflush.restype = ctypes.c_int
+        libc.fileno.argtypes = [ctypes.c_void_p]
+        libc.fileno.restype = ctypes.c_int
+        libc.fclose.argtypes = [ctypes.c_void_p]
+        libc.fclose.restype = ctypes.c_int
+
+        stream = libc.tmpfile()
+        if not stream:
+            return None
+        try:
+            if libc.malloc_info(0, stream) != 0:
+                return None
+            if libc.fflush(stream) != 0:
+                return None
+            fd = libc.fileno(stream)
+            if fd < 0:
+                return None
+            os.lseek(fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return _parse_malloc_info(
+                b"".join(chunks).decode("utf-8", errors="replace")
+            )
+        finally:
+            libc.fclose(stream)
+    except Exception:
+        return None
 
 
 def _should_log_trim(
@@ -172,7 +261,7 @@ def _should_log_trim(
     # successful trim is an explicit observability event, regardless of RSS.
     if force:
         return True
-    if not force and call_count % log_every_n:
+    if call_count % log_every_n:
         return False
     before_rss = before.get("rss_kib")
     after_rss = after.get("rss_kib")
@@ -212,7 +301,7 @@ def trim_memory(
 
     Returns ``True`` only when ``malloc_trim(0)`` ran and reported success.
     Unsupported allocators, the config kill switch, cooldown suppression, the
-    RSS low-water gate, and all runtime errors return ``False`` without
+    configured RSS low-water mark, and runtime errors return ``False`` without
     affecting the caller.
     """
     (
@@ -283,14 +372,29 @@ def trim_memory(
                 or not _last_gc_monotonic
                 or now - _last_gc_monotonic >= gc_cooldown
             )
-            started = time.perf_counter()
+
+            # Diagnostics extend policy: even an unexpected diagnostics failure
+            # must not suppress gc/trim. Collect fragmentation before recovery so
+            # it describes the heap state that motivated this attempt.
+            try:
+                heap = _malloc_info_stats()
+            except Exception as exc:
+                logger.debug("malloc_info diagnostics failed: %s", exc)
+                heap = None
+
+            gc_ms = 0.0
             if should_gc:
+                gc_started = time.perf_counter()
                 gc.collect()
+                gc_ms = (time.perf_counter() - gc_started) * 1000
                 _last_gc_monotonic = time.monotonic()
+
+            trim_started = time.perf_counter()
             trim_result = trim(0)
+            trim_ms = (time.perf_counter() - trim_started) * 1000
             released = bool(trim_result)
             after = collect_memory_snapshot()
-            duration_ms = (time.perf_counter() - started) * 1000
+            duration_ms = gc_ms + trim_ms
             _trim_call_count += 1
             if released and _should_log_trim(
                 force=force,
@@ -300,17 +404,31 @@ def trim_memory(
                 after=after,
                 info_log_min_delta_mb=info_log_min_delta_mb,
             ):
+                heap_system_mb = (
+                    heap["system_bytes"] / (1024 * 1024) if heap else None
+                )
+                heap_free_mb = heap["free_bytes"] / (1024 * 1024) if heap else None
                 logger.info(
                     "memory trim: reason=%s malloc_trim=%s rss_kib=%s->%s "
-                    "rss_anon_kib=%s->%s threads=%s duration_ms=%.1f",
+                    "rss_anon_kib=%s->%s swap_kib=%s->%s threads=%s "
+                    "duration_ms=%.1f gc_ran=%s gc_ms=%.1f trim_ms=%.1f "
+                    "heap_system_mb=%s heap_free_mb=%s frag_pct=%s",
                     reason or "cleanup",
                     trim_result,
                     before.get("rss_kib"),
                     after.get("rss_kib"),
                     before.get("rss_anon_kib"),
                     after.get("rss_anon_kib"),
+                    before.get("vm_swap_kib"),
+                    after.get("vm_swap_kib"),
                     after.get("thread_count"),
                     duration_ms,
+                    should_gc,
+                    gc_ms,
+                    trim_ms,
+                    heap_system_mb,
+                    heap_free_mb,
+                    heap.get("frag_pct") if heap else None,
                 )
             return released
         except Exception as exc:
