@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 
 import pytest
 
@@ -15,12 +16,14 @@ def headroom_plugin(monkeypatch):
     spec = importlib.util.spec_from_file_location("_test_headroom_plugin", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "_store_instance", None)
     monkeypatch.setattr(module, "_store_initialized", False)
     monkeypatch.setattr(module, "_router_instance", None)
     monkeypatch.setattr(module, "_router_initialized", False)
-    return module
+    yield module
+    sys.modules.pop(spec.name, None)
 
 
 def _settings(module, **overrides):
