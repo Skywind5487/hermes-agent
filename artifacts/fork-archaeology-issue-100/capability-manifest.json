@@ -1,0 +1,1718 @@
+{
+  "schema_version": 1,
+  "phase": "Phase 1 reviewed capability manifest",
+  "inputs": {
+    "fork_ref": "35c8564c9c0af3d75bcbdf1d793e7207e5528f06",
+    "upstream_ref": "460d345642ee3d143a3e461abe39fd42b86a7e54",
+    "merge_base": "91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53"
+  },
+  "method": {
+    "grouping_axes": [
+      "historical intent/behavior",
+      "merge provenance",
+      "current fork survival",
+      "frozen upstream/prior art"
+    ],
+    "rule": "A capability is a behavior boundary with a contract and verification surface; provisional provenance buckets are evidence containers only. Runtime policy and diagnostics are split when a historical change both changes behavior and measures it. The adversarial coverage audit reviews every change record at hunk/intent level; a commit may have multiple semantic rows.",
+    "non_capability_rule": "Research, operations, benchmarks, integration topology, and isolated maintenance are accounted explicitly without promotion to capabilities."
+  },
+  "accounting": {
+    "historical_change_records": 145,
+    "merge_events": 26,
+    "total_records": 171,
+    "mapped_records": 171,
+    "complete": true
+  },
+  "groups": [
+    {
+      "id": "capability:browser-timeout-cleanup",
+      "record_class": "capability",
+      "capability": "Browser timeout cleanup policy",
+      "intent_name": "Make browser daemon termination on timeout configuration-gated and crash-resilient while retaining finally-path cleanup.",
+      "historical_commits": [
+        {
+          "sha": "a2450695db0e99f3dd8362f129024cb74c700bb8",
+          "subject": "fix(browser): config-gated daemon kill on timeout"
+        },
+        {
+          "sha": "b42bc25e622c11230998cc57f7050ec2a2cdd090",
+          "subject": "fix(browser): add tests and crash-resilience for daemon-kill on timeout"
+        },
+        {
+          "sha": "cfb2636a6a3ed02ff773f106beb71c88576f1284",
+          "subject": "fix(browser): move dict cleanup to finally block on timeout (P1 fix)"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [
+        {
+          "sha": "8a0a1a145e2290682e8d4e6f76ed6ec90b0b933f",
+          "subject": "Merge branch 'fix/browser-timeout-daemon-kill-toggle' into dev"
+        },
+        {
+          "sha": "9e3439835e9dbbad0d0076d539d769db1f84de0a",
+          "subject": "Merge remote-tracking branch 'origin/main' into fix/browser-timeout-daemon-kill-toggle"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Timeout cleanup clears in-memory browser state in a finally-equivalent path.",
+        "Daemon termination is opt-in/config-gated.",
+        "Cleanup failures are contained and test-covered."
+      ],
+      "current_dev_survival": "Survives in tools/browser_tool.py and timeout cleanup/daemon tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has timeout cleanup/orphan reaping but not terminate_daemon_on_timeout configuration behavior.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Check whether upstream orphan reaping supersedes this toggle."
+      ],
+      "source_inventory_records": [
+        "commit:8a0a1a145e2290682e8d4e6f76ed6ec90b0b933f",
+        "commit:9e3439835e9dbbad0d0076d539d769db1f84de0a",
+        "commit:a2450695db0e99f3dd8362f129024cb74c700bb8",
+        "commit:b42bc25e622c11230998cc57f7050ec2a2cdd090",
+        "commit:cfb2636a6a3ed02ff773f106beb71c88576f1284"
+      ],
+      "change_record_count": 3,
+      "merge_event_count": 2
+    },
+    {
+      "id": "capability:compression-session-boundary",
+      "record_class": "capability",
+      "capability": "Compression session-boundary semantics",
+      "intent_name": "Prevent compressor-reported no-op results from creating a false session boundary.",
+      "historical_commits": [],
+      "supporting_historical_commits": [
+        {
+          "sha": "176646d2cd6c95fa49b9414f21ed9e781b0aaa84",
+          "subject": "feat: add lifecycle and SQLite observability telemetry",
+          "role": "behavioral overlay; same commit also contains telemetry"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "The commit is retained in the lifecycle telemetry provenance bucket for runner accounting; the hunk-level audit promotes this independent behavior intent.",
+      "behavioral_contracts": [
+        "A context compressor reporting noop does not rotate or rewrite the session, even if it returns a newly allocated list.",
+        "The current system prompt and session lock are released safely on the no-op path."
+      ],
+      "current_dev_survival": "Survives in agent/conversation_compression.py and its compression lifecycle tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has a semantic no-progress guard for equal compressor output, but the explicit status-reported-noop case is a separate residual contract.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "SPLIT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Confirm the canonical status field for third-party context compressors before porting."
+      ],
+      "source_inventory_records": [
+        "behavior-overlay:commit:176646d2cd6c95fa49b9414f21ed9e781b0aaa84"
+      ],
+      "change_record_count": 0,
+      "merge_event_count": 0
+    },
+    {
+      "id": "capability:configurable-reasoning-display",
+      "record_class": "capability",
+      "capability": "Configurable reasoning display limit",
+      "intent_name": "Replace a hardcoded reasoning display limit with explicit configuration while retaining safe truncation.",
+      "historical_commits": [
+        {
+          "sha": "895ba96014ecf934dbc140306ffe578a0a533ea3",
+          "subject": "feat: configurable reasoning max lines via display.reasoning_max_lines"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [
+        "PR #3"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "9fe97e2aa1b05306ed626e5ae3db540d24bb4678",
+          "subject": "Merge PR #3: configurable reasoning max lines"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "reasoning_max_lines controls display truncation.",
+        "Invalid or absent configuration falls back safely.",
+        "Fence escaping remains applied before wrapping."
+      ],
+      "current_dev_survival": "Survives in cli.py/config parsing and gateway display code.",
+      "upstream_prior_art_current_implementation": "Frozen upstream hardcodes the first 15 lines and has no reasoning_max_lines seam.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Confirm configuration source and documentation expected upstream."
+      ],
+      "source_inventory_records": [
+        "commit:895ba96014ecf934dbc140306ffe578a0a533ea3",
+        "pr:3"
+      ],
+      "change_record_count": 1,
+      "merge_event_count": 1
+    },
+    {
+      "id": "capability:cron-nul-safety",
+      "record_class": "capability",
+      "capability": "NUL-safe cron lifecycle and terminal fallback",
+      "intent_name": "Safely reject NUL-bearing paths before lifecycle/terminal process APIs can misinterpret them.",
+      "historical_commits": [
+        {
+          "sha": "d53e209b3b620abce55f2cc57a80c69bc0cd9369",
+          "subject": "fix(cron): harden lifecycle guard + terminal fallback against NUL-bearing paths (#76762)"
+        }
+      ],
+      "historical_issues": [
+        "PR #76762"
+      ],
+      "historical_prs": [
+        "PR #76762"
+      ],
+      "merge_provenance": [],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "NUL-bearing input does not reach unsafe process/lifecycle calls.",
+        "Terminal fallback returns a clear failure rather than truncating at NUL."
+      ],
+      "current_dev_survival": "Survives in cron/lifecycle_guard.py and tools/terminal_tool.py.",
+      "upstream_prior_art_current_implementation": "Frozen upstream contains the corresponding NUL/binary-safe guard and terminal fallback.",
+      "status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Confirm upstream release and canonical tests."
+      ],
+      "source_inventory_records": [
+        "pr:76762"
+      ],
+      "change_record_count": 1,
+      "merge_event_count": 0
+    },
+    {
+      "id": "capability:headroom-compression",
+      "record_class": "capability",
+      "capability": "Headroom output compression",
+      "intent_name": "Compress oversized tool/context payloads with bounded output, metadata-safe behavior, and explicit warning semantics.",
+      "historical_commits": [
+        {
+          "sha": "237176ed1d973910972984ba83d876d01c00f3db",
+          "subject": "fix(headroom): prevent metadata from expanding tool results"
+        },
+        {
+          "sha": "5eb552458de9828f4496880fd878f58015a63389",
+          "subject": "feat(headroom): add ContentRouter + SmartCrusher integration behind config flag"
+        },
+        {
+          "sha": "915913db360de5fe5b147d4895276ff39a6e8686",
+          "subject": "Add opt-in headroom tool-output compression plugin"
+        },
+        {
+          "sha": "c16ebe6b8649c570b688fd82d6b66f9a8416d59c",
+          "subject": "fix(headroom): logger.warning for ContentRouter/CacheAligner failures + warning E2E tests"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [
+        {
+          "sha": "b7e62647bd657a429d967cfa77034632ee490f9a",
+          "subject": "feat(headroom): merge ContentRouter + warning E2E tests into dev"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Compression activates only at configured thresholds and does not expand tool-result metadata.",
+        "Failures degrade with warning/logging and preserve usable content.",
+        "Plugin registration and schema remain valid when active."
+      ],
+      "current_dev_survival": "Survives in plugins/headroom, tools_config.py, plugin.yaml, pyproject.toml/uv.lock and plugin tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has no headroom ContentRouter/SmartCrusher implementation.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Identify upstream context-management owner before porting.",
+        "Keep output compression separate from retrieval."
+      ],
+      "source_inventory_records": [
+        "commit:237176ed1d973910972984ba83d876d01c00f3db",
+        "commit:5eb552458de9828f4496880fd878f58015a63389",
+        "commit:915913db360de5fe5b147d4895276ff39a6e8686",
+        "commit:b7e62647bd657a429d967cfa77034632ee490f9a",
+        "commit:c16ebe6b8649c570b688fd82d6b66f9a8416d59c"
+      ],
+      "change_record_count": 4,
+      "merge_event_count": 1
+    },
+    {
+      "id": "capability:headroom-retrieval",
+      "record_class": "capability",
+      "capability": "Headroom retrieval (CCR)",
+      "intent_name": "Expose bounded retrieval of compressed context through a registered tool when compression is active.",
+      "historical_commits": [
+        {
+          "sha": "0a4b567ff08776a3a10ee7a32d37332d873f20b2",
+          "subject": "feat(headroom): add retrieval (CCR) support to Phase 1 compression plugin"
+        },
+        {
+          "sha": "0b4e7601227a23bc653d0d3018a3a9591d02f2a1",
+          "subject": "fix: headroom_retrieve tool schema — add description and parameters wrapper"
+        },
+        {
+          "sha": "b527e4df996b859356c0c48c2b9c9eae4c74c4dc",
+          "subject": "fix(headroom): auto-enable headroom_retrieve tool when compression is active"
+        },
+        {
+          "sha": "d3f44c9d63b7b3444e2cf4c71fcbde86020e6ea6",
+          "subject": "fix(headroom): add missing toolset param to register_tool call"
+        },
+        {
+          "sha": "ff4df5b71e1557660dbe994eb5569983f57c9901",
+          "subject": "fix(headroom): add missing toolset param to register_tool call"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [
+        {
+          "sha": "516d739f64a95a4f380b899fbb9a349d750fc2aa",
+          "subject": "Merge branch 'feat/headroom-retrieval-toolset-autoenable' into dev"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "The retrieval tool has a stable schema.",
+        "It is auto-enabled only when compression is active and returns bounded context.",
+        "Registration failures are explicit and warning-visible."
+      ],
+      "current_dev_survival": "Survives in plugins/headroom, tools_config.py, plugin.yaml and plugin tests.",
+      "upstream_prior_art_current_implementation": "No equivalent retrieval tool is present in frozen upstream.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Decide whether retrieval is a generic upstream context API or plugin-owned."
+      ],
+      "source_inventory_records": [
+        "commit:0a4b567ff08776a3a10ee7a32d37332d873f20b2",
+        "commit:0b4e7601227a23bc653d0d3018a3a9591d02f2a1",
+        "commit:516d739f64a95a4f380b899fbb9a349d750fc2aa",
+        "commit:b527e4df996b859356c0c48c2b9c9eae4c74c4dc",
+        "commit:d3f44c9d63b7b3444e2cf4c71fcbde86020e6ea6",
+        "commit:ff4df5b71e1557660dbe994eb5569983f57c9901"
+      ],
+      "change_record_count": 5,
+      "merge_event_count": 1
+    },
+    {
+      "id": "capability:lifecycle-sqlite-telemetry",
+      "record_class": "capability",
+      "capability": "Lifecycle and SQLite observability telemetry",
+      "intent_name": "Expose structured lifecycle, tool, stream, SQLite, and delivery telemetry at important execution boundaries.",
+      "historical_commits": [
+        {
+          "sha": "176646d2cd6c95fa49b9414f21ed9e781b0aaa84",
+          "subject": "feat: add lifecycle and SQLite observability telemetry"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Important boundaries emit structured telemetry rather than only ad-hoc logs.",
+        "SQLite lock/owner and stream/tool failures remain diagnosable."
+      ],
+      "current_dev_survival": "Survives across lifecycle_telemetry.py, sqlite_native_telemetry.py, turn_context.py, gateway code and tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream comparison was not completed per telemetry surface; absence is not treated as proof.",
+      "status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "medium",
+      "unresolved_questions": [
+        "Separate domain facts from diagnostics.",
+        "Which event names/sinks are stable enough to port?"
+      ],
+      "source_inventory_records": [
+        "commit:176646d2cd6c95fa49b9414f21ed9e781b0aaa84"
+      ],
+      "change_record_count": 1,
+      "merge_event_count": 0,
+      "behavioral_overlays": [
+        "capability:compression-session-boundary"
+      ]
+    },
+    {
+      "id": "capability:memory-trim-diagnostics",
+      "record_class": "capability",
+      "capability": "Memory trim diagnostics",
+      "intent_name": "Attribute trim cost and memory pressure without making diagnostics a prerequisite for recovery.",
+      "historical_commits": [
+        {
+          "sha": "04f1af72be078cef69de538f1519f93a73088b0d",
+          "subject": "feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "04f1 is explicitly owned here for its instrumentation; its policy threshold is cited as supporting evidence by the policy capability.",
+      "behavioral_contracts": [
+        "gc_ms versus trim_ms identifies the freeze mechanism without changing the policy decision.",
+        "Fragmentation and VmSwap are best-effort diagnostics and never block memory recovery."
+      ],
+      "current_dev_survival": "Survives in hermes_cli/mem_trim.py through gc_ms/trim_ms, malloc_info fragmentation, VmSwap snapshots, and structured trim logs.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has basic RSS/RssAnon snapshots and trim logging, but not the fork's GC-versus-trim attribution, malloc_info fragmentation, or VmSwap diagnostics.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "KEEP",
+      "confidence": "medium",
+      "unresolved_questions": [
+        "Which diagnostic fields are stable enough to expose as a long-term contract?",
+        "Should malloc_info remain best-effort Linux/glibc-only instrumentation?"
+      ],
+      "source_inventory_records": [
+        "commit:04f1af72be078cef69de538f1519f93a73088b0d"
+      ],
+      "change_record_count": 1,
+      "merge_event_count": 0
+    },
+    {
+      "id": "capability:memory-trim-policy",
+      "record_class": "capability",
+      "capability": "Memory trim policy",
+      "intent_name": "Avoid expensive and low-value heap work while preserving cheap malloc_trim cadence.",
+      "historical_commits": [
+        {
+          "sha": "a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb",
+          "subject": "fix(mem-trim): gate gc.collect() behind gc_cooldown_seconds, measure frag before trim"
+        }
+      ],
+      "supporting_historical_commits": [
+        {
+          "sha": "04f1af72be078cef69de538f1519f93a73088b0d",
+          "subject": "feat(mem-trim): instrument gc/trim split + malloc_info frag + VmSwap, add RSS low-water threshold",
+          "role": "policy precursor"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "The policy was introduced by the two sequential mem-trim commits; 04f1 is mapped to diagnostics for explicit accounting and retained here as a supporting precursor.",
+      "behavioral_contracts": [
+        "RSS below threshold_mb skips the expensive trim work on housekeeping ticks.",
+        "gc.collect() runs at most once per gc_cooldown_seconds while malloc_trim remains eligible on the normal trim cadence.",
+        "The 99.7% GC attribution explains the policy split; force behavior and invalid configuration retain safe fallbacks."
+      ],
+      "current_dev_survival": "Survives in hermes_cli/mem_trim.py with threshold_mb, gc_cooldown_seconds, separate _last_gc_monotonic state, and independent malloc_trim cadence.",
+      "upstream_prior_art_current_implementation": "Frozen upstream hermes_cli/mem_trim.py has a general cooldown around gc.collect()+malloc_trim, but no RSS low-water gate or independent GC cooldown; this is partial prior art, not equivalence.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Which upstream housekeeping callers should own the cheap trim cadence after porting?",
+        "Should threshold_mb and gc_cooldown_seconds share the upstream config naming/default policy?"
+      ],
+      "source_inventory_records": [
+        "commit:a9d2b9af4f800fef23fa7ecaf2ea270b43e326eb"
+      ],
+      "change_record_count": 1,
+      "merge_event_count": 0
+    },
+    {
+      "id": "capability:outbound-code-fence-safety",
+      "record_class": "capability",
+      "capability": "Outbound code-fence and truncation safety",
+      "intent_name": "Preserve balanced code fences and inline-code spans when reasoning, streaming chunks, or Discord edits are escaped or truncated.",
+      "historical_commits": [
+        {
+          "sha": "347442ddc80a2658582cb62dd268a0be024b1bcf",
+          "subject": "fix: escape triple-backtick in reasoning before wrapping in outer code block"
+        },
+        {
+          "sha": "44afcc8d3f869c7780beb1bc0bece86df1e45cb2",
+          "subject": "test: code fence tracking coverage for all send/split paths"
+        },
+        {
+          "sha": "47cc1764dc2c2c65cc83fe20500da939698d72d3",
+          "subject": "fix: close orphaned code fences on all send paths"
+        },
+        {
+          "sha": "c1a3e16c32896ea2d469536c657814049c29bec6",
+          "subject": "fix: also close orphaned single-backtick inline-code spans"
+        },
+        {
+          "sha": "efd68fe044001c57c5d148a66469209589c344d9",
+          "subject": "fix: ensure balanced code fences after Discord edit_message brute-force truncation"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [
+        "PR #2"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "535b33c95f9465bb3e05b281b17fceee3ba24d22",
+          "subject": "Merge PR #2: escape reasoning fences (resolve conflict)"
+        },
+        {
+          "sha": "eed6ba2734bc7aaabbd1e8cf08cd794badc72d71",
+          "subject": "Merge branch 'fix/truncation-fence-edge-case' into dev"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Untrusted backticks are escaped before outer wrapping.",
+        "Chunk balancing and truncation close open triple-backtick and inline-code spans.",
+        "Discord edit/truncation preserves the same user-visible balance guarantee."
+      ],
+      "current_dev_survival": "Survives in gateway/stream_consumer.py and Discord adapter/tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream already has escape_code_fences_for_display, ensure_closed_code_fences, and chunk balancing with equivalent behavior.",
+      "status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Run upstream Discord edit-truncation tests before deleting fork provenance."
+      ],
+      "source_inventory_records": [
+        "commit:347442ddc80a2658582cb62dd268a0be024b1bcf",
+        "commit:44afcc8d3f869c7780beb1bc0bece86df1e45cb2",
+        "commit:47cc1764dc2c2c65cc83fe20500da939698d72d3",
+        "pr:2",
+        "commit:c1a3e16c32896ea2d469536c657814049c29bec6",
+        "commit:eed6ba2734bc7aaabbd1e8cf08cd794badc72d71",
+        "commit:efd68fe044001c57c5d148a66469209589c344d9"
+      ],
+      "change_record_count": 5,
+      "merge_event_count": 2
+    },
+    {
+      "id": "capability:request-transform-hook",
+      "record_class": "capability",
+      "capability": "Full-payload outbound request transform hook",
+      "intent_name": "Allow plugins to transform the complete outbound API request before dispatch.",
+      "historical_commits": [
+        {
+          "sha": "296d9c6e2e5a6f852344ad8fa9b90f5687912be1",
+          "subject": "feat: add transform_api_request plugin hook for full-payload request transformation"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "transform_api_request receives and returns the complete payload at a documented boundary.",
+        "The hook is optional and preserves the request when absent.",
+        "Hook errors are explicit and do not dispatch partial data."
+      ],
+      "current_dev_survival": "Survives in agent/conversation_loop.py, hermes_cli/hooks.py, hermes_cli/plugins.py and run-agent tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has pre_llm_call but not a full-payload transform hook at dispatch.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Define ordering relative to pre_llm_call and provider adapters."
+      ],
+      "source_inventory_records": [
+        "commit:296d9c6e2e5a6f852344ad8fa9b90f5687912be1"
+      ],
+      "change_record_count": 1,
+      "merge_event_count": 0
+    },
+    {
+      "id": "capability:session-fts-cjk",
+      "record_class": "capability",
+      "capability": "CJK session metadata search",
+      "intent_name": "Add an optional, independently maintained CJK session metadata index with safe degradation and snapshot-consistent serving.",
+      "historical_commits": [
+        {
+          "sha": "0eee69ef43f16c63f29db414e1acb40253212125",
+          "subject": "fix(session-fts): run CJK guard+MATCH in one SQLite snapshot (PR #65 P1)"
+        },
+        {
+          "sha": "15f5aa07a0a1e4ffcf12b5b90aeea6d187e37114",
+          "subject": "fix: migrate FTS5 trigram tokenizer from trigram to simple for CJK search"
+        },
+        {
+          "sha": "3053abf3b039a5b4c23637597cb076f2339250fb",
+          "subject": "fix: let all CJK queries use simple tokenizer; cache lineage resolves"
+        },
+        {
+          "sha": "3e23375f7934e4315d45860e6992171fb5609c5c",
+          "subject": "test(session-fts): RED contract for CJK session metadata lifecycle (#26)"
+        },
+        {
+          "sha": "7b4d37c2727ce8b1a12d9ccb22e8a936ca87fab7",
+          "subject": "feat(session-fts): external-content CJK metadata DDL + capability/quarantine (#26)"
+        },
+        {
+          "sha": "8ec0ec3bf85a7414bb4244027b7f018e7eebf1e5",
+          "subject": "feat(session-fts): plug CJK session rebuild into the generic engine (#26)"
+        },
+        {
+          "sha": "47c537c766bb72d7dfbd6a3fe0cbc2bd9985c128",
+          "subject": "feat(session-fts): CJK metadata candidate seam + all-3-field search (#26)"
+        },
+        {
+          "sha": "6311e77e27f4fd4009c73d0df16abebf56121f4a",
+          "subject": "docs(research): map CJK session metadata FTS lifecycle for #33"
+        },
+        {
+          "sha": "6447a52cd994bf30c2811814f21095d12aba83ae",
+          "subject": "fix(state): short-circuit CJK-unservable to direct LIKE + single compression edge"
+        },
+        {
+          "sha": "6b3402ea05566fa1553a93aceb285eb517d7e67d",
+          "subject": "fix(session-fts): three lifecycle/capability seams for CJK session FTS (round-3 review)"
+        },
+        {
+          "sha": "83431f775a9e3798611e03b16a2f7d9a7ac74a57",
+          "subject": "docs(design): document the #26 CJK session metadata FTS variant"
+        },
+        {
+          "sha": "8efead2600a3f932f9881b53cd0c7eabc755f82f",
+          "subject": "fix(session-fts): address #26 code-review findings"
+        }
+      ],
+      "historical_issues": [
+        "PR #65",
+        "issue #26"
+      ],
+      "historical_prs": [
+        "PR #26",
+        "PR #65",
+        "issue #26"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "bdf2fc218264538c4f3238b58532488fe665ff9e",
+          "subject": "Merge pull request #65 from Skywind5487/fts/session-cjk-highwater"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "CJK search covers title, id, and display_name through external-content FTS.",
+        "Unavailable tokenizer/index state degrades safely without hiding the base path.",
+        "Guard and MATCH run against one SQLite snapshot; rebuild is independent and resumable."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_session_metadata_cjk_fts.py.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has no session CJK metadata index or equivalent optional lifecycle.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "What tokenizer availability contract is acceptable upstream?",
+        "Should CJK remain a separate optional port?"
+      ],
+      "source_inventory_records": [
+        "pr:65",
+        "commit:15f5aa07a0a1e4ffcf12b5b90aeea6d187e37114",
+        "commit:3053abf3b039a5b4c23637597cb076f2339250fb",
+        "pr:26",
+        "commit:6311e77e27f4fd4009c73d0df16abebf56121f4a",
+        "commit:6447a52cd994bf30c2811814f21095d12aba83ae",
+        "commit:6b3402ea05566fa1553a93aceb285eb517d7e67d",
+        "commit:83431f775a9e3798611e03b16a2f7d9a7ac74a57",
+        "commit:8efead2600a3f932f9881b53cd0c7eabc755f82f"
+      ],
+      "change_record_count": 12,
+      "merge_event_count": 1
+    },
+    {
+      "id": "capability:session-fts-lifecycle",
+      "record_class": "capability",
+      "capability": "Unified six-index FTS lifecycle",
+      "intent_name": "Give all session and message FTS indexes one descriptor-driven maintenance, health, repair, discovery, and degraded-runtime boundary.",
+      "historical_commits": [
+        {
+          "sha": "00e680a8cb22e251f351b9f140b0679c4f96dabc",
+          "subject": "feat(fts): authoritative six-index registry + registry-driven ordinary maintenance (#27)"
+        },
+        {
+          "sha": "e64af5e0f8a3e8816137fd083ca7d567e2f8a0a1",
+          "subject": "feat(fts): registry-driven health probes + trigger inventory/convergence (#27)"
+        },
+        {
+          "sha": "474b88fe76e18dfcf397f11b3de6f069abac4a4c",
+          "subject": "fix(fts): registry-driven offline + destructive repair covers session indexes (#27)"
+        },
+        {
+          "sha": "f9ade6baff7f236b6b9401932c61bc0400375664",
+          "subject": "feat(fts): read-only session capability discovery + shared rebuild-lane iteration (#27)"
+        },
+        {
+          "sha": "e64ad007b459871af42e312bc5dffd2da92ac900",
+          "subject": "test(fts): six-index regression matrix for maintenance/repair/read-only/degraded-runtime (#27)"
+        },
+        {
+          "sha": "0400c66f072d0f319331ea105cd8f7e059975388",
+          "subject": "refactor(fts): apply review round — drop dead lane keys, merge trigger-drop + CJK quarantine helpers, remove dead _FTS_TRIGGERS (#27)"
+        },
+        {
+          "sha": "933a2ce86c8a8c7379cbbfb1f50686e9bf2febec",
+          "subject": "fix(fts): reuse #30 ownership classifier in offline/global paths + read-only CJK worker fix (#27)"
+        },
+        {
+          "sha": "ed5ab2e8ecd03a98d70fbf3dca20d830c51d460a",
+          "subject": "fix(fts): read-only trigram discovery gates on full #30 namespace ownership (#27)"
+        },
+        {
+          "sha": "3bc7d3f58f808e269675404c9bbeada467b00e98",
+          "subject": "refactor(fts): ponytail pass — drop redundant tests, shrink review history + comments (#27)"
+        },
+        {
+          "sha": "d6a4d70483623cc3fad4eea8c96754d7d637d02c",
+          "subject": "fix(fts): read-only trigram serving requires a complete trigger set (#27)"
+        },
+        {
+          "sha": "0cf4cd0baffb68b571a44f2a39d3bf817cd38348",
+          "subject": "docs(fts): record review round 4 for #27 unified FTS lifecycle"
+        },
+        {
+          "sha": "75223d19544ceb73cf24fb859fc0780ed9a099a5",
+          "subject": "docs(fts): record review round 1 for #27"
+        },
+        {
+          "sha": "a822d37d18064d1442eb20b6a2cb4e9f8b17d48d",
+          "subject": "docs(fts): record review round 3 for #27 unified FTS lifecycle"
+        },
+        {
+          "sha": "bdd9d699f6dc13b32852a078c1ecf5664bcb837d",
+          "subject": "docs(fts): record six-index unified lifecycle implementation for #27"
+        },
+        {
+          "sha": "dc1f153a71d025d903f255861da57f94d649ca37",
+          "subject": "docs(fts): record review round 2 for #27 unified FTS lifecycle"
+        }
+      ],
+      "historical_issues": [
+        "PR #76",
+        "issue #27"
+      ],
+      "historical_prs": [
+        "PR #27",
+        "PR #76",
+        "issue #27"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "9d140c8594c67ed37729b190fd3733508d0d770c",
+          "subject": "Merge pull request #76 from Skywind5487/feat/27-unified-fts-lifecycle"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "The registry covers messages_fts, messages_fts_trigram, messages_fts_cjk, sessions_fts, sessions_fts_cjk, and sessions_fts_trigram.",
+        "Maintenance, health, read-only discovery, repair, and degraded runtime iterate the same descriptors.",
+        "Unknown or incomplete trigger state fails closed for serving."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_fts_lifecycle_registry.py.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has message FTS primitives but no equivalent session six-index lifecycle boundary.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Which lifecycle pieces are required by upstream?",
+        "How should #31 remain an explicit dependency?"
+      ],
+      "source_inventory_records": [
+        "pr:27",
+        "commit:0cf4cd0baffb68b571a44f2a39d3bf817cd38348",
+        "commit:75223d19544ceb73cf24fb859fc0780ed9a099a5",
+        "pr:76",
+        "commit:a822d37d18064d1442eb20b6a2cb4e9f8b17d48d",
+        "commit:bdd9d699f6dc13b32852a078c1ecf5664bcb837d",
+        "commit:dc1f153a71d025d903f255861da57f94d649ca37"
+      ],
+      "change_record_count": 15,
+      "merge_event_count": 1
+    },
+    {
+      "id": "capability:session-fts-simple-eol",
+      "record_class": "capability",
+      "capability": "Legacy simple-tokenizer retirement",
+      "intent_name": "Remove the unsupported legacy simple-tokenizer compatibility debt and make unsupported database states fail explicitly.",
+      "historical_commits": [
+        {
+          "sha": "196b904417371cf233f3eb9b560c80a079ab8d72",
+          "subject": "docs(research): map simple-tokenizer EOL for #40"
+        },
+        {
+          "sha": "44dd4c5e586e60c22a322a9eb89d1aed63892e36",
+          "subject": "fix: load simple FTS5 tokenizer and apply read-performance PRAGMAs"
+        },
+        {
+          "sha": "85fd91fd7c7be20d63356f27654d399ca1da4fa0",
+          "subject": "test(fts): pin simple-tokenizer EOL policy (#19)"
+        },
+        {
+          "sha": "186986a447080ae74a1d17fd1e32aaf039cb2ff2",
+          "subject": "fix(fts): retire simple-tokenizer residue; drop global shim (#19)"
+        },
+        {
+          "sha": "deb10243ccebd6153cdfab8e9869faba2e105f0e",
+          "subject": "docs(fts): close simple compatibility contract (#19)"
+        },
+        {
+          "sha": "1d5b80cab802e6ae932c97342e328e76faa496fa",
+          "subject": "fix(fts): harden simple EOL sanitation per review (#19)"
+        },
+        {
+          "sha": "a1136e548ea1f2200429bf44f8f1a7297cc84246",
+          "subject": "fix: load simple FTS5 tokenizer and apply read-performance PRAGMAs"
+        },
+        {
+          "sha": "a4e2c52f1582952686ee56aaedd7285874326102",
+          "subject": "fix: address Copilot review — init hermes_home, load simple in ro path, v21 migration"
+        },
+        {
+          "sha": "c20cb64b4b79468c641626e9b9d3957790f7a671",
+          "subject": "fix: address Copilot review — init hermes_home, load simple in ro path, v21 migration"
+        },
+        {
+          "sha": "f779b5320c6008e1c8b49bf7386fdfe76dea7a8a",
+          "subject": "fix(state): load simple tokenizer so legacy trigram tables stay writable"
+        }
+      ],
+      "historical_issues": [
+        "PR #87",
+        "issue #19"
+      ],
+      "historical_prs": [
+        "PR #19",
+        "PR #87",
+        "issue #19"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "433a49f66b447f41fdd488dc4858a07c7cd7154d",
+          "subject": "Merge branch 'fix/fts-simple-tokenizer-complete' into dev"
+        },
+        {
+          "sha": "53da9e89f8f3d2b051bf4c719b9f09b355392c00",
+          "subject": "Merge pull request #87 from Skywind5487/feat/19-simple-tokenizer-eol"
+        },
+        {
+          "sha": "dc2270aad84242da42f4342ac137e243ca181aa5",
+          "subject": "Merge branch 'fix/fts-simple-tokenizer-complete' into dev"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Supported post-#12 databases do not require simple-tokenizer loading or repair branches.",
+        "Unsupported legacy residue is sanitized or rejected explicitly rather than silently kept writable.",
+        "Modern trigram/CJK lifecycle remains the canonical path."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py sanitizer/repair logic and the #19/#87 research and tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has no load_simple_extension/simple-tokenizer compatibility shim; the legacy debt is already absent there.",
+      "status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Prove the release ancestry of upstream database states before closing the port question."
+      ],
+      "source_inventory_records": [
+        "commit:196b904417371cf233f3eb9b560c80a079ab8d72",
+        "commit:433a49f66b447f41fdd488dc4858a07c7cd7154d",
+        "commit:44dd4c5e586e60c22a322a9eb89d1aed63892e36",
+        "pr:87",
+        "pr:19",
+        "commit:a1136e548ea1f2200429bf44f8f1a7297cc84246",
+        "commit:a4e2c52f1582952686ee56aaedd7285874326102",
+        "commit:c20cb64b4b79468c641626e9b9d3957790f7a671",
+        "commit:dc2270aad84242da42f4342ac137e243ca181aa5",
+        "commit:f779b5320c6008e1c8b49bf7386fdfe76dea7a8a"
+      ],
+      "change_record_count": 10,
+      "merge_event_count": 3
+    },
+    {
+      "id": "capability:session-fts-storage-v2",
+      "record_class": "capability",
+      "capability": "Session FTS storage-v2 settlement",
+      "intent_name": "Make required session FTS storage state explicit and refuse unsafe serving until settlement is complete.",
+      "historical_commits": [
+        {
+          "sha": "00a2675a9270033325d53d7a3301a58f5f66d760",
+          "subject": "test(fts): pin storage-v2 refusal states (#31)"
+        },
+        {
+          "sha": "b86e4f526ec377f7f958dc21ddaac87238882f19",
+          "subject": "fix(fts): unify storage-v2 settlement predicate (#31)"
+        },
+        {
+          "sha": "2c907113fd2c50edde60425c561ab8ca25192b1b",
+          "subject": "test(fts): cover storage-v2 interruption/reopen + acceptance matrix (#31)"
+        },
+        {
+          "sha": "f887f44fa2d27c7ec4132fe70d337f7975fcde63",
+          "subject": "docs(research): record storage-v2 settlement implementation (#31)"
+        },
+        {
+          "sha": "180ae82a2d7ec34a099665d68719c8579986d693",
+          "subject": "test(fts): pin structural refusal branches (#31)"
+        },
+        {
+          "sha": "1d6d73f3bb8ffeb599799c05b6e853da1758b4db",
+          "subject": "refactor(fts): settle review-round findings (#31)"
+        },
+        {
+          "sha": "0fafc1dd7b58f15982ce2833de2bc8826a1e116f",
+          "subject": "test(fts): pin mixed-capability optimize availability (#31)"
+        },
+        {
+          "sha": "67d4f719d6b0717be024861ae2756fa49d6f1315",
+          "subject": "fix(fts): optimize-available sees any actionable blocker (#31)"
+        },
+        {
+          "sha": "0ff8583e91c838088fde6cb55ba0488cf5a0ee93",
+          "subject": "docs(research): fix settlement test count in validation note (#31)"
+        }
+      ],
+      "historical_issues": [
+        "PR #78",
+        "issue #31"
+      ],
+      "historical_prs": [
+        "PR #31",
+        "PR #78",
+        "issue #31"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "276d497764feb7d4a71f1424ed44b8958da63b16",
+          "subject": "Merge pull request #78 from Skywind5487/feat/31-storage-v2-settlement"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "One predicate defines required-index settlement; startup and foreground paths use it.",
+        "Incomplete or interrupted required settlement refuses serving; reopen/resume reaches an explicit terminal state.",
+        "Optional indexes do not silently become required blockers."
+      ],
+      "current_dev_survival": "Survives in hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_fts_storage_v2_settlement.py.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has no session six-index storage-v2 settlement state machine.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Which upstream storage contract is the port target?",
+        "Can refusal remain separate from six-index lifecycle?"
+      ],
+      "source_inventory_records": [
+        "pr:31",
+        "pr:78"
+      ],
+      "change_record_count": 9,
+      "merge_event_count": 1
+    },
+    {
+      "id": "capability:session-fts-trigram",
+      "record_class": "capability",
+      "capability": "Normalized session metadata trigram FTS",
+      "intent_name": "Provide normalized external-content trigram search for arbitrary infix session metadata with fail-closed namespace ownership.",
+      "historical_commits": [
+        {
+          "sha": "19e6e6223bb58a4a53c8c02c86a0127d34afaf5a",
+          "subject": "docs(research): map normalized session trigram FTS"
+        },
+        {
+          "sha": "37811327cdc65c85c4b0bd565b1cdb3a4590dd91",
+          "subject": "feat(title-fts5): add sessions_fts + sessions_fts_trigram FTS5 tables with CJK dispatch"
+        },
+        {
+          "sha": "48b04dae36d6577b06de0efc67ebe1eb1a479d4c",
+          "subject": "feat(fts): add normalized external-content session trigram index (#30)"
+        },
+        {
+          "sha": "6f82bcbb3c5f714148a17da47577e862493a55d6",
+          "subject": "test(fts): cover normalized session trigram end to end (#30)"
+        },
+        {
+          "sha": "0f29f1454ea2227229e4056d66ed09f749a06e46",
+          "subject": "docs(research): document normalized session trigram FTS implementation (#30)"
+        },
+        {
+          "sha": "dc2cd8cfaf9462316e0140a27a7f5edaf90f3fb3",
+          "subject": "fix(fts): clear unfulfillable trigram claim on tokenizer-less host + de-dup shared seams (#30)"
+        },
+        {
+          "sha": "252920f02442b68391fcafba35bef2c9567e9ab8",
+          "subject": "style(fts): consolidate session trigram ensure epilogue + spec-driven transition columns (#30)"
+        },
+        {
+          "sha": "4483194b81495dab9b3c4c282c08adad89e0f2d9",
+          "subject": "fix(fts): classify session trigram schema by exact logical columns + VIEW projection (#30)"
+        },
+        {
+          "sha": "bfa928d53da7c61814816c10f83fef75bfef7e43",
+          "subject": "fix(fts): require canonical source VIEW + FTS5 root for modern trigram identity (#30)"
+        },
+        {
+          "sha": "cc5261ce775c8db6a7099d411f16030d24e71f2f",
+          "subject": "fix(fts): classify legacy session trigram by DDL, never PRAGMA table_info (#30)"
+        },
+        {
+          "sha": "e33b533e1d2421fb18941463b6fe51752a8ad345",
+          "subject": "fix(fts): classify modern session trigram by DDL, never PRAGMA table_info (#30)"
+        },
+        {
+          "sha": "b5155410abbf04c1fc4bb433ae3f5e546f5bf426",
+          "subject": "fix(fts): gate trigram source VIEW ensure on source compatibility (#30)"
+        },
+        {
+          "sha": "9aad13bcad68a292f708fe30698405c2016b2626",
+          "subject": "fix(fts): classify same-name root VIEW as unknown, not absent (#30)"
+        },
+        {
+          "sha": "3172c9f4611cc2b872f2083829577cc73152f9dc",
+          "subject": "fix(fts): exact shadow allowlist + classify same-name root index as unknown (#30)"
+        },
+        {
+          "sha": "6467a30563fb1da2bd5c1f42dc7cd1f574697d31",
+          "subject": "fix(fts): hardening pass — literal-safe identity, trigger/shadow ownership, demotion CAS, stale lifecycle, serving gates, empty-claim, query cap (#30)"
+        },
+        {
+          "sha": "e1ef573d3feb4e89082e8ff5fe7c941dd3620a9c",
+          "subject": "fix(fts): harden session trigram transition namespaces (#30)"
+        },
+        {
+          "sha": "72388ff87f0baf99910edefab2b2fc2e00b40284",
+          "subject": "fix(fts): preserve session trigram claims across capability handoff (#30)"
+        },
+        {
+          "sha": "0c02b83d4d8702267481a5f196606e19e3d303cc",
+          "subject": "fix(fts): gate session trigram mutations on durable ownership (#30)"
+        },
+        {
+          "sha": "a9c1b2d11bab435cda80fcfc81fc223d210b4755",
+          "subject": "fix(fts): serve session trigram candidates from one snapshot (#30)"
+        },
+        {
+          "sha": "2142e2fa1b491ce904e0dbbbd2cc446863d0fe48",
+          "subject": "test(fts): drop fork-only legacy simple convergence tests (#30)"
+        },
+        {
+          "sha": "c7163001f23feb31f94fec1ebb3c41badaebdb97",
+          "subject": "refactor(fts): drop fork-only legacy simple demotion lane (#30)"
+        },
+        {
+          "sha": "6f534c8760a30a318ae0d874b7a6323f5f0337df",
+          "subject": "docs(fts): record scope correction and legacy lane removal (#30)"
+        },
+        {
+          "sha": "10e3419d10e938c979c701246457cbd6f9c10ad4",
+          "subject": "test(fts): drop round-11 CAS and shadow-preflight tests (#30)"
+        },
+        {
+          "sha": "69591fe659774a4e61a3f754211f5602e96a7381",
+          "subject": "fix(fts): quarantine healthy modern target on no-trigram runtime; drop unsupported hardening (#30)"
+        },
+        {
+          "sha": "7b513c6bf2f698f612fceb0c64de84c8c5e0ddea",
+          "subject": "docs(fts): record round-12 re-review and subtractive hardening removal (#30)"
+        },
+        {
+          "sha": "783d3fa59ae28010368368e3dafddc19750f9b55",
+          "subject": "test(recovery): pin session-trigram derived markers as generated meta (#79)"
+        },
+        {
+          "sha": "4aefa3abbbe4f9c3eba29988fa772e45d70000f9",
+          "subject": "fix(recovery): exclude session-trigram derived markers from recovered DB (#79)"
+        },
+        {
+          "sha": "d4c9a165c5abe6cf8c0503005b18e55de58e28cc",
+          "subject": "docs(research): record session-trigram recovery marker fix (#79)"
+        },
+        {
+          "sha": "f17ab58979753a9ee342d258595e8d076ef2f309",
+          "subject": "test(recovery): guard verifier detection of leftover session-trigram markers (#79)"
+        },
+        {
+          "sha": "ad0c45f0924349f6f0453d4941c3d76ad5258cdc",
+          "subject": "test(fts): pin modern session trigram and legacy-simple states"
+        }
+      ],
+      "historical_issues": [
+        "PR #79",
+        "issue #30"
+      ],
+      "historical_prs": [
+        "PR #30",
+        "PR #79",
+        "issue #30"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "919f4469e832bc2b38bba0ea5af26b842bf91acd",
+          "subject": "feat(fts): normalized external-content session trigram metadata index (#30)"
+        },
+        {
+          "sha": "4e5ad5c2230300d1ffae84b089ffc70e368c8a23",
+          "subject": "fix(recovery): exclude session-trigram derived markers from recovered DB (#79)"
+        },
+        {
+          "sha": "f18b3c90c2309ee7616010f99c1c927c9f05013f",
+          "subject": "Merge remote-tracking branch 'origin/dev' into fts/session-trigram-external-content"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "The external-content source normalizes title/display_name and keeps raw id searchable.",
+        "Serving requires complete trigger/namespace ownership; unknown same-name objects fail closed.",
+        "Recovery markers support resumable rebuild without treating a partial index as healthy."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_session_metadata_trigram_fts.py.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has no sessions_fts_trigram external-content index; generic message trigram is not equivalent.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Validate SQLite/tokenizer deployment constraints.",
+        "Keep #30 ownership separate from #27 orchestration."
+      ],
+      "source_inventory_records": [
+        "commit:19e6e6223bb58a4a53c8c02c86a0127d34afaf5a",
+        "commit:37811327cdc65c85c4b0bd565b1cdb3a4590dd91",
+        "pr:30",
+        "pr:79",
+        "commit:ad0c45f0924349f6f0453d4941c3d76ad5258cdc",
+        "commit:f18b3c90c2309ee7616010f99c1c927c9f05013f"
+      ],
+      "change_record_count": 30,
+      "merge_event_count": 3
+    },
+    {
+      "id": "capability:session-fts-unicode",
+      "record_class": "capability",
+      "capability": "Unicode session metadata FTS",
+      "intent_name": "Provide stable-row-id, resumable external-content Unicode search over session title, id, and display_name.",
+      "historical_commits": [
+        {
+          "sha": "2ac803bd949f0aba96c0d4d500edd2ad65aa3036",
+          "subject": "feat(session-search): port sessions FTS5 title index (unicode61 + cjk_unicode61) from dev"
+        },
+        {
+          "sha": "9b25b0c8bd7408eaf2398529b6a04ed1a068b892",
+          "subject": "docs: research #32 session row_id unicode FTS"
+        },
+        {
+          "sha": "a4ceb2521b8bb14e753e6f02242d0a29f6d57fb2",
+          "subject": "style(session-fts): drop duplicate @staticmethod (round-2 review)"
+        },
+        {
+          "sha": "c3f1abc5cc34f1a356740529c9f17dfc0f4157b0",
+          "subject": "fix: use _rowid_ (INT) instead of id (TEXT) for sessions_fts triggers and queries"
+        },
+        {
+          "sha": "e94f2630a50d7585f78cfc06365753c033113cb9",
+          "subject": "Session metadata FTS: stable row_id + resumable Unicode external-content index (#25) (#59)"
+        }
+      ],
+      "historical_issues": [
+        "PR #59",
+        "issue #25"
+      ],
+      "historical_prs": [
+        "PR #59",
+        "issue #25"
+      ],
+      "merge_provenance": [],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Stable sessions.row_id is retained across hidden rows and gaps.",
+        "External-content FTS indexes title, id, and display_name with resumable high-water backfill.",
+        "Backfill and triggers preserve delete correctness and never expose hidden sessions."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py, hermes_cli/session_recovery.py and tests/test_session_metadata_fts.py.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has messages_fts but no equivalent sessions_fts metadata index.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Confirm upstream migration and database-version policy."
+      ],
+      "source_inventory_records": [
+        "commit:2ac803bd949f0aba96c0d4d500edd2ad65aa3036",
+        "commit:9b25b0c8bd7408eaf2398529b6a04ed1a068b892",
+        "commit:a4ceb2521b8bb14e753e6f02242d0a29f6d57fb2",
+        "commit:c3f1abc5cc34f1a356740529c9f17dfc0f4157b0",
+        "pr:59"
+      ],
+      "change_record_count": 5,
+      "merge_event_count": 0
+    },
+    {
+      "id": "capability:session-search-context-hydration",
+      "record_class": "capability",
+      "capability": "Session search context hydration",
+      "intent_name": "Hydrate bounded surrounding context with a predictable lock scope while preserving result semantics.",
+      "historical_commits": [],
+      "supporting_historical_commits": [
+        {
+          "sha": "b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70",
+          "subject": "perf(search): batch context queries — chunked session_id batches (20/sql)",
+          "role": "behavioral overlay; benchmark bucket also contains query-shape validation"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "The commit remains in performance-validation for one-to-one runner accounting; the context/lock hunk is promoted by the behavioral audit.",
+      "behavioral_contracts": [
+        "Each search match receives only its bounded preceding, matching, and following message context.",
+        "Context rows are fetched in bounded session batches and the position index is built outside the database lock.",
+        "Decode failures degrade each match to an empty context rather than corrupting the result set."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py session message search and context preview tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has per-match context hydration with equivalent -1/0/+1 semantics, but not the fork's bounded batch and lock-scope policy.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Confirm the current upstream search module seam and whether the batch size should remain 20."
+      ],
+      "source_inventory_records": [
+        "behavior-overlay:commit:b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70"
+      ],
+      "change_record_count": 0,
+      "merge_event_count": 0
+    },
+    {
+      "id": "capability:session-search-lineage",
+      "record_class": "capability",
+      "capability": "Compression-lineage-aware session search",
+      "intent_name": "Resolve positive compression edges to a stable root with bounded, snapshot-aware search hydration and explicit truncation.",
+      "historical_commits": [
+        {
+          "sha": "1f5edc591353a0a65ec7aa2f02c6916fd67fd505",
+          "subject": "perf(state): narrow session listing before lineage hydration"
+        },
+        {
+          "sha": "2732c47e28fbf7aaea97bd8c5cf82045a4c34159",
+          "subject": "wip(session-search): move winner selection into SQL"
+        },
+        {
+          "sha": "2d2bad204ec644455ad1273f2934f388eb4111dd",
+          "subject": "fix(session-search): defer winner snippets"
+        },
+        {
+          "sha": "2e1b2e64d7a452f524f703a99d68b1b110b93d3e",
+          "subject": "test(search): drop stale generic-parent oracle import after #68 flip"
+        },
+        {
+          "sha": "2f12b03079cb7ae28acf666d16cfd748e5eaac74",
+          "subject": "feat(session-search): tool parity + truncation contract for #68"
+        },
+        {
+          "sha": "3de538d32a3c076929c1d7c173dd77e4055100f9",
+          "subject": "perf: reduce SELECT * in get_compression_lineage to 4 columns"
+        },
+        {
+          "sha": "42c421f68b6556757c17b4dc78756cf31babd239",
+          "subject": "fix(search): distinct-owner candidates + title-only K=1 snapshot contract (#68 review round-2)"
+        },
+        {
+          "sha": "46907bc8b55ba36ef73e0d96c10eccb9b28b0310",
+          "subject": "feat(search): compression-lineage resolver for #68 winner seam"
+        },
+        {
+          "sha": "55dc24391f92d71d9e293c7990089075f2ff49c9",
+          "subject": "refactor(search): drop title/current lineage-proof protocol per #68 review round-5"
+        },
+        {
+          "sha": "66eb2fad76abf150043ffd899fbdfbd328aba2d0",
+          "subject": "fix(search): title/current share in-snapshot roots + compacted anchor fallback (#68 review)"
+        },
+        {
+          "sha": "6fa6c557257175f26c1689799d352fdf948cb787",
+          "subject": "fix: replace SELECT * with specific columns in get_anchored_view and get_messages_around"
+        },
+        {
+          "sha": "8838d16060bb7610c6d7ad3697f384df3edb70c1",
+          "subject": "test(search): RED contracts for #68 compression-lineage resolver"
+        },
+        {
+          "sha": "9a1f477df5c8f25fd7ba4f57318e9f5ffcb2fc32",
+          "subject": "fix(session-search): ranked Top-N pre-limit for relevance sort"
+        },
+        {
+          "sha": "a13d012e5b8736928662f27269d9f2a7cf84f0af",
+          "subject": "docs(session-storage): document #68 compression-lineage resolution"
+        },
+        {
+          "sha": "a615feaea695123d1b3a832417a9a76554301af8",
+          "subject": "test(state): cover whole-store lineage visibility and pagination"
+        },
+        {
+          "sha": "b2710666a29eed6fc46f3b6ce23c72f4dc766181",
+          "subject": "test(search): rename title==current test, correct misleading scope claim (#68 review final)"
+        },
+        {
+          "sha": "c81ab321ec4bb3d5a33429b28907cd5836e41789",
+          "subject": "fix(search): displayable-anchor ranking + drop unproven title on B-hit (#68 review round-3)"
+        },
+        {
+          "sha": "d72f99eb1b897dd29a46692a310aa15b1bfd77e8",
+          "subject": "docs(research): index session-lineage research"
+        },
+        {
+          "sha": "dcd10233d32eee72df93ec7ff5f8f9efcec4eef6",
+          "subject": "fix(search): don't gate exact-title on unrun content snapshot (#68 review round-4)"
+        },
+        {
+          "sha": "f32b51764e43e48195d10e62d64b195a052d4968",
+          "subject": "test(search): #68 review acceptance — title parity, compacted anchor, real B boundaries, snapshot, 10k, internal-K"
+        }
+      ],
+      "historical_issues": [
+        "PR #72",
+        "issue #68"
+      ],
+      "historical_prs": [
+        "PR #72",
+        "issue #68"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "2f90c254d524d618b1c866a10bb519f2c1b6f5dc",
+          "subject": "Merge pull request #72 from Skywind5487/fix/68-compression-lineage-resolver"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Only positive compression edges are followed; branch/delegate markers and tool children do not become roots.",
+        "Missing/cyclic lineage fails closed; query-local memo/path compression is bounded by B=2000 successful uncached row fetches.",
+        "B exhaustion returns truncated/warning without poisoned memo; one snapshot, early-K and deferred hydration are preserved."
+      ],
+      "current_dev_survival": "Survives in hermes_state_search.py and session-search tools/tests, including bounded winner hydration.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has _lineage_root_id/basic lookup but not the stronger resolver, memo, B-boundary, or explicit truncation contract.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "SPLIT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Can the upstream model host the stronger resolver without storage changes?",
+        "Keep benchmarks non-normative."
+      ],
+      "source_inventory_records": [
+        "commit:1f5edc591353a0a65ec7aa2f02c6916fd67fd505",
+        "commit:2732c47e28fbf7aaea97bd8c5cf82045a4c34159",
+        "commit:2d2bad204ec644455ad1273f2934f388eb4111dd",
+        "commit:2e1b2e64d7a452f524f703a99d68b1b110b93d3e",
+        "commit:2f12b03079cb7ae28acf666d16cfd748e5eaac74",
+        "pr:72",
+        "commit:3de538d32a3c076929c1d7c173dd77e4055100f9",
+        "commit:42c421f68b6556757c17b4dc78756cf31babd239",
+        "commit:46907bc8b55ba36ef73e0d96c10eccb9b28b0310",
+        "commit:55dc24391f92d71d9e293c7990089075f2ff49c9",
+        "commit:66eb2fad76abf150043ffd899fbdfbd328aba2d0",
+        "commit:6fa6c557257175f26c1689799d352fdf948cb787",
+        "commit:8838d16060bb7610c6d7ad3697f384df3edb70c1",
+        "commit:9a1f477df5c8f25fd7ba4f57318e9f5ffcb2fc32",
+        "commit:a13d012e5b8736928662f27269d9f2a7cf84f0af",
+        "commit:a615feaea695123d1b3a832417a9a76554301af8",
+        "commit:b2710666a29eed6fc46f3b6ce23c72f4dc766181",
+        "commit:c81ab321ec4bb3d5a33429b28907cd5836e41789",
+        "commit:d72f99eb1b897dd29a46692a310aa15b1bfd77e8",
+        "commit:dcd10233d32eee72df93ec7ff5f8f9efcec4eef6",
+        "commit:f32b51764e43e48195d10e62d64b195a052d4968"
+      ],
+      "change_record_count": 20,
+      "merge_event_count": 1
+    },
+    {
+      "id": "capability:session-search-routing",
+      "record_class": "capability",
+      "capability": "Session metadata search routing",
+      "intent_name": "Route picker and resume candidates across Unicode, CJK, trigram, and bounded LIKE fallback while preserving visibility and lineage semantics.",
+      "historical_commits": [
+        {
+          "sha": "0990803323497a36761c9627a20ceb57be56d5a3",
+          "subject": "test(state): pin session metadata route and fallback contract"
+        },
+        {
+          "sha": "3ebb2592c141b232ecd0717adf32279afa6bee3f",
+          "subject": "test(api): cross-profile resume search + desktop stale-response ordering"
+        },
+        {
+          "sha": "3f4795a9fbc70c39cbfbe11ed93e66d36b91c01d",
+          "subject": "feat(api): route session metadata discovery through the common seam"
+        },
+        {
+          "sha": "5882274ff6c868c24f9d36f3796de08e5de8a245",
+          "subject": "refactor(state): add snapshot-aware metadata candidate router"
+        },
+        {
+          "sha": "b4efc640fab0517571bd05447cf2be2ace9cf3e1",
+          "subject": "feat(desktop): search the whole session store in the resume picker"
+        },
+        {
+          "sha": "b97d00e7319e5147d569519b6a34ef63c6635551",
+          "subject": "perf(search): benchmark routed session metadata candidates"
+        },
+        {
+          "sha": "ca4d3041a5e0b6d2b792cdf3c9f2689c9a18683e",
+          "subject": "fix(session-search): define ranked_candidates for LIKE route"
+        }
+      ],
+      "historical_issues": [
+        "issue #14"
+      ],
+      "historical_prs": [
+        "PR #14",
+        "issue #14"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "35c8564c9c0af3d75bcbdf1d793e7207e5528f06",
+          "subject": "feat(session): route session-metadata picker candidates through FTS (#14)"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Unicode, CJK, and infix queries select their intended index; LIKE is bounded fallback.",
+        "FTS narrows IDs before lineage hydration; only empty successful FTS triggers fallback.",
+        "Visibility, archive/pin/source filters, lineage, branch markers, whole-store scope, and limits remain correct."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py, hermes_state_search.py, web session/profile routers, desktop picker code and routing tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has session ID/title primitives but no equivalent metadata-index router.",
+      "status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Separate routing from index contracts and desktop/API seams.",
+        "Revalidate ranking against the post-fork upstream model."
+      ],
+      "source_inventory_records": [
+        "commit:0990803323497a36761c9627a20ceb57be56d5a3",
+        "pr:14",
+        "commit:3ebb2592c141b232ecd0717adf32279afa6bee3f",
+        "commit:3f4795a9fbc70c39cbfbe11ed93e66d36b91c01d",
+        "commit:5882274ff6c868c24f9d36f3796de08e5de8a245",
+        "commit:b4efc640fab0517571bd05447cf2be2ace9cf3e1",
+        "commit:b97d00e7319e5147d569519b6a34ef63c6635551",
+        "commit:ca4d3041a5e0b6d2b792cdf3c9f2689c9a18683e"
+      ],
+      "change_record_count": 7,
+      "merge_event_count": 1
+    },
+    {
+      "id": "capability:session-title-safety",
+      "record_class": "capability",
+      "capability": "Literal-safe numbered-title resolution",
+      "intent_name": "Resolve numbered session-title variants without SQL LIKE metacharacters or non-numeric # suffixes becoming variants.",
+      "historical_commits": [
+        {
+          "sha": "d18dadb5f3b517ec69f14428dc78e7af1a86a30e",
+          "subject": "test(session): pin literal-safe numbered-title resolution (#15)"
+        },
+        {
+          "sha": "faf96ef221ddfba2618abc8dae8368f7b82c1c2a",
+          "subject": "fix(session): literal-safe numbered-title escaping and #N suffix validation (#15)"
+        },
+        {
+          "sha": "69bee0838ae15936ae4beb13cdf5d6907c19c707",
+          "subject": "docs: record #38 numbered-title research note and design contract (#15)"
+        },
+        {
+          "sha": "17b0d2c9135d38728109592860677c4abbaddf4f",
+          "subject": "fix(session): unify #N grammar to ASCII digits; tidy escape_like placement (#15)"
+        }
+      ],
+      "historical_issues": [
+        "issue #15"
+      ],
+      "historical_prs": [
+        "PR #15",
+        "issue #15"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "984eff15df1fb749f00aece7fc24c43e9afcb7e8",
+          "subject": "Merge remote-tracking branch 'origin/dev' into fix/15-numbered-title-literal-safety"
+        },
+        {
+          "sha": "dcf8096413c7ee40fe0ab512ac86927fb2092df1",
+          "subject": "fix(session): literal-safe numbered-title escaping and #N suffix validation (#15)"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Escape SQL LIKE literals independently from Python literals.",
+        "Only strict ASCII #N suffixes are variants; %, _, \\, #, CJK, and literal titles stay exact and safe.",
+        "The public resolution API and root/current exclusion semantics remain unchanged."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py, hermes_state_common.py and title/metadata tests.",
+      "upstream_prior_art_current_implementation": "Frozen upstream escapes LIKE but does not enforce the fork's strict numeric suffix filter.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "SPLIT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Check callers that may depend on broader historical #% behavior."
+      ],
+      "source_inventory_records": [
+        "commit:984eff15df1fb749f00aece7fc24c43e9afcb7e8",
+        "pr:15"
+      ],
+      "change_record_count": 4,
+      "merge_event_count": 2
+    },
+    {
+      "id": "capability:sqlite-write-contention-policy",
+      "record_class": "capability",
+      "capability": "SQLite write contention backoff policy",
+      "intent_name": "Bound write contention with rollback-safe exponential backoff and a finite delay cap.",
+      "historical_commits": [],
+      "supporting_historical_commits": [
+        {
+          "sha": "cc2531fbc6df8fdb34fca0b096b798eb53f970dd",
+          "subject": "fix: exponential backoff, slow-write log, and Discord API delivery log",
+          "role": "behavioral overlay; same commit also contains diagnostics"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "The commit remains in its original incidental-hardening provenance bucket for one-to-one runner accounting; the retry hunk is promoted by the behavioral audit.",
+      "behavioral_contracts": [
+        "SQLite write contention retries roll back before retrying.",
+        "Retry delay uses a 20ms base with jitter, exponential growth, and a 2s cap.",
+        "Retry exhaustion and non-lock failures retain explicit error behavior."
+      ],
+      "current_dev_survival": "Survives in hermes_state.py _execute_write and write-contention tests/logging.",
+      "upstream_prior_art_current_implementation": "Frozen upstream has uniform 20-150ms retry jitter and slow-write diagnostics, not the fork's exponential 20ms-to-2s policy.",
+      "status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Revalidate attempt/deadline semantics when porting onto the current upstream writer."
+      ],
+      "source_inventory_records": [
+        "behavior-overlay:commit:cc2531fbc6df8fdb34fca0b096b798eb53f970dd"
+      ],
+      "change_record_count": 0,
+      "merge_event_count": 0
+    },
+    {
+      "id": "non-capability:incidental-hardening",
+      "record_class": "non_capability",
+      "capability": "Incidental hardening and maintenance",
+      "intent_name": "Account for isolated reliability/logging/cleanup changes without manufacturing a broader ontology.",
+      "historical_commits": [
+        {
+          "sha": "4270ea5b9a903d0dcf692db2365875ac5b3fe319",
+          "subject": "chore: ignore fts5_cjk Windows build artifact (.dll)"
+        },
+        {
+          "sha": "9f3056cb3a9642c39056af8409cc3198007e68a8",
+          "subject": "ignore agents"
+        },
+        {
+          "sha": "cc2531fbc6df8fdb34fca0b096b798eb53f970dd",
+          "subject": "fix: exponential backoff, slow-write log, and Discord API delivery log"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "The safety invariant remains visible in record subject/files while capability ownership is unresolved."
+      ],
+      "current_dev_survival": "Record-specific survival is visible in the frozen tree.",
+      "upstream_prior_art_current_implementation": "No equivalence claim is made without focused comparison.",
+      "status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "medium",
+      "unresolved_questions": [
+        "Promote only if a user-visible invariant and test boundary is identified."
+      ],
+      "source_inventory_records": [
+        "commit:4270ea5b9a903d0dcf692db2365875ac5b3fe319",
+        "commit:9f3056cb3a9642c39056af8409cc3198007e68a8",
+        "commit:cc2531fbc6df8fdb34fca0b096b798eb53f970dd"
+      ],
+      "change_record_count": 3,
+      "merge_event_count": 0,
+      "behavioral_overlays": [
+        "capability:sqlite-write-contention-policy"
+      ]
+    },
+    {
+      "id": "non-capability:integration-merge",
+      "record_class": "non_capability",
+      "capability": "Branch integration and merge bookkeeping",
+      "intent_name": "Account for merge events that combine classified work without claiming a new capability.",
+      "historical_commits": [],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [
+        {
+          "sha": "1602d06f5045d173ee31161b92e387de69ab821c",
+          "subject": "merge(session-search): ranked Top-N + late-snippet into dev"
+        },
+        {
+          "sha": "637ef2e193b6b2dada5d0b79173461fca03fbf20",
+          "subject": "Merge remote-tracking branch 'origin/dev' into fts/routed-session-metadata-candidates"
+        },
+        {
+          "sha": "9d6accc0f3de1e99c8c4fde24a8f5e3fcf5ef140",
+          "subject": "Merge remote-tracking branch 'origin/main' into dev"
+        },
+        {
+          "sha": "b66c149de0c8240e84ded1a2f983b8c42f7b984b",
+          "subject": "merge(main): absorb upstream main 91937a6dc into dev — keep session-search fix chain"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "A merge event is not silently omitted merely because it has no patch-id or changed-file payload."
+      ],
+      "current_dev_survival": "Integrated behavior is represented by capability records on either side.",
+      "upstream_prior_art_current_implementation": "Merge topology is provenance, not semantic upstream evidence.",
+      "status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Split conflict resolution into a capability if it changes behavior."
+      ],
+      "source_inventory_records": [
+        "commit:1602d06f5045d173ee31161b92e387de69ab821c",
+        "commit:637ef2e193b6b2dada5d0b79173461fca03fbf20",
+        "commit:9d6accc0f3de1e99c8c4fde24a8f5e3fcf5ef140",
+        "commit:b66c149de0c8240e84ded1a2f983b8c42f7b984b"
+      ],
+      "change_record_count": 0,
+      "merge_event_count": 4
+    },
+    {
+      "id": "non-capability:performance-validation",
+      "record_class": "non_capability",
+      "capability": "Performance validation record",
+      "intent_name": "Account for benchmarks and query-shape optimizations without upgrading measurements into semantic boundaries.",
+      "historical_commits": [
+        {
+          "sha": "7b66bbf8e2af4fc27959f58b5ca70cfaba0346d0",
+          "subject": "perf(search): benchmark cold-open + fallback-invariant self-check"
+        },
+        {
+          "sha": "b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70",
+          "subject": "perf(search): batch context queries — chunked session_id batches (20/sql)"
+        }
+      ],
+      "historical_issues": [],
+      "historical_prs": [],
+      "merge_provenance": [
+        {
+          "sha": "a34da2c31ca60f9b5280558c514a3a1880035036",
+          "subject": "Merge branch 'fix/session-search-perf' of /home/skywind5487/hermes_worktrees/fix/session-search-perf into dev"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "A benchmark supports a decision but does not prove equivalence or impose an unreviewed target."
+      ],
+      "current_dev_survival": "Benchmark and query-shape changes remain visible in history.",
+      "upstream_prior_art_current_implementation": "No upstream equivalence is inferred from local measurements.",
+      "status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Re-run only benchmarks needed for a concrete port candidate."
+      ],
+      "source_inventory_records": [
+        "commit:7b66bbf8e2af4fc27959f58b5ca70cfaba0346d0",
+        "commit:a34da2c31ca60f9b5280558c514a3a1880035036",
+        "commit:b879cbd332b8ac66ada6aaebfc5a9e61ae6cbe70"
+      ],
+      "change_record_count": 2,
+      "merge_event_count": 1,
+      "behavioral_overlays": [
+        "capability:session-search-context-hydration"
+      ]
+    },
+    {
+      "id": "non-capability:production-evidence",
+      "record_class": "non_capability",
+      "capability": "Production recovery/build evidence",
+      "intent_name": "Account for recovery runbooks, production DB build/freeze, and runtime attestation without treating them as runtime capabilities.",
+      "historical_commits": [
+        {
+          "sha": "0460c1944c8c7c40c6d9d7b7ebdb9e036aa49d57",
+          "subject": "docs(research): record #22 production-ready state.db build and freeze"
+        },
+        {
+          "sha": "311bf7d6d28b204f0aa977ddcd05d44141d2d4ba",
+          "subject": "docs(recovery): add production runtime repair runbook"
+        },
+        {
+          "sha": "4292711d0a7cdcef9ef20399b1da6d4b1c87d9ba",
+          "subject": "docs(research): correct #22 path/router evidence with executing-query validation"
+        },
+        {
+          "sha": "8b085795df0359adbf3c81315f888bc7041fb044",
+          "subject": "docs(research): record #22 redo with SQLite 3.51.3 + CJK + fuzz"
+        },
+        {
+          "sha": "cea5282a181d23af471f4467f449fd9bfc022ca5",
+          "subject": "docs(recovery): attest production gateway runtime surface"
+        }
+      ],
+      "historical_issues": [
+        "PR #82",
+        "issue #21",
+        "issue #22",
+        "issue #41"
+      ],
+      "historical_prs": [
+        "PR #82",
+        "issue #21",
+        "issue #22",
+        "issue #41"
+      ],
+      "merge_provenance": [
+        {
+          "sha": "bee13fc085079d78d0334722ad4c37a1144e3102",
+          "subject": "Merge pull request #82 from Skywind5487/feat/22-production-ready-state-db-execution"
+        }
+      ],
+      "merge_provenance_note": "Explicitly accounted in the source inventory.",
+      "behavioral_contracts": [
+        "Operational records remain durable evidence and are not mistaken for code-level equivalence."
+      ],
+      "current_dev_survival": "Survives as docs/research and research/recovery artifacts.",
+      "upstream_prior_art_current_implementation": "No code-level equivalence is claimed from operational documents.",
+      "status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "unresolved_questions": [
+        "Which recovery procedures remain required after a future port?"
+      ],
+      "source_inventory_records": [
+        "commit:0460c1944c8c7c40c6d9d7b7ebdb9e036aa49d57",
+        "commit:311bf7d6d28b204f0aa977ddcd05d44141d2d4ba",
+        "commit:4292711d0a7cdcef9ef20399b1da6d4b1c87d9ba",
+        "commit:8b085795df0359adbf3c81315f888bc7041fb044",
+        "pr:82",
+        "commit:cea5282a181d23af471f4467f449fd9bfc022ca5"
+      ],
+      "change_record_count": 5,
+      "merge_event_count": 1
+    }
+  ],
+  "phase_2_boundaries": [
+    "Port memory-trim policy (RSS low-water threshold, independent GC cooldown, cheap malloc_trim cadence) as a runtime behavior slice.",
+    "Keep memory-trim diagnostics (GC/trim attribution, fragmentation, VmSwap) separate from policy and best-effort.",
+    "Port session metadata FTS base, CJK, trigram, lifecycle, and storage-v2 as separate slices with explicit dependency ordering.",
+    "Port session search routing only after index contracts and the lineage resolver are independently validated.",
+    "Evaluate headroom output compression and CCR retrieval as separate optional plugin slices.",
+    "Port configurable reasoning display and request transformation after upstream hook/config ordering is specified.",
+    "Port compression session-boundary no-op semantics separately from lifecycle telemetry.",
+    "Port SQLite write-contention backoff separately from incidental diagnostics.",
+    "Port session-search context hydration/lock scope separately from benchmark evidence."
+  ]
+}
