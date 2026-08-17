@@ -1,0 +1,1688 @@
+{
+  "schema_version": 1,
+  "phase": "Phase 1.5 capability composition / feature-line synthesis",
+  "inputs": {
+    "phase1_manifest_head": "f81cd921a89516d855b5b69906ce99e6351bc741",
+    "phase1_manifest_paths": [
+      "artifacts/fork-archaeology-issue-100/capability-manifest.json",
+      "artifacts/fork-archaeology-issue-100/capability-manifest.md"
+    ],
+    "phase1_behavioral_audit_paths": [
+      "artifacts/fork-archaeology-issue-100/behavioral-coverage-audit.json",
+      "artifacts/fork-archaeology-issue-100/behavioral-coverage-audit.md"
+    ],
+    "current_fork_reconstruction_base": "fa5ed679cc6559c619038f327e6276f4b7e8d735",
+    "current_fork_reconstruction_base_ref": "dev",
+    "current_upstream_main_sha": "56526bc0d36522ab7a87ee0056f70e3847d2f0e6",
+    "frozen_phase1_refs": {
+      "fork_ref": "35c8564c9c0af3d75bcbdf1d793e7207e5528f06",
+      "upstream_ref": "460d345642ee3d143a3e461abe39fd42b86a7e54",
+      "merge_base": "91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53"
+    }
+  },
+  "authority": {
+    "phase1_preservation_rule": "Capability identity, contract clauses, provenance, accepted DROP evidence, and explicit non-capability records are preserved; composition does not silently delete or merge clauses.",
+    "current_upstream_rule": "Targeted current-upstream evidence informs seams and ownership; discovered drift is recorded, not silently compensated.",
+    "final_gate": "No REVIEW_BLOCKED or unresolved composition blocker is accepted in the final plan."
+  },
+  "relationship_types": {
+    "REQUIRES": "hard semantic/runtime dependency",
+    "EXTENDS": "optional enhancement with safe base degradation",
+    "SHARES_SUBSTRATE": "implementation overlap without semantic dependency",
+    "ORDER_AFTER": "reconstruction ordering only, not runtime dependency"
+  },
+  "feature_families": [
+    {
+      "id": "family:session-metadata-search",
+      "line_ids": [
+        "line:session-metadata-search-core",
+        "line:session-metadata-search-cjk",
+        "line:session-metadata-search-trigram",
+        "line:session-metadata-search-routing"
+      ]
+    },
+    {
+      "id": "family:session-content-search",
+      "line_ids": [
+        "line:session-search-lineage",
+        "line:session-search-context-hydration"
+      ]
+    },
+    {
+      "id": "family:session-safety",
+      "line_ids": [
+        "line:session-title-safety"
+      ]
+    },
+    {
+      "id": "family:headroom",
+      "line_ids": [
+        "line:headroom-compression",
+        "line:headroom-retrieval"
+      ]
+    },
+    {
+      "id": "family:memory-runtime",
+      "line_ids": [
+        "line:memory-trim-policy",
+        "line:memory-trim-diagnostics"
+      ]
+    },
+    {
+      "id": "family:compression-lifecycle",
+      "line_ids": [
+        "line:compression-session-boundary"
+      ]
+    },
+    {
+      "id": "family:runtime-observability",
+      "line_ids": [
+        "line:runtime-lifecycle-observability"
+      ]
+    },
+    {
+      "id": "family:runtime-reliability",
+      "line_ids": [
+        "line:sqlite-write-contention-policy"
+      ]
+    },
+    {
+      "id": "family:browser-runtime",
+      "line_ids": [
+        "line:browser-timeout-cleanup"
+      ]
+    },
+    {
+      "id": "family:display-and-request",
+      "line_ids": [
+        "line:configurable-reasoning-display",
+        "line:request-transform-hook"
+      ]
+    }
+  ],
+  "feature_lines": [
+    {
+      "id": "line:session-metadata-search-core",
+      "name": "Session metadata search core",
+      "family": "session-metadata-search",
+      "purpose": "Provide a valid, settled, Unicode-tokenized metadata-search substrate with durable schema/index lifecycle behavior.",
+      "role": "shared_substrate",
+      "owns": [
+        "capability:session-fts-storage-v2",
+        "capability:session-fts-lifecycle",
+        "capability:session-fts-unicode"
+      ],
+      "upstream_seam": "hermes_state.py + hermes_state_search.py + hermes_state_schema.py at current upstream main; current upstream has session storage/search primitives but not the fork's settled six-index lifecycle.",
+      "strategy": "port",
+      "acceptance": [
+        "A fresh temporary HERMES_HOME can create, settle, rebuild, and query the core metadata indexes.",
+        "Unicode-tokenized metadata queries preserve visibility, archive/pin/source filters, ranking, limits, and safe fallback behavior.",
+        "Schema refusal/recovery states are explicit and restart-safe."
+      ],
+      "landing_state": "Metadata search is usable with the Unicode core only; optional CJK/trigram and routing lines are absent and must degrade to existing fallback behavior.",
+      "evidence_gaps": [
+        "Refresh exact schema/index seam immediately before Phase 2 implementation."
+      ],
+      "rationale": "Storage-v2 and lifecycle settlement have no coherent accepted state when separated: an index variant without durable settlement is not a usable substrate. Unicode is the baseline tokenizer contract for the core."
+    },
+    {
+      "id": "line:session-metadata-search-cjk",
+      "name": "CJK metadata search extension",
+      "family": "session-metadata-search",
+      "purpose": "Add CJK-aware metadata search without making non-CJK installations depend on the optional tokenizer/index.",
+      "role": "optional_extension",
+      "owns": [
+        "capability:session-fts-cjk"
+      ],
+      "upstream_seam": "hermes_state_search.py CJK route and CJK FTS schema at current upstream main.",
+      "strategy": "port",
+      "acceptance": [
+        "CJK queries select the CJK route when the index is available.",
+        "Missing/unhealthy CJK support degrades to the documented fallback without breaking Unicode metadata search."
+      ],
+      "landing_state": "Core metadata search remains valid when this extension is not installed or its index is unavailable.",
+      "evidence_gaps": [
+        "Confirm native/CJK build availability on supported deployment targets."
+      ],
+      "rationale": "CJK is independently optional and has a safe fallback; it must not block the core line."
+    },
+    {
+      "id": "line:session-metadata-search-trigram",
+      "name": "Trigram metadata search extension",
+      "family": "session-metadata-search",
+      "purpose": "Add infix/trigram metadata search as an optional index variant with bounded fallback semantics.",
+      "role": "optional_extension",
+      "owns": [
+        "capability:session-fts-trigram"
+      ],
+      "upstream_seam": "hermes_state_search.py trigram route/schema and rebuild state at current upstream main.",
+      "strategy": "port",
+      "acceptance": [
+        "Infix queries route to trigram candidates when available.",
+        "Trigram rebuild failure or absence leaves the core route and bounded LIKE fallback correct."
+      ],
+      "landing_state": "Core metadata search remains valid without trigram indexing.",
+      "evidence_gaps": [
+        "Recheck trigram index rebuild high-water behavior against current upstream schema."
+      ],
+      "rationale": "Trigram is an independently deployable search enhancement, not a prerequisite for metadata search correctness."
+    },
+    {
+      "id": "line:session-metadata-search-routing",
+      "name": "Session metadata search routing",
+      "family": "session-metadata-search",
+      "purpose": "Select the appropriate metadata-search route and preserve ranking, visibility, lineage, and fallback invariants across available variants.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:session-search-routing"
+      ],
+      "upstream_seam": "hermes_state.py/hermes_state_search.py metadata candidate router and picker/API callers at current upstream main.",
+      "strategy": "reimplement",
+      "acceptance": [
+        "Token, Unicode, CJK, trigram, and infix queries select the intended route when its prerequisite is healthy.",
+        "Only empty successful FTS routes fall back; stale responses, visibility filters, lineage, and limits remain correct."
+      ],
+      "landing_state": "Routing is accepted against the core route; optional index variants remain absent or are treated as unavailable.",
+      "evidence_gaps": [
+        "Current upstream has a different search seam; perform a targeted API/caller comparison before implementation."
+      ],
+      "rationale": "Routing consumes the core substrate but is a separate acceptance boundary because it coordinates multiple optional variants and public picker/API behavior."
+    },
+    {
+      "id": "line:session-title-safety",
+      "name": "Literal-safe session title resolution",
+      "family": "session-safety",
+      "purpose": "Keep numbered-title resolution literal-safe and strict without coupling it to FTS index availability.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:session-title-safety"
+      ],
+      "upstream_seam": "hermes_state.py title resolution/LIKE escaping at current upstream main.",
+      "strategy": "port",
+      "acceptance": [
+        "LIKE metacharacters remain literal and only strict ASCII #N suffixes form numbered variants.",
+        "Title resolution works with or without optional FTS extensions."
+      ],
+      "landing_state": "Title safety is accepted independently; metadata routing can use the shared session store without importing this line's grammar.",
+      "evidence_gaps": [
+        "Validate current upstream callers that may depend on broader historical #% behavior."
+      ],
+      "rationale": "The contract is search-adjacent but independently testable and does not require FTS routing."
+    },
+    {
+      "id": "line:session-search-lineage",
+      "name": "Compression-aware session lineage search",
+      "family": "session-content-search",
+      "purpose": "Preserve lineage, reset boundaries, visibility, and resume semantics across compressed session segments.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:session-search-lineage"
+      ],
+      "upstream_seam": "hermes_state.py lineage/session resume methods and agent/conversation_compression.py boundary integration at current upstream main.",
+      "strategy": "split",
+      "acceptance": [
+        "Compressed parents, children, resets, and branch markers resolve to the correct visible lineage tip.",
+        "Archived/compacted history remains discoverable without reintroducing reset or delegate branches."
+      ],
+      "landing_state": "Lineage behavior is valid without metadata FTS routing or context preview extensions.",
+      "evidence_gaps": [
+        "Separate upstream-owned lineage behavior from fork residual clauses before Phase 2."
+      ],
+      "rationale": "Lineage is a session-state contract, not a metadata-index dependency. It shares session storage with search but has its own acceptance seam."
+    },
+    {
+      "id": "line:session-search-context-hydration",
+      "name": "Session search context hydration",
+      "family": "session-content-search",
+      "purpose": "Return bounded surrounding message context with explicit lock scope and safe decode fallback.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:session-search-context-hydration"
+      ],
+      "upstream_seam": "hermes_state.py message-search result projection at current upstream main; current upstream has per-match hydration but not the fork's batch/lock policy.",
+      "strategy": "port",
+      "acceptance": [
+        "Every match receives only its preceding/matching/following context window.",
+        "Batch hydration is bounded and indexing/decoding outside the lock does not change result semantics.",
+        "A decode/query failure degrades the affected context to empty without losing the match."
+      ],
+      "landing_state": "Search results remain valid with empty context previews; no metadata FTS or lineage feature is required at runtime by this line.",
+      "evidence_gaps": [
+        "Confirm the current upstream search projection seam and retained batch size."
+      ],
+      "rationale": "This is a distinct observable query/lock behavior; file overlap and the phrase session search do not establish a hard dependency on metadata routing or lineage."
+    },
+    {
+      "id": "line:headroom-compression",
+      "name": "Headroom compression substrate",
+      "family": "headroom",
+      "purpose": "Compress oversized context/tool payloads with bounded, metadata-safe output and explicit degradation.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:headroom-compression"
+      ],
+      "upstream_seam": "plugins/headroom and context/plugin registration seam at current upstream main; no equivalent upstream implementation was found in Phase 1.",
+      "strategy": "port",
+      "acceptance": [
+        "Configured thresholds activate compression without expanding tool metadata.",
+        "Compression failures preserve usable content and emit the required warning contract.",
+        "Plugin registration/schema remains valid when active."
+      ],
+      "landing_state": "Compression works without retrieval; compressed output remains usable even when no retrieval tool is available.",
+      "evidence_gaps": [
+        "Targeted current-upstream context-engine hook comparison."
+      ],
+      "rationale": "Compression is the independently useful base substrate; retrieval is an extension with a stricter dependency."
+    },
+    {
+      "id": "line:headroom-retrieval",
+      "name": "Headroom compressed-context retrieval",
+      "family": "headroom",
+      "purpose": "Expose bounded retrieval of compressed context only when compression has produced retrievable context.",
+      "role": "optional_extension",
+      "owns": [
+        "capability:headroom-retrieval"
+      ],
+      "upstream_seam": "plugins/headroom retrieval tool registration and auto-enable path at current upstream main.",
+      "strategy": "port",
+      "acceptance": [
+        "Retrieval schema is stable and bounded.",
+        "The tool is enabled only with active compression and fails explicitly if registration/context is unavailable."
+      ],
+      "landing_state": "Compression remains correct and useful with retrieval disabled or unavailable.",
+      "evidence_gaps": [
+        "Decide whether retrieval remains plugin-owned or maps to a future generic context API."
+      ],
+      "rationale": "Retrieval has no meaningful source context without compression, but compression has a complete acceptance state without retrieval."
+    },
+    {
+      "id": "line:memory-trim-policy",
+      "name": "Memory trim policy",
+      "family": "memory-runtime",
+      "purpose": "Avoid low-value and expensive heap work while preserving cheap malloc_trim cadence.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:memory-trim-policy"
+      ],
+      "upstream_seam": "hermes_cli/mem_trim.py and housekeeping configuration at current upstream main.",
+      "strategy": "port",
+      "acceptance": [
+        "RSS below threshold skips expensive work.",
+        "GC obeys its independent cooldown while malloc_trim remains eligible.",
+        "Invalid/force configuration behavior remains safe."
+      ],
+      "landing_state": "Memory recovery policy is valid with diagnostics absent or best-effort disabled.",
+      "evidence_gaps": [
+        "Confirm current upstream housekeeping caller/config naming."
+      ],
+      "rationale": "Policy changes runtime scheduling and has an independent operational acceptance seam."
+    },
+    {
+      "id": "line:memory-trim-diagnostics",
+      "name": "Memory trim diagnostics",
+      "family": "memory-runtime",
+      "purpose": "Attribute trim cost and pressure without becoming a prerequisite for recovery.",
+      "role": "optional_extension",
+      "owns": [
+        "capability:memory-trim-diagnostics"
+      ],
+      "upstream_seam": "hermes_cli/mem_trim.py diagnostic collection at current upstream main; upstream has basic RSS logging but not fork attribution fields.",
+      "strategy": "port",
+      "acceptance": [
+        "GC/trim timing, fragmentation, and VmSwap are best-effort diagnostics.",
+        "Diagnostic failure never blocks the policy line's recovery behavior."
+      ],
+      "landing_state": "Policy remains correct when malloc_info/VmSwap diagnostics are unavailable.",
+      "evidence_gaps": [
+        "Confirm Linux/glibc-only fields and long-term stable event schema."
+      ],
+      "rationale": "Diagnostics are optional and share mem_trim.py with policy, but their failure must not invalidate policy acceptance."
+    },
+    {
+      "id": "line:compression-session-boundary",
+      "name": "Compression session-boundary semantics",
+      "family": "compression-lifecycle",
+      "purpose": "Prevent compressor-reported no-op output from creating a false session rotation/rewrite.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:compression-session-boundary"
+      ],
+      "upstream_seam": "agent/conversation_compression.py no-progress/session rotation path at current upstream main.",
+      "strategy": "split",
+      "acceptance": [
+        "A compressor status noop does not rotate or rewrite the session, including newly allocated equal output.",
+        "Locks and cached prompt state are released/preserved safely on the no-op path."
+      ],
+      "landing_state": "Compression boundary semantics are valid without lineage search; lineage remains a separate session-state line.",
+      "evidence_gaps": [
+        "Confirm the canonical third-party compressor status field."
+      ],
+      "rationale": "Both compression and lineage mention boundaries, but this line owns the local compression transition and does not require lineage search implementation."
+    },
+    {
+      "id": "line:runtime-lifecycle-observability",
+      "name": "Runtime lifecycle observability",
+      "family": "runtime-observability",
+      "purpose": "Emit structured lifecycle, tool, stream, SQLite, and delivery telemetry at diagnosable execution boundaries.",
+      "role": "optional_extension",
+      "owns": [
+        "capability:lifecycle-sqlite-telemetry"
+      ],
+      "upstream_seam": "lifecycle_telemetry.py, sqlite_native_telemetry.py, turn_context.py, and gateway event seams; no matching current-upstream module was found by targeted search.",
+      "strategy": "reimplement",
+      "acceptance": [
+        "Stable event contracts are emitted at selected lifecycle boundaries.",
+        "Telemetry failures cannot change the underlying lifecycle or SQLite result.",
+        "Sensitive payloads remain excluded/redacted by contract."
+      ],
+      "landing_state": "All runtime capabilities remain correct with telemetry disabled; the line can be accepted through event contract tests alone.",
+      "evidence_gaps": [
+        "Finalize the stable event subset and sink/redaction contract before Phase 2."
+      ],
+      "rationale": "Phase 1 NEEDS_REVIEW is resolved here as an independently testable optional line rather than silently attached to every runtime feature."
+    },
+    {
+      "id": "line:sqlite-write-contention-policy",
+      "name": "SQLite write contention policy",
+      "family": "runtime-reliability",
+      "purpose": "Bound SQLite write contention with rollback-safe exponential retry behavior.",
+      "role": "shared_substrate",
+      "owns": [
+        "capability:sqlite-write-contention-policy"
+      ],
+      "upstream_seam": "hermes_state.py _execute_write at current upstream main; upstream retains uniform retry jitter rather than the fork exponential policy.",
+      "strategy": "port",
+      "acceptance": [
+        "Lock contention rolls back before retry.",
+        "Delay uses a 20ms base, jitter, exponential growth, and a 2s cap.",
+        "Retry exhaustion and non-lock failures remain explicit."
+      ],
+      "landing_state": "SQLite writes remain correct for all callers; observability may be absent and does not gate retry behavior.",
+      "evidence_gaps": [
+        "Revalidate deadline/attempt semantics against current upstream writer."
+      ],
+      "rationale": "The policy is reusable substrate with an independent timing/rollback contract, not incidental logging."
+    },
+    {
+      "id": "line:browser-timeout-cleanup",
+      "name": "Browser timeout cleanup",
+      "family": "browser-runtime",
+      "purpose": "Make timeout cleanup configuration-gated, crash-resilient, and state-safe.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:browser-timeout-cleanup"
+      ],
+      "upstream_seam": "tools/browser_tool.py daemon timeout cleanup at current upstream main.",
+      "strategy": "port",
+      "acceptance": [
+        "Timeout clears in-memory state through the finally path.",
+        "Daemon termination is opt-in and cleanup failures are contained."
+      ],
+      "landing_state": "Browser timeout behavior is independently valid without any session search/runtime observability line.",
+      "evidence_gaps": [
+        "Check whether current upstream orphan reaping supersedes the toggle."
+      ],
+      "rationale": "No shared acceptance seam or runtime dependency exists with the other Phase-1 capabilities."
+    },
+    {
+      "id": "line:configurable-reasoning-display",
+      "name": "Configurable reasoning display",
+      "family": "display-and-request",
+      "purpose": "Expose a safe configurable reasoning display limit while preserving fence escaping.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:configurable-reasoning-display"
+      ],
+      "upstream_seam": "cli.py/config parsing and gateway display at current upstream main.",
+      "strategy": "port",
+      "acceptance": [
+        "Configured line limit controls display truncation.",
+        "Invalid/absent config falls back safely and escaping remains applied."
+      ],
+      "landing_state": "Display behavior is independently valid without request transformation or telemetry.",
+      "evidence_gaps": [
+        "Confirm current upstream config ordering and display hook."
+      ],
+      "rationale": "A stable user-facing display contract exists without a dependency on adjacent request behavior."
+    },
+    {
+      "id": "line:request-transform-hook",
+      "name": "Request transformation hook",
+      "family": "display-and-request",
+      "purpose": "Preserve the fork's explicit request transformation seam and its safe ordering contract.",
+      "role": "vertical_feature",
+      "owns": [
+        "capability:request-transform-hook"
+      ],
+      "upstream_seam": "Current upstream request/model-call assembly hook; targeted seam comparison required before implementation.",
+      "strategy": "port",
+      "acceptance": [
+        "Transformation runs at the documented request boundary.",
+        "Disabled/missing hook leaves the original request unchanged and failures are explicit."
+      ],
+      "landing_state": "Request assembly remains valid without configurable reasoning display.",
+      "evidence_gaps": [
+        "Pin exact current upstream hook ordering and provider coverage."
+      ],
+      "rationale": "Shared vicinity in request/display code is not a semantic dependency."
+    }
+  ],
+  "merge_units": [
+    {
+      "id": "repair:session-search",
+      "name": "Session Search reconstruction",
+      "kind": "repair",
+      "purpose": "Reconstruct the complete session-search subsystem as one maintainer-facing merge boundary.",
+      "component_line_ids": [
+        "line:session-metadata-search-core",
+        "line:session-metadata-search-cjk",
+        "line:session-metadata-search-trigram",
+        "line:session-metadata-search-routing",
+        "line:session-search-lineage",
+        "line:session-search-context-hydration",
+        "line:session-title-safety"
+      ],
+      "acceptance": [
+        "Metadata, content, lineage, optional index variants, hydration, and title-resolution behavior pass together through the public session-search contract.",
+        "Core/index correctness is independently attributable to its component line while bundle-level tests verify route selection, visibility, fallback, lineage, and bounded context end to end.",
+        "The bundle can be merged as one coherent session-search repair without requiring every optional component to become a separate long-lived branch."
+      ],
+      "landing_state": "Session Search is either accepted as a complete repair unit or remains explicitly incomplete; component lines are internal work packages and commit boundaries.",
+      "rationale": "These components answer one maintainer-facing completion claim: Hermes session search is fixed. The feature families remain taxonomy only; this unit intentionally crosses metadata-search, content-search, and safety families."
+    },
+    {
+      "id": "repair:memory-runtime",
+      "name": "Memory runtime reconstruction",
+      "kind": "repair",
+      "purpose": "Restore memory housekeeping policy and its diagnostics as one operational recovery repair.",
+      "component_line_ids": [
+        "line:memory-trim-policy",
+        "line:memory-trim-diagnostics"
+      ],
+      "acceptance": [
+        "Low-water and GC-cooldown policy is correct while malloc_trim remains eligible.",
+        "Timing, fragmentation, and VmSwap diagnostics are best effort and cannot block recovery."
+      ],
+      "landing_state": "Memory runtime is merged as one repair; diagnostics may degrade internally but policy behavior remains covered.",
+      "rationale": "Policy and diagnostics are separate implementation concerns but one maintainer-facing memory-recovery outcome."
+    },
+    {
+      "id": "repair:headroom-context",
+      "name": "Headroom context reconstruction",
+      "kind": "repair",
+      "purpose": "Restore the complete Headroom context feature, including compression and retrieval.",
+      "component_line_ids": [
+        "line:headroom-compression",
+        "line:headroom-retrieval"
+      ],
+      "acceptance": [
+        "Oversized allowlisted tool results compress with bounded, metadata-safe output.",
+        "Retrieval handles are produced and bounded retrieval succeeds when compression has stored context; unavailable retrieval degrades explicitly."
+      ],
+      "landing_state": "Headroom context is merged as one optional subsystem; compression remains useful if retrieval is unavailable.",
+      "rationale": "Compression and retrieval retain their internal dependency, but the maintainer-facing feature is the complete Headroom context subsystem."
+    },
+    {
+      "id": "repair:compression-lifecycle",
+      "name": "Compression lifecycle reconstruction",
+      "kind": "repair",
+      "purpose": "Repair compressor no-op and session-boundary transition semantics.",
+      "component_line_ids": [
+        "line:compression-session-boundary"
+      ],
+      "acceptance": [
+        "Compressor no-op status never causes false session rotation or rewrite, including equal newly allocated output."
+      ],
+      "landing_state": "Compression lifecycle boundary behavior is independently mergeable.",
+      "rationale": "This is already a complete, narrowly scoped lifecycle repair."
+    },
+    {
+      "id": "repair:sqlite-reliability",
+      "name": "SQLite reliability reconstruction",
+      "kind": "repair",
+      "purpose": "Repair rollback-safe SQLite write contention handling.",
+      "component_line_ids": [
+        "line:sqlite-write-contention-policy"
+      ],
+      "acceptance": [
+        "Lock contention retries roll back first, use bounded exponential backoff, and preserve explicit exhaustion/non-lock errors."
+      ],
+      "landing_state": "SQLite write reliability is independently mergeable.",
+      "rationale": "The policy has one clear runtime contract and one maintainer-facing completion claim."
+    },
+    {
+      "id": "feature:runtime-observability",
+      "name": "Runtime observability subsystem",
+      "kind": "feature",
+      "purpose": "Provide optional structured lifecycle, tool, stream, SQLite, and delivery telemetry.",
+      "component_line_ids": [
+        "line:runtime-lifecycle-observability"
+      ],
+      "acceptance": [
+        "The stable event subset, sink, and redaction contract are finalized and tested.",
+        "Telemetry failure cannot change the observed runtime result."
+      ],
+      "landing_state": "Optional observability is merged independently after its Phase-2 preflight resolves event and sink ownership.",
+      "rationale": "This is a complete optional subsystem rather than a bug repair, and its remaining preflight is explicit."
+    },
+    {
+      "id": "repair:browser-runtime",
+      "name": "Browser runtime reconstruction",
+      "kind": "repair",
+      "purpose": "Repair browser timeout cleanup and bounded shutdown behavior.",
+      "component_line_ids": [
+        "line:browser-timeout-cleanup"
+      ],
+      "acceptance": [
+        "Browser timeout paths clean up owned resources without masking the original failure."
+      ],
+      "landing_state": "Browser timeout cleanup is independently mergeable.",
+      "rationale": "The component already represents a complete browser-runtime repair."
+    },
+    {
+      "id": "feature:reasoning-display",
+      "name": "Configurable reasoning display",
+      "kind": "feature",
+      "purpose": "Expose bounded, safely configured reasoning display behavior.",
+      "component_line_ids": [
+        "line:configurable-reasoning-display"
+      ],
+      "acceptance": [
+        "Configured display limits apply with safe fallback for invalid or absent configuration and preserve fence escaping."
+      ],
+      "landing_state": "Reasoning display is independently mergeable.",
+      "rationale": "This component has a complete user-visible display contract and should not be coupled to request transformation."
+    },
+    {
+      "id": "feature:request-transform",
+      "name": "Request transform hook",
+      "kind": "feature",
+      "purpose": "Provide the request transformation extension point with explicit registration behavior.",
+      "component_line_ids": [
+        "line:request-transform-hook"
+      ],
+      "acceptance": [
+        "The hook registration and invocation contract remain stable and preserve request behavior when unused."
+      ],
+      "landing_state": "Request transformation is independently mergeable.",
+      "rationale": "This is a standalone extension point, not part of the reasoning-display merge boundary."
+    }
+  ],
+  "edges": [
+    {
+      "from": "line:session-metadata-search-cjk",
+      "to": "line:session-metadata-search-core",
+      "type": "EXTENDS",
+      "reason": "CJK is optional and degrades to the core route."
+    },
+    {
+      "from": "line:session-metadata-search-trigram",
+      "to": "line:session-metadata-search-core",
+      "type": "EXTENDS",
+      "reason": "Trigram is optional and degrades to bounded fallback/core search."
+    },
+    {
+      "from": "line:session-metadata-search-routing",
+      "to": "line:session-metadata-search-core",
+      "type": "REQUIRES",
+      "reason": "Routing needs a valid core candidate/index contract."
+    },
+    {
+      "from": "line:session-metadata-search-routing",
+      "to": "line:session-search-lineage",
+      "type": "REQUIRES",
+      "reason": "The routing contract explicitly promises lineage/branch-marker correctness during result hydration."
+    },
+    {
+      "from": "line:session-metadata-search-routing",
+      "to": "line:session-metadata-search-cjk",
+      "type": "SHARES_SUBSTRATE",
+      "reason": "Routing knows the optional route but remains valid when it is unavailable."
+    },
+    {
+      "from": "line:session-metadata-search-routing",
+      "to": "line:session-metadata-search-trigram",
+      "type": "SHARES_SUBSTRATE",
+      "reason": "Routing knows the optional route but remains valid when it is unavailable."
+    },
+    {
+      "from": "line:session-title-safety",
+      "to": "line:session-metadata-search-core",
+      "type": "SHARES_SUBSTRATE",
+      "reason": "Title safety shares session storage/callers only."
+    },
+    {
+      "from": "line:headroom-retrieval",
+      "to": "line:headroom-compression",
+      "type": "REQUIRES",
+      "reason": "Retrieval has no meaningful compressed context without compression."
+    },
+    {
+      "from": "line:memory-trim-diagnostics",
+      "to": "line:memory-trim-policy",
+      "type": "EXTENDS",
+      "reason": "Policy remains correct when best-effort diagnostics are absent."
+    },
+    {
+      "from": "line:session-search-context-hydration",
+      "to": "line:session-search-lineage",
+      "type": "SHARES_SUBSTRATE",
+      "reason": "Both read session messages/lineage but neither requires the other's implementation."
+    },
+    {
+      "from": "line:session-search-context-hydration",
+      "to": "line:session-metadata-search-core",
+      "type": "SHARES_SUBSTRATE",
+      "reason": "Both use session search storage; context can be accepted with another result producer."
+    },
+    {
+      "from": "line:compression-session-boundary",
+      "to": "line:session-search-lineage",
+      "type": "SHARES_SUBSTRATE",
+      "reason": "Compression creates lineage records, but local no-op boundary semantics are independently testable."
+    },
+    {
+      "from": "line:runtime-lifecycle-observability",
+      "to": "line:compression-session-boundary",
+      "type": "SHARES_SUBSTRATE",
+      "reason": "Telemetry observes compression lifecycle but does not gate it."
+    },
+    {
+      "from": "line:runtime-lifecycle-observability",
+      "to": "line:sqlite-write-contention-policy",
+      "type": "SHARES_SUBSTRATE",
+      "reason": "Telemetry observes SQLite writes but does not own retry policy."
+    }
+  ],
+  "coverage": [
+    {
+      "capability_id": "capability:browser-timeout-cleanup",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:browser-timeout-cleanup"
+      ],
+      "explanation": "All clauses are owned by line:browser-timeout-cleanup; no clause split is required.",
+      "evidence": "Frozen upstream has timeout cleanup/orphan reaping but not terminate_daemon_on_timeout configuration behavior.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:browser-timeout-cleanup#contract-1",
+          "text": "Timeout cleanup clears in-memory browser state in a finally-equivalent path.",
+          "owner_line_ids": [
+            "line:browser-timeout-cleanup"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:browser-timeout-cleanup#contract-2",
+          "text": "Daemon termination is opt-in/config-gated.",
+          "owner_line_ids": [
+            "line:browser-timeout-cleanup"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:browser-timeout-cleanup#contract-3",
+          "text": "Cleanup failures are contained and test-covered.",
+          "owner_line_ids": [
+            "line:browser-timeout-cleanup"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:compression-session-boundary",
+      "phase1_status": "PARTIAL_UPSTREAM",
+      "phase1_disposition": "SPLIT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:compression-session-boundary"
+      ],
+      "explanation": "All clauses are owned by line:compression-session-boundary; no clause split is required.",
+      "evidence": "Frozen upstream has a semantic no-progress guard for equal compressor output, but the explicit status-reported-noop case is a separate residual contract.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:compression-session-boundary#contract-1",
+          "text": "A context compressor reporting noop does not rotate or rewrite the session, even if it returns a newly allocated list.",
+          "owner_line_ids": [
+            "line:compression-session-boundary"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:compression-session-boundary#contract-2",
+          "text": "The current system prompt and session lock are released safely on the no-op path.",
+          "owner_line_ids": [
+            "line:compression-session-boundary"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:configurable-reasoning-display",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:configurable-reasoning-display"
+      ],
+      "explanation": "All clauses are owned by line:configurable-reasoning-display; no clause split is required.",
+      "evidence": "Frozen upstream hardcodes the first 15 lines and has no reasoning_max_lines seam.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:configurable-reasoning-display#contract-1",
+          "text": "reasoning_max_lines controls display truncation.",
+          "owner_line_ids": [
+            "line:configurable-reasoning-display"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:configurable-reasoning-display#contract-2",
+          "text": "Invalid or absent configuration falls back safely.",
+          "owner_line_ids": [
+            "line:configurable-reasoning-display"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:configurable-reasoning-display#contract-3",
+          "text": "Fence escaping remains applied before wrapping.",
+          "owner_line_ids": [
+            "line:configurable-reasoning-display"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:cron-nul-safety",
+      "phase1_status": "SEMANTIC_UPSTREAM",
+      "phase1_disposition": "DROP",
+      "phase1_confidence": "high",
+      "composition_outcome": "UPSTREAM_OWNED",
+      "owner_line_ids": [],
+      "explanation": "Frozen Phase-1 status is SEMANTIC_UPSTREAM/DROP; current-upstream refresh retains the external ownership and no fork line is created.",
+      "evidence": "Frozen upstream contains the corresponding NUL/binary-safe guard and terminal fallback.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:cron-nul-safety#contract-1",
+          "text": "NUL-bearing input does not reach unsafe process/lifecycle calls.",
+          "owner_line_ids": [],
+          "coverage": "UPSTREAM_OWNED"
+        },
+        {
+          "id": "capability:cron-nul-safety#contract-2",
+          "text": "Terminal fallback returns a clear failure rather than truncating at NUL.",
+          "owner_line_ids": [],
+          "coverage": "UPSTREAM_OWNED"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:headroom-compression",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:headroom-compression"
+      ],
+      "explanation": "All clauses are owned by line:headroom-compression; no clause split is required.",
+      "evidence": "Frozen upstream has no headroom ContentRouter/SmartCrusher implementation.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:headroom-compression#contract-1",
+          "text": "Compression activates only at configured thresholds and does not expand tool-result metadata.",
+          "owner_line_ids": [
+            "line:headroom-compression"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:headroom-compression#contract-2",
+          "text": "Failures degrade with warning/logging and preserve usable content.",
+          "owner_line_ids": [
+            "line:headroom-compression"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:headroom-compression#contract-3",
+          "text": "Plugin registration and schema remain valid when active.",
+          "owner_line_ids": [
+            "line:headroom-compression"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:headroom-retrieval",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:headroom-retrieval"
+      ],
+      "explanation": "All clauses are owned by line:headroom-retrieval; no clause split is required.",
+      "evidence": "No equivalent retrieval tool is present in frozen upstream.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:headroom-retrieval#contract-1",
+          "text": "The retrieval tool has a stable schema.",
+          "owner_line_ids": [
+            "line:headroom-retrieval"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:headroom-retrieval#contract-2",
+          "text": "It is auto-enabled only when compression is active and returns bounded context.",
+          "owner_line_ids": [
+            "line:headroom-retrieval"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:headroom-retrieval#contract-3",
+          "text": "Registration failures are explicit and warning-visible.",
+          "owner_line_ids": [
+            "line:headroom-retrieval"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:lifecycle-sqlite-telemetry",
+      "phase1_status": "NEEDS_REVIEW",
+      "phase1_disposition": "NEEDS_REVIEW",
+      "phase1_confidence": "medium",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:runtime-lifecycle-observability"
+      ],
+      "explanation": "Phase-1 NEEDS_REVIEW is resolved as an optional, independently testable observability line; no unresolved composition blocker remains.",
+      "evidence": "Frozen upstream comparison was not completed per telemetry surface; absence is not treated as proof.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:lifecycle-sqlite-telemetry#contract-1",
+          "text": "Important boundaries emit structured telemetry rather than only ad-hoc logs.",
+          "owner_line_ids": [
+            "line:runtime-lifecycle-observability"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:lifecycle-sqlite-telemetry#contract-2",
+          "text": "SQLite lock/owner and stream/tool failures remain diagnosable.",
+          "owner_line_ids": [
+            "line:runtime-lifecycle-observability"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:memory-trim-diagnostics",
+      "phase1_status": "PARTIAL_UPSTREAM",
+      "phase1_disposition": "KEEP",
+      "phase1_confidence": "medium",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:memory-trim-diagnostics"
+      ],
+      "explanation": "All clauses are owned by line:memory-trim-diagnostics; no clause split is required.",
+      "evidence": "Frozen upstream has basic RSS/RssAnon snapshots and trim logging, but not the fork's GC-versus-trim attribution, malloc_info fragmentation, or VmSwap diagnostics.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:memory-trim-diagnostics#contract-1",
+          "text": "gc_ms versus trim_ms identifies the freeze mechanism without changing the policy decision.",
+          "owner_line_ids": [
+            "line:memory-trim-diagnostics"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:memory-trim-diagnostics#contract-2",
+          "text": "Fragmentation and VmSwap are best-effort diagnostics and never block memory recovery.",
+          "owner_line_ids": [
+            "line:memory-trim-diagnostics"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:memory-trim-policy",
+      "phase1_status": "PARTIAL_UPSTREAM",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:memory-trim-policy"
+      ],
+      "explanation": "All clauses are owned by line:memory-trim-policy; no clause split is required.",
+      "evidence": "Frozen upstream hermes_cli/mem_trim.py has a general cooldown around gc.collect()+malloc_trim, but no RSS low-water gate or independent GC cooldown; this is partial prior art, not equivalence.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:memory-trim-policy#contract-1",
+          "text": "RSS below threshold_mb skips the expensive trim work on housekeeping ticks.",
+          "owner_line_ids": [
+            "line:memory-trim-policy"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:memory-trim-policy#contract-2",
+          "text": "gc.collect() runs at most once per gc_cooldown_seconds while malloc_trim remains eligible on the normal trim cadence.",
+          "owner_line_ids": [
+            "line:memory-trim-policy"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:memory-trim-policy#contract-3",
+          "text": "The 99.7% GC attribution explains the policy split; force behavior and invalid configuration retain safe fallbacks.",
+          "owner_line_ids": [
+            "line:memory-trim-policy"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:outbound-code-fence-safety",
+      "phase1_status": "SEMANTIC_UPSTREAM",
+      "phase1_disposition": "DROP",
+      "phase1_confidence": "high",
+      "composition_outcome": "UPSTREAM_OWNED",
+      "owner_line_ids": [],
+      "explanation": "Frozen Phase-1 status is SEMANTIC_UPSTREAM/DROP; no fork reconstruction line is needed.",
+      "evidence": "Frozen upstream already has escape_code_fences_for_display, ensure_closed_code_fences, and chunk balancing with equivalent behavior.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:outbound-code-fence-safety#contract-1",
+          "text": "Untrusted backticks are escaped before outer wrapping.",
+          "owner_line_ids": [],
+          "coverage": "UPSTREAM_OWNED"
+        },
+        {
+          "id": "capability:outbound-code-fence-safety#contract-2",
+          "text": "Chunk balancing and truncation close open triple-backtick and inline-code spans.",
+          "owner_line_ids": [],
+          "coverage": "UPSTREAM_OWNED"
+        },
+        {
+          "id": "capability:outbound-code-fence-safety#contract-3",
+          "text": "Discord edit/truncation preserves the same user-visible balance guarantee.",
+          "owner_line_ids": [],
+          "coverage": "UPSTREAM_OWNED"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:request-transform-hook",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:request-transform-hook"
+      ],
+      "explanation": "All clauses are owned by line:request-transform-hook; no clause split is required.",
+      "evidence": "Frozen upstream has pre_llm_call but not a full-payload transform hook at dispatch.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:request-transform-hook#contract-1",
+          "text": "transform_api_request receives and returns the complete payload at a documented boundary.",
+          "owner_line_ids": [
+            "line:request-transform-hook"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:request-transform-hook#contract-2",
+          "text": "The hook is optional and preserves the request when absent.",
+          "owner_line_ids": [
+            "line:request-transform-hook"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:request-transform-hook#contract-3",
+          "text": "Hook errors are explicit and do not dispatch partial data.",
+          "owner_line_ids": [
+            "line:request-transform-hook"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-fts-cjk",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-metadata-search-cjk"
+      ],
+      "explanation": "All clauses are owned by line:session-metadata-search-cjk; no clause split is required.",
+      "evidence": "Frozen upstream has no session CJK metadata index or equivalent optional lifecycle.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-fts-cjk#contract-1",
+          "text": "CJK search covers title, id, and display_name through external-content FTS.",
+          "owner_line_ids": [
+            "line:session-metadata-search-cjk"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-cjk#contract-2",
+          "text": "Unavailable tokenizer/index state degrades safely without hiding the base path.",
+          "owner_line_ids": [
+            "line:session-metadata-search-cjk"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-cjk#contract-3",
+          "text": "Guard and MATCH run against one SQLite snapshot; rebuild is independent and resumable.",
+          "owner_line_ids": [
+            "line:session-metadata-search-cjk"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-fts-lifecycle",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-metadata-search-core"
+      ],
+      "explanation": "All clauses are owned by line:session-metadata-search-core; no clause split is required.",
+      "evidence": "Frozen upstream has message FTS primitives but no equivalent session six-index lifecycle boundary.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-fts-lifecycle#contract-1",
+          "text": "The registry covers messages_fts, messages_fts_trigram, messages_fts_cjk, sessions_fts, sessions_fts_cjk, and sessions_fts_trigram.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-lifecycle#contract-2",
+          "text": "Maintenance, health, read-only discovery, repair, and degraded runtime iterate the same descriptors.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-lifecycle#contract-3",
+          "text": "Unknown or incomplete trigger state fails closed for serving.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-fts-simple-eol",
+      "phase1_status": "SEMANTIC_UPSTREAM",
+      "phase1_disposition": "DROP",
+      "phase1_confidence": "high",
+      "composition_outcome": "UPSTREAM_OWNED",
+      "owner_line_ids": [],
+      "explanation": "Frozen Phase-1 status is SEMANTIC_UPSTREAM/DROP; the upstream tokenizer behavior satisfies the contract.",
+      "evidence": "Frozen upstream has no load_simple_extension/simple-tokenizer compatibility shim; the legacy debt is already absent there.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-fts-simple-eol#contract-1",
+          "text": "Supported post-#12 databases do not require simple-tokenizer loading or repair branches.",
+          "owner_line_ids": [],
+          "coverage": "UPSTREAM_OWNED"
+        },
+        {
+          "id": "capability:session-fts-simple-eol#contract-2",
+          "text": "Unsupported legacy residue is sanitized or rejected explicitly rather than silently kept writable.",
+          "owner_line_ids": [],
+          "coverage": "UPSTREAM_OWNED"
+        },
+        {
+          "id": "capability:session-fts-simple-eol#contract-3",
+          "text": "Modern trigram/CJK lifecycle remains the canonical path.",
+          "owner_line_ids": [],
+          "coverage": "UPSTREAM_OWNED"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-fts-storage-v2",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-metadata-search-core"
+      ],
+      "explanation": "All clauses are owned by line:session-metadata-search-core; no clause split is required.",
+      "evidence": "Frozen upstream has no session six-index storage-v2 settlement state machine.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-fts-storage-v2#contract-1",
+          "text": "One predicate defines required-index settlement; startup and foreground paths use it.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-storage-v2#contract-2",
+          "text": "Incomplete or interrupted required settlement refuses serving; reopen/resume reaches an explicit terminal state.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-storage-v2#contract-3",
+          "text": "Optional indexes do not silently become required blockers.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-fts-trigram",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-metadata-search-trigram"
+      ],
+      "explanation": "All clauses are owned by line:session-metadata-search-trigram; no clause split is required.",
+      "evidence": "Frozen upstream has no sessions_fts_trigram external-content index; generic message trigram is not equivalent.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-fts-trigram#contract-1",
+          "text": "The external-content source normalizes title/display_name and keeps raw id searchable.",
+          "owner_line_ids": [
+            "line:session-metadata-search-trigram"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-trigram#contract-2",
+          "text": "Serving requires complete trigger/namespace ownership; unknown same-name objects fail closed.",
+          "owner_line_ids": [
+            "line:session-metadata-search-trigram"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-trigram#contract-3",
+          "text": "Recovery markers support resumable rebuild without treating a partial index as healthy.",
+          "owner_line_ids": [
+            "line:session-metadata-search-trigram"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-fts-unicode",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-metadata-search-core"
+      ],
+      "explanation": "All clauses are owned by line:session-metadata-search-core; no clause split is required.",
+      "evidence": "Frozen upstream has messages_fts but no equivalent sessions_fts metadata index.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-fts-unicode#contract-1",
+          "text": "Stable sessions.row_id is retained across hidden rows and gaps.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-unicode#contract-2",
+          "text": "External-content FTS indexes title, id, and display_name with resumable high-water backfill.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-fts-unicode#contract-3",
+          "text": "Backfill and triggers preserve delete correctness and never expose hidden sessions.",
+          "owner_line_ids": [
+            "line:session-metadata-search-core"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-search-context-hydration",
+      "phase1_status": "PARTIAL_UPSTREAM",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-search-context-hydration"
+      ],
+      "explanation": "All clauses are owned by line:session-search-context-hydration; no clause split is required.",
+      "evidence": "Frozen upstream has per-match context hydration with equivalent -1/0/+1 semantics, but not the fork's bounded batch and lock-scope policy.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-search-context-hydration#contract-1",
+          "text": "Each search match receives only its bounded preceding, matching, and following message context.",
+          "owner_line_ids": [
+            "line:session-search-context-hydration"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-search-context-hydration#contract-2",
+          "text": "Context rows are fetched in bounded session batches and the position index is built outside the database lock.",
+          "owner_line_ids": [
+            "line:session-search-context-hydration"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-search-context-hydration#contract-3",
+          "text": "Decode failures degrade each match to an empty context rather than corrupting the result set.",
+          "owner_line_ids": [
+            "line:session-search-context-hydration"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-search-lineage",
+      "phase1_status": "PARTIAL_UPSTREAM",
+      "phase1_disposition": "SPLIT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-search-lineage"
+      ],
+      "explanation": "All clauses are owned by line:session-search-lineage; no clause split is required.",
+      "evidence": "Frozen upstream has _lineage_root_id/basic lookup but not the stronger resolver, memo, B-boundary, or explicit truncation contract.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-search-lineage#contract-1",
+          "text": "Only positive compression edges are followed; branch/delegate markers and tool children do not become roots.",
+          "owner_line_ids": [
+            "line:session-search-lineage"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-search-lineage#contract-2",
+          "text": "Missing/cyclic lineage fails closed; query-local memo/path compression is bounded by B=2000 successful uncached row fetches.",
+          "owner_line_ids": [
+            "line:session-search-lineage"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-search-lineage#contract-3",
+          "text": "B exhaustion returns truncated/warning without poisoned memo; one snapshot, early-K and deferred hydration are preserved.",
+          "owner_line_ids": [
+            "line:session-search-lineage"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-search-routing",
+      "phase1_status": "FORK_ONLY",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-metadata-search-routing"
+      ],
+      "explanation": "All clauses are owned by line:session-metadata-search-routing; no clause split is required.",
+      "evidence": "Frozen upstream has session ID/title primitives but no equivalent metadata-index router.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-search-routing#contract-1",
+          "text": "Unicode, CJK, and infix queries select their intended index; LIKE is bounded fallback.",
+          "owner_line_ids": [
+            "line:session-metadata-search-routing"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-search-routing#contract-2",
+          "text": "FTS narrows IDs before lineage hydration; only empty successful FTS triggers fallback.",
+          "owner_line_ids": [
+            "line:session-metadata-search-routing"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-search-routing#contract-3",
+          "text": "Visibility, archive/pin/source filters, lineage, branch markers, whole-store scope, and limits remain correct.",
+          "owner_line_ids": [
+            "line:session-metadata-search-routing"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:session-title-safety",
+      "phase1_status": "PARTIAL_UPSTREAM",
+      "phase1_disposition": "SPLIT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:session-title-safety"
+      ],
+      "explanation": "All clauses are owned by line:session-title-safety; no clause split is required.",
+      "evidence": "Frozen upstream escapes LIKE but does not enforce the fork's strict numeric suffix filter.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:session-title-safety#contract-1",
+          "text": "Escape SQL LIKE literals independently from Python literals.",
+          "owner_line_ids": [
+            "line:session-title-safety"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-title-safety#contract-2",
+          "text": "Only strict ASCII #N suffixes are variants; %, _, \\, #, CJK, and literal titles stay exact and safe.",
+          "owner_line_ids": [
+            "line:session-title-safety"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:session-title-safety#contract-3",
+          "text": "The public resolution API and root/current exclusion semantics remain unchanged.",
+          "owner_line_ids": [
+            "line:session-title-safety"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    },
+    {
+      "capability_id": "capability:sqlite-write-contention-policy",
+      "phase1_status": "PARTIAL_UPSTREAM",
+      "phase1_disposition": "PORT",
+      "phase1_confidence": "high",
+      "composition_outcome": "FEATURE_LINE",
+      "owner_line_ids": [
+        "line:sqlite-write-contention-policy"
+      ],
+      "explanation": "All clauses are owned by line:sqlite-write-contention-policy; no clause split is required.",
+      "evidence": "Frozen upstream has uniform 20-150ms retry jitter and slow-write diagnostics, not the fork's exponential 20ms-to-2s policy.",
+      "phase1_drift": null,
+      "contract_clauses": [
+        {
+          "id": "capability:sqlite-write-contention-policy#contract-1",
+          "text": "SQLite write contention retries roll back before retrying.",
+          "owner_line_ids": [
+            "line:sqlite-write-contention-policy"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:sqlite-write-contention-policy#contract-2",
+          "text": "Retry delay uses a 20ms base with jitter, exponential growth, and a 2s cap.",
+          "owner_line_ids": [
+            "line:sqlite-write-contention-policy"
+          ],
+          "coverage": "FEATURE_LINE"
+        },
+        {
+          "id": "capability:sqlite-write-contention-policy#contract-3",
+          "text": "Retry exhaustion and non-lock failures retain explicit error behavior.",
+          "owner_line_ids": [
+            "line:sqlite-write-contention-policy"
+          ],
+          "coverage": "FEATURE_LINE"
+        }
+      ]
+    }
+  ],
+  "non_capability_accounting": [
+    {
+      "group_id": "non-capability:incidental-hardening",
+      "evidence_attachment_line_ids": [
+        "line:sqlite-write-contention-policy",
+        "line:runtime-lifecycle-observability"
+      ],
+      "no_feature_justification": "Retry policy is promoted as a capability overlay; remaining slow-write/delivery logs attach as evidence and do not create a feature line."
+    },
+    {
+      "group_id": "non-capability:integration-merge",
+      "evidence_attachment_line_ids": [],
+      "no_feature_justification": "Accounting/provenance evidence only; no feature line owns this group."
+    },
+    {
+      "group_id": "non-capability:performance-validation",
+      "evidence_attachment_line_ids": [
+        "line:session-search-context-hydration",
+        "line:session-metadata-search-routing"
+      ],
+      "no_feature_justification": "Benchmark evidence informs the two affected acceptance seams; the benchmark record itself is not a feature line."
+    },
+    {
+      "group_id": "non-capability:production-evidence",
+      "evidence_attachment_line_ids": [],
+      "no_feature_justification": "Accounting/provenance evidence only; no feature line owns this group."
+    }
+  ],
+  "composition_waves": [
+    {
+      "wave": 1,
+      "line_ids": [
+        "line:session-metadata-search-core",
+        "line:session-search-lineage",
+        "line:headroom-compression",
+        "line:memory-trim-policy",
+        "line:compression-session-boundary",
+        "line:runtime-lifecycle-observability",
+        "line:sqlite-write-contention-policy",
+        "line:browser-timeout-cleanup",
+        "line:configurable-reasoning-display",
+        "line:request-transform-hook"
+      ],
+      "parallelizable": true,
+      "reason": "Independent acceptance seams; shared files are handled as integration risk, not runtime dependency."
+    },
+    {
+      "wave": 2,
+      "line_ids": [
+        "line:session-metadata-search-cjk",
+        "line:session-metadata-search-trigram",
+        "line:session-metadata-search-routing",
+        "line:session-title-safety",
+        "line:session-search-context-hydration",
+        "line:headroom-retrieval",
+        "line:memory-trim-diagnostics"
+      ],
+      "parallelizable": false,
+      "reason": "Extensions and coordinators follow the substrate or optional base lines they consume."
+    }
+  ],
+  "ticket_projection": [
+    {
+      "merge_unit_id": "repair:session-search",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:session-metadata-search-core",
+        "line:session-metadata-search-cjk",
+        "line:session-metadata-search-trigram",
+        "line:session-metadata-search-routing",
+        "line:session-search-lineage",
+        "line:session-search-context-hydration",
+        "line:session-title-safety"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "repair:memory-runtime",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:memory-trim-policy",
+        "line:memory-trim-diagnostics"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "repair:headroom-context",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:headroom-compression",
+        "line:headroom-retrieval"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "repair:compression-lifecycle",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:compression-session-boundary"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "repair:sqlite-reliability",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:sqlite-write-contention-policy"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "feature:runtime-observability",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:runtime-lifecycle-observability"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "repair:browser-runtime",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:browser-timeout-cleanup"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "feature:reasoning-display",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:configurable-reasoning-display"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    },
+    {
+      "merge_unit_id": "feature:request-transform",
+      "ticket_action": "PROPOSE_IMPLEMENTATION_PR",
+      "component_line_ids": [
+        "line:request-transform-hook"
+      ],
+      "depends_on_merge_units": [],
+      "parallelizable_wave": 1,
+      "fresh_targeted_research": true
+    }
+  ],
+  "upstream_owned_noop_projection": [
+    {
+      "capability_id": "capability:cron-nul-safety",
+      "ticket_action": "NO_TICKET_UPSTREAM_OWNED"
+    },
+    {
+      "capability_id": "capability:outbound-code-fence-safety",
+      "ticket_action": "NO_TICKET_UPSTREAM_OWNED"
+    },
+    {
+      "capability_id": "capability:session-fts-simple-eol",
+      "ticket_action": "NO_TICKET_UPSTREAM_OWNED"
+    }
+  ],
+  "verification": {
+    "phase1_capability_count": 22,
+    "phase1_non_capability_count": 4,
+    "component_line_count": 17,
+    "merge_unit_count": 9,
+    "behavioral_audit_unique_change_records": 145,
+    "hard_dependency_dag": true,
+    "unresolved_composition_blockers": [],
+    "phase1_drift": []
+  }
+}
