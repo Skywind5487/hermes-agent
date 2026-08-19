@@ -69,3 +69,39 @@ Corrected invariant:
 > verified ownership + successful termination → destructive cleanup; ambiguous ownership or failed termination → preserve recovery metadata.
 
 The correction also factors PID/socket teardown and session-state/binding cleanup into shared helpers used by timeout and normal cleanup. Timeout supplies the stricter `require_verified_ownership=True` policy; normal cleanup retains its established best-effort behavior. This removes the duplicated security-sensitive ownership implementation without importing unmerged upstream policy.
+
+## Wayfinder gate resolution — 2026-08-19 (late)
+
+Issue #115 received a Wayfinder intent-topology gate and an implementation
+handoff (both 2026-08-19). This section records how the branch satisfies them.
+
+### Upstream refresh (preflight)
+
+- Current fork `main` / branch base: `243352e7b8bddc9f33eba1b6506810f8dd88beaa`.
+- Current upstream `main` refreshed: `f82f2dbabd9e66b714f2b4f8a40447fe0c13e732`
+  (Wayfinder observed `a6bada232c4889fec1a2b50664f859d5335bc542`; upstream has since advanced).
+- Upstream changes since the base touch `tools/process_registry.py`,
+  `hermes_cli/config.py`, and `tests/conftest.py`, but **not**
+  `tools/browser_tool.py` (the branch's only production seam). No conflict and no
+  rebase requirement for the browser feature.
+- No `base/browser-runtime-115` branch exists; PR #121 targets fork `main`
+  directly, which matches the ticket's branch boundary.
+
+### Handoff directives → status
+
+| Directive | Status |
+|---|---|
+| Fix the #121 browser regressions around session / last-active pruning under the cleanup seam | Resolved on `1cab18e4a` — `cleanup_browser` restores the established bare-task (unconditional drop) vs `::local` (owner-only drop) last-active binding contract. |
+| Do not weaken the recovery-safe ownership contract | Preserved — timeout cleanup still requires `require_verified_ownership=True`; ambiguity/failure keeps socket dir + session metadata + last-active binding for orphan recovery. |
+| Unrelated `relay_shared_metrics` lock flakes are not part of this feature | Not addressed here; no longer present on the final head (all 12 CI slices green). |
+| Preserve shared teardown mechanics only where policy stays explicit | Timeout uses the strict policy; normal cleanup keeps best-effort semantics. |
+| Do not create a child `line:` PR for the regression | No new child line. |
+| Classify commits by behavior intents; tests belong with the behavior | `8a0da17e5` (research/evidence), `97457847a` (recovery-safe ownership + tests), `1cab18e4a` (shared-teardown last-active correctness + tests). |
+
+### Final invariant (unchanged)
+
+> verified ownership + successful termination → destructive cleanup; ambiguity or
+> termination failure → preserve recovery evidence.
+
+Verification on `1cab18e4a`: browser acceptance + hybrid-routing + orphan-reaper +
+timeout/open regressions pass (58 local tests); CI on PR #121 is fully green.
