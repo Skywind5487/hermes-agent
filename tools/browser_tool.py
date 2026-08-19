@@ -5109,7 +5109,16 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     for session_key in session_keys:
         _cleanup_single_browser_session(session_key)
 
-    _prune_last_active_browser_binding(task_id)
+    # Drop stale last-active ownership.  Cleaning a bare task drops its
+    # binding; cleaning a sidecar drops the binding only if that sidecar was
+    # still the recorded owner.  This prevents a later click/snapshot from
+    # resurrecting a cleaned sidecar on about:blank while preserving a
+    # primary-session binding.
+    if _is_local_sidecar_key(task_id):
+        if _last_active_session_key.get(task_id[: -len(_LOCAL_SUFFIX)]) == task_id:
+            _last_active_session_key.pop(task_id[: -len(_LOCAL_SUFFIX)], None)
+    else:
+        _last_active_session_key.pop(task_id, None)
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:

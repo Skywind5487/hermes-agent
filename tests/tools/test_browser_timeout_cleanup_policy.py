@@ -248,6 +248,40 @@ def test_cleanup_all_resets_timeout_policy_cache(monkeypatch):
     assert bt._terminate_daemon_resolved is False
 
 
+def test_cleanup_bare_task_always_drops_last_active_binding(monkeypatch):
+    """Cleaning a bare task drops its last-active binding unconditionally.
+
+    Existing hybrid-routing contract (tests/tools/test_browser_hybrid_routing.py)
+    requires ``cleanup_browser("default")`` to drop
+    ``_last_active_session_key["default"]`` even when a live session is still
+    recorded — a later click/snapshot must not resurrect a cleaned session.
+    """
+    bt._active_sessions["task"] = {"session_name": "primary"}
+    bt._active_sessions["task::local"] = {"session_name": "sidecar"}
+    bt._last_active_session_key["task"] = "task::local"
+    bt._recording_sessions.update({"task", "task::local"})
+
+    monkeypatch.setattr(bt, "_cleanup_single_browser_session", lambda _key: None)
+
+    bt.cleanup_browser("task")
+
+    assert "task" not in bt._last_active_session_key
+
+
+def test_cleanup_sidecar_keeps_live_primary_binding(monkeypatch):
+    """Cleaning a ``::local`` sidecar keeps the primary's live binding."""
+    bt._active_sessions["task"] = {"session_name": "primary"}
+    bt._active_sessions["task::local"] = {"session_name": "sidecar"}
+    bt._last_active_session_key["task"] = "task"
+    bt._recording_sessions.update({"task", "task::local"})
+
+    monkeypatch.setattr(bt, "_cleanup_single_browser_session", lambda _key: None)
+
+    bt.cleanup_browser("task::local")
+
+    assert bt._last_active_session_key["task"] == "task"
+
+
 def _timeout_result(tmp_path, monkeypatch, *, terminate: bool, cloud: bool = False):
     session_info = {
         "session_name": "timeout-session",
