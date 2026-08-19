@@ -62,6 +62,15 @@ return {
 Hermes stores those trace entries in later observer hook payloads as
 `middleware_trace`.
 
+LLM request callbacks compose in registration order: each accepted complete
+`{"request": {...}}` replacement becomes the next callback's effective request,
+while `original_request` remains the pre-middleware snapshot. Each callback sees
+isolated deep copies. If a callback mutates its candidate and raises, that
+candidate is discarded and Hermes continues from the last committed request.
+There is no shallow-copy fallback: if the complete request cannot be deep-copied,
+Hermes logs the isolation failure, skips `llm_request` for that call, and sends
+the original request unchanged.
+
 Execution middleware receives a `next_call` callback. Call it to continue the
 chain:
 
