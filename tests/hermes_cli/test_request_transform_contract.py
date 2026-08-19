@@ -16,8 +16,46 @@ class _UncopyableProviderObject:
 
 
 def _install(monkeypatch, *callbacks):
-    manager = types.SimpleNamespace(_middleware={"llm_request": list(callbacks)})
+    manager = types.SimpleNamespace(
+        _middleware={"llm_request": list(callbacks)},
+        # The mocked manager models "already discovered"; discover_and_load is
+        # a no-op because the middleware is pre-registered.
+        discover_and_load=lambda force=False: None,
+    )
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+
+def test_fresh_process_discovers_configured_plugin_before_snapshot(monkeypatch):
+    """A configured llm_request plugin must run on first delivery even when
+    plugin discovery has not happened yet — this seam cannot depend on which
+    surface imported Hermes first. Without the discovery-aware snapshot a
+    fresh manager (empty registry, _discovered False) was mistaken for "no
+    middleware" and silently skipped the configured transform."""
+
+    manager = types.SimpleNamespace(
+        _middleware={},
+        _discovered=False,
+    )
+
+    def _discover_and_load(force=False):
+        # Simulate first-use discovery registering a configured plugin.
+        if "llm_request" not in manager._middleware:
+            manager._middleware["llm_request"] = [
+                lambda **kw: {
+                    "request": {**kw["request"], "fresh": True},
+                    "source": "fresh",
+                }
+            ]
+
+    manager.discover_and_load = _discover_and_load
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+    request = {"messages": [{"role": "user", "content": "hello"}]}
+    result = apply_llm_request_middleware(request)
+
+    assert result.payload == {**request, "fresh": True}
+    assert result.changed is True
+    assert result.trace == [{"source": "fresh"}]
 
 
 def test_missing_middleware_preserves_request_identity(monkeypatch):

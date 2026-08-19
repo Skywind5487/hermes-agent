@@ -292,7 +292,13 @@ class TestPluginDiscovery:
 
 
     def test_middleware_helpers_skip_no_listener_work(self, monkeypatch):
-        manager = types.SimpleNamespace(_middleware={})
+        manager = types.SimpleNamespace(
+            _middleware={},
+            # apply_llm_request_middleware triggers first-use discovery before
+            # snapshotting callbacks; the no-op models an already-discovered
+            # manager with no registered listeners.
+            discover_and_load=lambda force=False: None,
+        )
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
 
         request = {"messages": []}

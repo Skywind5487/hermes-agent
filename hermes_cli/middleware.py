@@ -85,6 +85,16 @@ def apply_llm_request_middleware(
     If the original request cannot be isolated, middleware is skipped and the
     original request is returned unchanged.
     """
+    # Plugin discovery is normally triggered as an import side effect of
+    # model_tools, but this seam must not depend on which surface imported
+    # Hermes first (dashboards, TUI slash workers, query mode, cron). Ensure
+    # first-use discovery has run before snapshotting callbacks so a
+    # configured plugin in a fresh process is not mistaken for "no middleware".
+    # discover_plugins() is idempotent.
+    from hermes_cli.plugins import discover_plugins
+
+    discover_plugins()
+
     callbacks = _get_middleware_callbacks(LLM_REQUEST_MIDDLEWARE)
     if not callbacks:
         return RequestMiddlewareResult(

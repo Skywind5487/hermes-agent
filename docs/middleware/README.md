@@ -71,6 +71,11 @@ There is no shallow-copy fallback: if the complete request cannot be deep-copied
 Hermes logs the isolation failure, skips `llm_request` for that call, and sends
 the original request unchanged.
 
+`llm_request` delivery performs first-use plugin discovery itself, so a
+configured plugin runs even on surfaces that never import the model-tool layer
+(dashboards, TUI slash workers, query mode, cron) and is never mistaken for a
+missing listener in a fresh process.
+
 Execution middleware receives a `next_call` callback. Call it to continue the
 chain:
 
