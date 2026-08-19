@@ -105,3 +105,21 @@ handoff (both 2026-08-19). This section records how the branch satisfies them.
 
 Verification on `1cab18e4a`: browser acceptance + hybrid-routing + orphan-reaper +
 timeout/open regressions pass (58 local tests); CI on PR #121 is fully green.
+
+## Review round 2 — 2026-08-19 (late)
+
+`/code-review` on PR #121 returned 2 spec blockers + 3 standards findings
+(addressed on `6f7312464`):
+
+| Finding | Fix |
+|---|---|
+| Spec: `_terminate_host_pid` treated "no exception" as success (Windows `taskkill` return code unchecked; POSIX `AccessDenied`/`OSError` swallowed); destructive cleanup deleted evidence for a still-alive daemon | `_terminate_host_pid` now returns confirmed-dead evidence (taskkill return code + bounded `_pid_gone_within` liveness poll on Windows; whole-tree confirmation after SIGTERM/SIGKILL on POSIX). The timeout teardown path only removes socket dir + session metadata when termination is confirmed; `False` preserves recovery evidence. |
+| Spec: process-global `_cached_terminate_daemon` leaked the opt-in policy across multiplexed profiles | `_should_terminate_daemon_on_timeout` resolves context-local config per call when `get_hermes_home_override()` is set (mirrors `_allow_private_urls`); single-profile path still caches. Dual `true→false→true` regression test added. |
+| Standards: new `browser.terminate_daemon_on_timeout` missing from `DEFAULT_CONFIG` | Added to `hermes_cli/config_defaults.py` browser section (deep-merge picks it up; no version bump needed). |
+| Standards: broad `except Exception` logs lacked tracebacks | `exc_info=True` added on both timeout-cleanup log sites. |
+| Standards: acceptance tests mocked the termination helper, hiding the real Windows/POSIX failure mode | Added contract tests that exercise `_terminate_host_pid`'s real Windows taskkill-failure and POSIX confirmed/survivor paths (stubbed `psutil` module so the hermetic venv needs no psutil), plus unconfirmed-termination-preserves / confirmed-termination-cleans teardown tests. |
+
+Verification on `6f7312464`: 23 acceptance tests (hermetic wrapper) + browser
+lifecycle set green; ruff clean on all changed files; the only failing
+`test_process_registry.py` cases are pre-existing environment/live-system-guard
+failures, identical before and after this change.
