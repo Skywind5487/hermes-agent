@@ -133,5 +133,10 @@ def test_stale_noop_status_does_not_suppress_successful_transition():
                 approx_tokens=10_000,
             )
 
-            assert compressed == [{"role": "user", "content": "summary"}]
+            # The successful transition is the contract under test, not
+            # byte-equality of the payload: rotation + persistence may attach
+            # internal message metadata (e.g. ``_row_id``), so compare only the
+            # fields that prove the summary was adopted and the session rotated.
+            assert compressed[0]["role"] == "user"
+            assert compressed[0]["content"] == "summary"
             assert agent.session_id != original_sid
