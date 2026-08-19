@@ -39,6 +39,14 @@ The machine-readable manifest contains the per-group historical commits, issues/
 - Port configurable reasoning display and request transformation after upstream hook/config ordering is specified.
 - Keep telemetry, memory-trim observability, and incidental hardening in `NEEDS_REVIEW` until their contracts and upstream comparisons are complete.
 
+### Current Headroom revalidation
+
+The Headroom `PORT`/reconstruction language above is intentionally the result of the frozen Phase-1 evidence boundary; it is not a standing authorization to port against later upstream main.
+
+Issue [#125](https://github.com/Skywind5487/hermes-agent/issues/125) revalidated Headroom against current upstream plugin/context architecture and current contribution policy. Its authoritative Phase-2 note is [`headroom-context-issue-125.md`](./headroom-context-issue-125.md): **Headroom-specific production code is now `EXTERNALIZE`; the in-tree reconstruction is dropped, while compression and optional retrieval remain acceptance-contract slices for a standalone plugin.**
+
+This link updates current Phase-2 truth without rewriting the frozen archaeology verdict at its historical refs.
+
 ## Evidence gaps
 
 - Frozen upstream has partial lineage/title prior art, but not the stronger fork contracts; replacement requires focused behavior tests.
