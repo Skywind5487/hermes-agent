@@ -14,9 +14,12 @@ Mechanism:
   * A daemon thread drains the queue and fans each batch out to subscribers
     (the OTLP metric/span/log streamers). Each subscriber is fail-isolated —
     a slow or raising subscriber never affects the hot path or its peers.
+  * A process-lifetime producer whose event predates its exporter may use
+    ``emit_buffered(event)``. That one event enters the same bounded queue even
+    before the first subscriber exists; it does not enable unrelated producers
+    or create a second queue/store.
 
-Nothing is persisted here. Monitoring is an egress path, not a local store;
-if no subscriber is attached, events simply age out of the ring buffer.
+Nothing is persisted here. Monitoring is an egress path, not a local store.
 """
 
 from __future__ import annotations
@@ -50,17 +53,11 @@ class MonitoringEmitter:
         self._subscribers: list = []
 
     # ── public API (hot path) ───────────────────────────────────────────────
-    def emit(self, event: Any) -> None:
-        """Enqueue an event. Never blocks, never raises.
-
-        ``event`` may be a dataclass with ``to_dict()`` or a plain dict.
-        """
-        if not self._enabled:
-            return
+    def _enqueue(self, event: Any) -> None:
+        """Put one event into the bounded queue. Never blocks, never raises."""
         try:
             payload = event.to_dict() if hasattr(event, "to_dict") else dict(event)
             payload.setdefault("ts_ns", time.time_ns())
-            self._ensure_started()
             try:
                 self._q.put_nowait(payload)
             except queue.Full:
@@ -72,8 +69,31 @@ class MonitoringEmitter:
                     self._q.put_nowait(payload)
                 except Exception:
                     self._dropped += 1
-        except Exception:  # the hot-path invariant: never propagate
+            if self._subscribers:
+                self._ensure_started()
+        except Exception:
             logger.debug("monitoring emit failed", exc_info=True)
+
+    def emit(self, event: Any) -> None:
+        """Enqueue an event when the monitoring plane is enabled.
+
+        ``event`` may be a dataclass with ``to_dict()`` or a plain dict.
+        Never blocks and never raises.
+        """
+        if not self._enabled:
+            return
+        self._enqueue(event)
+
+    def emit_buffered(self, event: Any) -> None:
+        """Enqueue one opt-in event even before a subscriber is attached.
+
+        This deliberately does *not* set ``_enabled``. It exists for an
+        already-opted-in producer whose observation lifetime begins before its
+        exporter/subscriber is constructed. Unrelated producers still see the
+        normal disabled ``emit()`` behavior. If no subscriber ever attaches,
+        only explicitly buffered events occupy the existing bounded queue.
+        """
+        self._enqueue(event)
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def _ensure_started(self) -> None:
@@ -90,6 +110,12 @@ class MonitoringEmitter:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            # A subscriber may detach after the dispatcher has started. Leave
+            # explicitly buffered events queued until another subscriber
+            # attaches rather than consuming them into an empty fan-out set.
+            if not self._subscribers:
+                self._stop.wait(0.1)
+                continue
             try:
                 first = self._q.get(timeout=0.5)
             except queue.Empty:
@@ -120,6 +146,13 @@ class MonitoringEmitter:
         if callback not in self._subscribers:
             self._subscribers.append(callback)
         self._enabled = True
+        # Never start dispatch from subscribe(). A residual event buffered
+        # before any subscriber may sit in the queue while the gateway attaches
+        # subscribers one at a time (span streamer first, diagnostic streamer
+        # second); an early dispatcher would dequeue it into a partial fan-out
+        # and lose it. The first ordinary emit() after the full subscriber set
+        # attaches starts dispatch and drains buffered events through the
+        # complete fan-out.
 
     def unsubscribe(self, callback) -> None:
         try:
@@ -131,8 +164,18 @@ class MonitoringEmitter:
 
     # ── introspection / shutdown (tests, CLI) ───────────────────────────────
     def flush(self, timeout: float = 2.0) -> None:
-        """Wait boundedly for queued and in-flight batches to finish dispatch."""
-        if timeout <= 0:
+        """Wait boundedly for queued and in-flight batches to finish dispatch.
+
+        With no subscriber there is no sink that can make queued explicitly
+        buffered events complete, so flushing is a no-op rather than a timeout
+        delay. Those events remain bounded in memory for a later subscriber.
+
+        The same holds before the dispatcher has started: a subscriber may be
+        attached while nothing can drain the queue (the startup snapshot was
+        never emitted), so waiting would only add an artificial shutdown delay.
+        Fail-open: no-op unless dispatch is actually running.
+        """
+        if timeout <= 0 or not self._subscribers or not self._started:
             return
 
         finished = threading.Event()
@@ -177,7 +220,8 @@ def get_emitter() -> MonitoringEmitter:
     with _EMITTER_LOCK:
         if _EMITTER is None:
             # Collection is opt-in. A plane exporter enables the singleton by
-            # attaching its first subscriber; until then producers are no-ops.
+            # attaching its first subscriber; until then ordinary producers
+            # are no-ops. Explicit pre-subscriber events use emit_buffered().
             _EMITTER = MonitoringEmitter(enabled=False)
     return _EMITTER
 
