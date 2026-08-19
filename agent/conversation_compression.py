@@ -3175,14 +3175,20 @@ def compress_context(
         # Check this BEFORE the semantic equality test so a plugin that
         # returns a freshly-built equal list (not the input object) is
         # still recognized as a no-op via its status flag.
-        if (
-            getattr(
-                agent.context_compressor,
-                "last_compression_status",
-                getattr(agent.context_compressor, "_last_compression_status", ""),
-            )
-            == "noop"
-        ):
+        #
+        # Resolve public then legacy status explicitly, not via a nested
+        # getattr fallback: every ContextEngine subclass now inherits the
+        # public ``last_compression_status = ""`` class attribute, so a nested
+        # ``getattr(compressor, "last_compression_status", legacy_fallback)``
+        # is masked by that empty default and never reaches a legacy-only
+        # ``_last_compression_status = "noop"``.
+        _public_status = getattr(
+            agent.context_compressor, "last_compression_status", ""
+        )
+        _legacy_status = getattr(
+            agent.context_compressor, "_last_compression_status", ""
+        )
+        if (_public_status or _legacy_status) == "noop":
             try:
                 logger.info(
                     "context compression no-op: session=%s messages=%d unchanged; skipping session boundary",

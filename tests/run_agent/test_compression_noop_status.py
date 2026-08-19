@@ -140,3 +140,65 @@ def test_stale_noop_status_does_not_suppress_successful_transition():
             assert compressed[0]["role"] == "user"
             assert compressed[0]["content"] == "summary"
             assert agent.session_id != original_sid
+
+
+def test_legacy_engine_private_noop_status_skips_boundary():
+    """A legacy ContextEngine subclass writing only the private flag still
+    skips the session boundary.
+
+    Regression for #112 review: the public ``last_compression_status`` class
+    attribute is inherited by every ``ContextEngine`` subclass, so a nested
+    ``getattr(compressor, "last_compression_status", legacy_fallback)`` is
+    masked by that empty default and never sees a legacy-only
+    ``_last_compression_status = "noop"``. Status resolution must treat the
+    public value as precedence with the private spelling as fallback.
+    """
+    from hermes_state import SessionDB
+    from agent.context_engine import ContextEngine
+
+    class _LegacyEngine(ContextEngine):
+        @property
+        def name(self) -> str:
+            return "legacy"
+
+        def update_from_response(self, usage) -> None:
+            pass
+
+        def should_compress(self, prompt_tokens=None) -> bool:
+            return True
+
+        def compress(
+            self,
+            messages,
+            current_tokens=None,
+            focus_topic=None,
+            force=False,
+            memory_context="",
+        ):
+            # Legacy contract: only the private spelling is written. The
+            # inherited public ``last_compression_status = ""`` stays empty.
+            self._last_compression_status = "noop"
+            return [{"role": "assistant", "content": "cleaned tail"}]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        with SessionDB(db_path=db_path) as db:
+            agent = _BoundaryHarness()._make_agent(db)
+            agent.context_compressor = _LegacyEngine()
+            agent._cached_system_prompt = "cached-system-prompt"
+            original_sid = agent.session_id
+
+            compressed, prompt = agent._compress_context(
+                [
+                    {"role": "user", "content": "replayed scaffold"},
+                    {"role": "assistant", "content": "fresh tail"},
+                ],
+                "sys",
+                approx_tokens=10_000,
+            )
+
+            assert compressed == [
+                {"role": "assistant", "content": "cleaned tail"}
+            ]
+            assert prompt == "cached-system-prompt"
+            assert agent.session_id == original_sid
