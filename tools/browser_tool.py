@@ -352,20 +352,34 @@ _terminate_daemon_resolved = False
 def _should_terminate_daemon_on_timeout() -> bool:
     """Return the config-gated immediate timeout teardown policy.
 
-    ``browser.terminate_daemon_on_timeout`` defaults to false.  Cache the
-    resolved boolean just like ``browser.command_timeout`` so the hot command
-    path does not reread config for every browser action.
+    ``browser.terminate_daemon_on_timeout`` defaults to false.  Single-profile
+    calls cache the result for the process lifetime; multiplexed profile turns
+    resolve their context-local config on each call.
     """
     global _cached_terminate_daemon, _terminate_daemon_resolved
+
+    # The profile multiplexer scopes config with a ContextVar while sharing
+    # this module. Never reuse another profile's timeout-cleanup policy.
+    if get_hermes_home_override() is not None:
+        return _resolve_terminate_daemon_on_timeout()
+
     if _terminate_daemon_resolved:
         return bool(_cached_terminate_daemon)
 
-    result = False
+    # Publish the value before the resolved flag, matching command-timeout
+    # cache ordering so concurrent readers never observe a half-filled cache.
+    _cached_terminate_daemon = _resolve_terminate_daemon_on_timeout()
+    _terminate_daemon_resolved = True
+    return _cached_terminate_daemon
+
+
+def _resolve_terminate_daemon_on_timeout() -> bool:
+    """Read the browser timeout-teardown toggle from the active config scope."""
     try:
         from hermes_cli.config import read_raw_config
 
         cfg = read_raw_config()
-        result = is_truthy_value(
+        return is_truthy_value(
             cfg_get(cfg, "browser", "terminate_daemon_on_timeout"),
             default=False,
         )
@@ -373,12 +387,7 @@ def _should_terminate_daemon_on_timeout() -> bool:
         logger.debug(
             "Could not read terminate_daemon_on_timeout from config: %s", exc
         )
-
-    # Publish the value before the resolved flag, matching command-timeout
-    # cache ordering so concurrent readers never observe a half-filled cache.
-    _cached_terminate_daemon = result
-    _terminate_daemon_resolved = True
-    return result
+    return False
 
 
 def _safe_command_timeout() -> int:
@@ -2838,6 +2847,7 @@ def _cleanup_local_browser_after_timeout(task_id: str, command: str) -> None:
                 command,
                 session_key,
                 exc,
+                exc_info=True,
             )
             continue
 
@@ -3100,6 +3110,7 @@ def _run_browser_command(
                         "Error during browser timeout teardown for task %s: %s",
                         task_id,
                         exc,
+                        exc_info=True,
                     )
 
             # Fall through to fallback check below
@@ -5058,19 +5069,26 @@ def _teardown_local_browser_runtime(
 
     try:
         from tools.process_registry import ProcessRegistry
-        ProcessRegistry._terminate_host_pid(daemon_pid)
-        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
+        terminated = ProcessRegistry._terminate_host_pid(daemon_pid)
     except (ProcessLookupError, PermissionError, OSError):
-        if require_verified_ownership:
-            return False
-        logger.debug(
-            "Could not kill daemon pid for %s (already dead or inaccessible)",
-            session_name,
-        )
+        terminated = False
     except Exception:
         if require_verified_ownership:
             return False
         raise
+
+    # Verified ownership alone is not enough — the timeout contract also
+    # requires confirmed termination before recovery evidence is removed.
+    if require_verified_ownership and not terminated:
+        return False
+
+    if terminated:
+        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
+    else:
+        logger.debug(
+            "Could not kill daemon pid for %s (already dead or inaccessible)",
+            session_name,
+        )
 
     shutil.rmtree(socket_dir, ignore_errors=True)
     return True

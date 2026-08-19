@@ -1,6 +1,8 @@
 """Acceptance tests for issue #115 browser timeout cleanup policy."""
 
 import subprocess
+import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
@@ -42,6 +44,21 @@ def _pid_file(tmp_path, session_name: str, pid: int) -> None:
     (socket_dir / f"{session_name}.pid").write_text(str(pid), encoding="utf-8")
 
 
+def _fake_psutil_module(monkeypatch, **attrs):
+    """Inject a stub ``psutil`` module so lazy ``import psutil`` resolves.
+
+    ``tools.process_registry`` imports ``psutil`` lazily inside
+    ``_terminate_host_pid``.  The hermetic test venv may not ship psutil, so
+    we stub the module in ``sys.modules`` rather than monkeypatching an
+    attribute on a module that may not be importable.
+    """
+    fake = types.ModuleType("psutil")
+    for name, value in attrs.items():
+        setattr(fake, name, value)
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+    return fake
+
+
 def test_timeout_policy_defaults_false_and_parses_false_string(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.read_raw_config",
@@ -66,6 +83,44 @@ def test_timeout_policy_true_is_cached(monkeypatch):
     assert calls == 1
 
 
+def test_multiplexed_profiles_resolve_policy_per_call(monkeypatch):
+    """Multiplexed profile turns resolve their context-local config per call.
+
+    Regression for the profile-leak blocker: a process-global cache would let
+    profile A's ``terminate_daemon_on_timeout=true`` leak into profile B's
+    ``false`` (and back), silently enabling immediate teardown for a profile
+    that did not opt in.
+    """
+    values = iter([True, False, True])
+
+    def read_config():
+        return {"browser": {"terminate_daemon_on_timeout": next(values)}}
+
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", read_config)
+    monkeypatch.setattr(bt, "get_hermes_home_override", lambda: "/profiles/b")
+
+    assert bt._should_terminate_daemon_on_timeout() is True
+    assert bt._should_terminate_daemon_on_timeout() is False
+    assert bt._should_terminate_daemon_on_timeout() is True
+
+
+def test_single_profile_policy_is_cached(monkeypatch):
+    """Single profile caches the resolved policy (reads config once)."""
+    calls = 0
+
+    def read_config():
+        nonlocal calls
+        calls += 1
+        return {"browser": {"terminate_daemon_on_timeout": True}}
+
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", read_config)
+    monkeypatch.setattr(bt, "get_hermes_home_override", lambda: None)
+
+    assert bt._should_terminate_daemon_on_timeout() is True
+    assert bt._should_terminate_daemon_on_timeout() is True
+    assert calls == 1
+
+
 def test_cleanup_bare_task_includes_local_sidecar(tmp_path, monkeypatch):
     _session("task", "primary")
     _session("task::local", "sidecar")
@@ -74,6 +129,11 @@ def test_cleanup_bare_task_includes_local_sidecar(tmp_path, monkeypatch):
     _pid_file(tmp_path, "sidecar", 202)
 
     killed = []
+
+    def _kill_confirmed(pid):
+        killed.append(pid)
+        return True
+
     monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
     monkeypatch.setattr(bt, "_stop_cdp_supervisor", lambda _key: None)
     monkeypatch.setattr(
@@ -81,7 +141,7 @@ def test_cleanup_bare_task_includes_local_sidecar(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "tools.process_registry.ProcessRegistry._terminate_host_pid",
-        lambda pid: killed.append(pid),
+        _kill_confirmed,
     )
 
     bt._cleanup_local_browser_after_timeout("task", "snapshot")
@@ -109,7 +169,7 @@ def test_sidecar_timeout_does_not_destroy_live_primary_binding(tmp_path, monkeyp
     )
     monkeypatch.setattr(
         "tools.process_registry.ProcessRegistry._terminate_host_pid",
-        lambda _pid: None,
+        lambda _pid: True,
     )
 
     bt._cleanup_local_browser_after_timeout("task::local", "click")
@@ -132,7 +192,7 @@ def test_sidecar_timeout_drops_binding_when_sidecar_owned_it(tmp_path, monkeypat
     )
     monkeypatch.setattr(
         "tools.process_registry.ProcessRegistry._terminate_host_pid",
-        lambda _pid: None,
+        lambda _pid: True,
     )
 
     bt._cleanup_local_browser_after_timeout("task::local", "click")
@@ -163,6 +223,150 @@ def test_termination_failure_preserves_recovery_metadata(tmp_path, monkeypatch):
     assert "task" in bt._session_last_activity
     assert bt._last_active_session_key["task"] == "task"
     assert (tmp_path / "agent-browser-primary").exists()
+
+
+def test_unconfirmed_termination_preserves_recovery_metadata(tmp_path, monkeypatch):
+    """Termination that returns without confirmation must preserve evidence.
+
+    Regression for the review blocker: ``_terminate_host_pid`` can fail (e.g.
+    Windows ``taskkill`` returns non-zero, POSIX ``AccessDenied`` swallowed)
+    without raising, so a test that only simulates an exception misses the
+    real failure mode.  The strict timeout path must treat a ``False`` return
+    exactly like a failure: keep socket dir + session metadata.
+    """
+    _session("task", "primary")
+    bt._last_active_session_key["task"] = "task"
+    _pid_file(tmp_path, "primary", 909)
+    terminate = MagicMock(return_value=False)  # kill ran but death unconfirmed
+
+    monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(bt, "_stop_cdp_supervisor", lambda _key: None)
+    monkeypatch.setattr(
+        bt, "_verify_reapable_browser_daemon", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        "tools.process_registry.ProcessRegistry._terminate_host_pid", terminate
+    )
+
+    bt._cleanup_local_browser_after_timeout("task", "open")
+
+    terminate.assert_called_once_with(909)
+    assert "task" in bt._active_sessions
+    assert "task" in bt._recording_sessions
+    assert "task" in bt._session_last_activity
+    assert bt._last_active_session_key["task"] == "task"
+    assert (tmp_path / "agent-browser-primary").exists()
+
+
+def test_confirmed_termination_removes_runtime_state(tmp_path, monkeypatch):
+    """Verified ownership + confirmed termination → destructive cleanup."""
+    _session("task", "primary")
+    bt._last_active_session_key["task"] = "task"
+    _pid_file(tmp_path, "primary", 1010)
+
+    monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(bt, "_stop_cdp_supervisor", lambda _key: None)
+    monkeypatch.setattr(
+        bt, "_verify_reapable_browser_daemon", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        "tools.process_registry.ProcessRegistry._terminate_host_pid",
+        MagicMock(return_value=True),
+    )
+
+    bt._cleanup_local_browser_after_timeout("task", "open")
+
+    assert "task" not in bt._active_sessions
+    assert "task" not in bt._recording_sessions
+    assert "task" not in bt._session_last_activity
+    assert "task" not in bt._last_active_session_key
+    assert not (tmp_path / "agent-browser-primary").exists()
+
+
+def test_terminate_host_pid_windows_taskkill_failure_returns_false(monkeypatch):
+    """Windows taskkill returning non-zero must NOT count as success.
+
+    Covers the real termination implementation (not a mocked helper): a failed
+    ``taskkill`` with no exception must still yield ``False`` so the caller
+    preserves recovery evidence instead of deleting a still-alive daemon.
+    """
+    from tools.process_registry import ProcessRegistry
+
+    killed = []
+    monkeypatch.setattr("tools.process_registry._IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "subprocess.run",
+        MagicMock(return_value=MagicMock(returncode=1)),
+    )
+    monkeypatch.setattr("os.kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(
+        ProcessRegistry, "_pid_gone_within", MagicMock(return_value=False)
+    )
+
+    assert ProcessRegistry._terminate_host_pid(12345) is False
+    assert killed == [12345]  # fallback signal was attempted
+
+
+def test_terminate_host_pid_posix_confirmed_dead_returns_true(monkeypatch):
+    """POSIX: whole tree confirmed gone after terminate → True."""
+    from tools.process_registry import ProcessRegistry
+
+    class FakeProc:
+        pid = 12345
+
+        def children(self, recursive=True):
+            return []
+
+        def terminate(self):
+            pass
+
+    class _NoSuchProcess(Exception):
+        pass
+
+    _fake_psutil_module(
+        monkeypatch,
+        Process=MagicMock(return_value=FakeProc()),
+        NoSuchProcess=_NoSuchProcess,
+        AccessDenied=PermissionError,
+    )
+    monkeypatch.setattr("tools.process_registry._IS_WINDOWS", False)
+    monkeypatch.setattr(
+        ProcessRegistry, "_daemon_term_grace_seconds", lambda: 1.0
+    )
+    monkeypatch.setattr(ProcessRegistry, "_proc_alive", lambda _p: False)
+
+    assert ProcessRegistry._terminate_host_pid(12345) is True
+
+
+def test_terminate_host_pid_posix_survivor_returns_false(monkeypatch):
+    """POSIX: a surviving tree member → termination not confirmed → False."""
+    from tools.process_registry import ProcessRegistry
+
+    class FakeProc:
+        pid = 12345
+
+        def children(self, recursive=True):
+            return []
+
+        def terminate(self):
+            pass
+
+    class _NoSuchProcess(Exception):
+        pass
+
+    _fake_psutil_module(
+        monkeypatch,
+        Process=MagicMock(return_value=FakeProc()),
+        NoSuchProcess=_NoSuchProcess,
+        AccessDenied=PermissionError,
+    )
+    monkeypatch.setattr("tools.process_registry._IS_WINDOWS", False)
+    monkeypatch.setattr(
+        ProcessRegistry, "_daemon_term_grace_seconds", lambda: 0.0
+    )
+    monkeypatch.setattr(ProcessRegistry, "_proc_alive", lambda _p: True)
+
+    assert ProcessRegistry._terminate_host_pid(12345) is False
 
 
 def test_unverified_pid_preserves_recovery_metadata(tmp_path, monkeypatch):
