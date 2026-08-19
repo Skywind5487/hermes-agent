@@ -43,45 +43,95 @@ def test_plugin_noop_adopts_cleanup_without_session_boundary():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
-        db = SessionDB(db_path=db_path)
-        agent = _BoundaryHarness()._make_agent(db)
+        with SessionDB(db_path=db_path) as db:
+            agent = _BoundaryHarness()._make_agent(db)
 
-        messages = [
-            {"role": "user", "content": "replayed scaffold"},
-            {"role": "assistant", "content": "fresh tail"},
-        ]
-        cleaned = [{"role": "assistant", "content": "fresh tail"}]
-        compressor = _noop_compressor(cleaned)
-        agent.context_compressor = compressor
-        agent._cached_system_prompt = "cached-system-prompt"
+            messages = [
+                {"role": "user", "content": "replayed scaffold"},
+                {"role": "assistant", "content": "fresh tail"},
+            ]
+            cleaned = [{"role": "assistant", "content": "fresh tail"}]
+            compressor = _noop_compressor(cleaned)
+            agent.context_compressor = compressor
+            agent._cached_system_prompt = "cached-system-prompt"
 
-        original_sid = agent.session_id
-        compressed, prompt = agent._compress_context(
-            messages,
-            "sys",
-            approx_tokens=10_000,
-        )
+            original_sid = agent.session_id
+            compressed, prompt = agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=10_000,
+            )
 
-        # This must exercise the explicit status seam, not #67938's equality
-        # guard: cleanup changed the active context.
-        assert compressed == cleaned
-        assert compressed != messages
-        assert prompt == "cached-system-prompt"
-        assert agent.session_id == original_sid
+            # This must exercise the explicit status seam, not #67938's equality
+            # guard: cleanup changed the active context.
+            assert compressed == cleaned
+            assert compressed != messages
+            assert prompt == "cached-system-prompt"
+            assert agent.session_id == original_sid
 
-        compression_boundary_calls = [
-            call
-            for call in compressor.on_session_start.call_args_list
-            if call.kwargs.get("boundary_reason") == "compression"
-        ]
-        assert not compression_boundary_calls
+            compression_boundary_calls = [
+                call
+                for call in compressor.on_session_start.call_args_list
+                if call.kwargs.get("boundary_reason") == "compression"
+            ]
+            assert not compression_boundary_calls
 
-        conn = sqlite3.connect(str(db_path))
-        try:
-            child_count = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?",
-                (original_sid,),
-            ).fetchone()[0]
-        finally:
-            conn.close()
-        assert child_count == 0
+            conn = sqlite3.connect(str(db_path))
+            try:
+                child_count = conn.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?",
+                    (original_sid,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            assert child_count == 0
+
+
+def test_stale_noop_status_does_not_suppress_successful_transition():
+    """A later successful result must not inherit a previous no-op status."""
+    from hermes_state import SessionDB
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        with SessionDB(db_path=db_path) as db:
+            agent = _BoundaryHarness()._make_agent(db)
+            compressor = _noop_compressor(
+                [{"role": "assistant", "content": "cleaned tail"}]
+            )
+            calls = 0
+
+            def _compress(_messages, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    compressor.last_compression_status = "noop"
+                    return [{"role": "assistant", "content": "cleaned tail"}]
+                # Deliberately leave the previous public status untouched.
+                return [{"role": "user", "content": "summary"}]
+
+            compressor.compress.side_effect = _compress
+            agent.context_compressor = compressor
+            original_sid = agent.session_id
+
+            messages = [
+                {"role": "user", "content": "replayed scaffold"},
+                {"role": "assistant", "content": "fresh tail"},
+            ]
+            compressed, _ = agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=10_000,
+            )
+            assert compressed == [
+                {"role": "assistant", "content": "cleaned tail"}
+            ]
+            assert agent.session_id == original_sid
+
+            compressed, _ = agent._compress_context(
+                compressed,
+                "sys",
+                approx_tokens=10_000,
+            )
+
+            assert compressed == [{"role": "user", "content": "summary"}]
+            assert agent.session_id != original_sid

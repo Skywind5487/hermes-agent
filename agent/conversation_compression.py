@@ -3029,6 +3029,17 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
+                    # Status belongs to this compression attempt. Clear both
+                    # the public contract and the legacy private spelling so
+                    # a prior plugin no-op cannot suppress a later success.
+                    for _status_name in (
+                        "last_compression_status",
+                        "_last_compression_status",
+                    ):
+                        try:
+                            setattr(agent.context_compressor, _status_name, "")
+                        except Exception:
+                            pass
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
