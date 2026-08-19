@@ -19864,13 +19864,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     from gateway.stream_consumer import escape_code_fences_for_display
+                    from agent.display import resolve_reasoning_max_lines, _truncate_reasoning_lines
                     # Collapse long reasoning to keep messages readable
-                    lines = last_reasoning.strip().splitlines()
-                    if len(lines) > 15:
-                        display_reasoning = "\n".join(lines[:15])
-                        display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
-                    else:
-                        display_reasoning = last_reasoning.strip()
+                    max_lines = resolve_reasoning_max_lines(_load_gateway_config(), 15)
+                    display_reasoning = _truncate_reasoning_lines(
+                        last_reasoning, max_lines, "\n_... ({n} more lines)_"
+                    )
                     # Render style is per-platform: Discord defaults to "-# "
                     # subtext (native small grey metadata text); other
                     # platforms keep the fenced code block.

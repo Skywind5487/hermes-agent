@@ -4739,6 +4739,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # reasoning_full: when reasoning display is on, print the post-response
         # recap box uncollapsed instead of clamping to the first 10 lines.
         self.reasoning_full = CLI_CONFIG["display"].get("reasoning_full", False)
+        # reasoning_max_lines: optional global cap override for all reasoning
+        # display surfaces (preview=5, recap=10). Resolved once at init from
+        # the already-loaded CLI_CONFIG — no hot-path config reload.
+        from agent.display import resolve_reasoning_max_lines
+        self.reasoning_max_lines_preview = resolve_reasoning_max_lines(CLI_CONFIG, 5)
+        self.reasoning_max_lines_recap = resolve_reasoning_max_lines(CLI_CONFIG, 10)
         _configure_output_history(
             enabled=CLI_CONFIG["display"].get("persistent_output", True),
             max_lines=CLI_CONFIG["display"].get("persistent_output_max_lines", 200),
@@ -7210,13 +7216,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint(f"  {_DIM}[thinking] {preview_text}{_RST}")
             return
 
-        lines = preview_text.splitlines()
-        if len(lines) > 5:
-            preview = "\n".join(lines[:5])
-            preview += f"\n  ... ({len(lines) - 5} more lines)"
-        else:
-            preview = preview_text
+        from agent.display import _truncate_reasoning_lines
+        preview = _truncate_reasoning_lines(
+            preview_text,
+            self.reasoning_max_lines_preview,
+            "\n  ... ({n} more lines)"
+        )
         _cprint(f"  {_DIM}[thinking] {preview}{_RST}")
+
+    def _build_reasoning_recap(self, reasoning: str) -> str:
+        """Format the post-response reasoning recap box content.
+
+        Precedence: ``reasoning_full`` > ``reasoning_max_lines`` > legacy
+        10-line default.  ``reasoning_full`` prints the thinking uncollapsed;
+        otherwise the reasoning is truncated to ``self.reasoning_max_lines_recap``
+        (resolved once from CLI_CONFIG at init — no hot-path reload) with the
+        existing /reasoning full hint suffix.
+
+        This is the production seam for the CLI recap; tests must exercise it
+        rather than reimplementing the precedence locally.
+        """
+        from agent.display import _truncate_reasoning_lines
+        if self.reasoning_full:
+            return reasoning.strip()
+        return _truncate_reasoning_lines(
+            reasoning,
+            self.reasoning_max_lines_recap,
+            f"\n{_DIM}  ... ({{n}} more lines — /reasoning full to show){_RST}",
+        )
 
     def _flush_reasoning_preview(self, *, force: bool = False) -> None:
         """Flush buffered reasoning text at natural boundaries.
@@ -15841,14 +15868,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     r_fill = w - 2 - len(r_label)
                     r_top = f"{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}"
                     r_bot = f"{_DIM}└{'─' * (w - 2)}┘{_RST}"
-                    # Collapse long reasoning to the first 10 lines unless the
+                    # Collapse long reasoning to the first N lines unless the
                     # user opted into full display via /reasoning full.
-                    lines = reasoning.strip().splitlines()
-                    if len(lines) > 10 and not getattr(self, "reasoning_full", False):
-                        display_reasoning = "\n".join(lines[:10])
-                        display_reasoning += f"\n{_DIM}  ... ({len(lines) - 10} more lines — /reasoning full to show){_RST}"
-                    else:
-                        display_reasoning = reasoning.strip()
+                    # Precedence: reasoning_full > reasoning_max_lines > legacy 10.
+                    display_reasoning = self._build_reasoning_recap(reasoning)
                     _cprint(f"\n{r_top}\n{_DIM}{display_reasoning}{_RST}\n{r_bot}")
 
             if response and not response_previewed:
