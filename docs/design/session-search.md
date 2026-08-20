@@ -5,6 +5,10 @@ Author: Skywind5487
 Tickets: umbrella #109 · children #128 / #129 / #130 · topology #134
 Recon: #109 `RECON FINAL` comment `5351011142`; maintainer composition decision
 comment `5351051799`
+Upstream gate: `docs/research/issue-109-upstream-prior-art-conflict-gate.md`
+(`upstream/main@f43eabee5f36e11448086ee8ee17c499958e81bf`, 2026-08-20) —
+#128/#129/#130 residual contracts remain fork-owned; no semantic blocker found.
+Whole-tree Git rebase mergeability remains an explicit landing-time check.
 
 ## What this is
 
