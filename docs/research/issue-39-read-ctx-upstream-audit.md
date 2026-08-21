@@ -1,325 +1,283 @@
-# Research #39 — read-only search / FTS paths onto `_read_ctx()` + upstream cherry-pick audit
+# Research #18 / #39 — read-only FTS/search paths onto `_read_ctx()`
 
-Date: 2026-08-16
-
-## Scope
-
-Research-only follow-up for fork issue #39 / implementation issue #18. This document does **not** implement #18.
+Date: **2026-08-21**  
+Status: **research complete; ready for `/recon` handoff**  
+Canonical research artifact: this file (the #39 exploration artifact is refreshed in place rather than duplicating facts under a second #18 note).
 
 Pinned trees:
 
 - fork integration target: `Skywind5487/hermes-agent@dev`
-- fork BASE_SHA: `35c8564c9c0af3d75bcbdf1d793e7207e5528f06` (the #14 merge commit)
+- fork source SHA: **`fa5ed679cc6559c619038f327e6276f4b7e8d735`**
+- fork `hermes_state.py` blob: **`ff2e072890a3879b3cfda09853a2068aa5766490`**
+- fork `hermes_state_search.py` blob: **`a9915780b257ee6ccc89cb09e67233fc0fb75e1e`**
 - upstream reference: `NousResearch/hermes-agent@main`
-- upstream reference SHA at audit time: `d5773bfc3ad32148f0ff2e1de975fc94e37a0335`
+- upstream SHA at this audit: **`fc9cbc872d8050c22f1192b16bc5ff4aed471e10`**
 
-Questions answered:
-
-1. Which read-only search/FTS paths still serialize behind `SessionDB._lock` for no correctness reason?
-2. Which reads must remain on the writer connection because they are transaction/schema-lifecycle coupled?
-3. Are the tokenizer and capability flags correct on every read connection for all six fork indexes?
-4. Which merged upstream implementation should #18 cherry-pick rather than reimplement?
-
-## Executive result
-
-The main FTS MATCH lanes are **already** routed through `_read_ctx()` on the pinned fork tree. #18 should therefore not be implemented as a broad “replace every FTS query” sweep.
-
-The remaining useful work is narrower and more concrete:
-
-1. **Import upstream's accepted bounded read-pool implementation first.** The current fork still retains one read-only connection per `(SessionDB × thread)`. Moving more reads to `_read_ctx()` before bounding this makes the FD-exhaustion exposure worse.
-2. **Move the remaining pure lookup/projection reads** that still take `self._lock`, especially `get_compression_tip()`. `list_sessions_rich()` already runs its main candidate/list query on `_read_ctx()`, then re-enters the writer lock once per compression-chain hop during tip projection.
-3. **Fix fork-only read-only capability parity:** `SessionDB(read_only=True)` loads `cjk_unicode61` for session CJK discovery but leaves message `_fts_cjk_available == False`, so cross-profile read-only message search cannot use `messages_fts_cjk` even when the index exists and is healthy.
-4. Preserve the conservative non-WAL fallback and transaction-coupled writer reads.
+Requesting issue: #18 — Move read-only FTS search paths onto SessionDB read connections.  
+Exploration issue: #39.  
+Related fork architecture: #12, #14, #27, #30.
 
 ---
 
-## Upstream cherry-pick audit
+## 查到什麼
 
-### Already present in `dev` — do not cherry-pick again
+### 1. Executive conclusion
 
-| upstream PR | merged commit | purpose | fork ancestry result |
-|---|---|---|---|
-| NousResearch/hermes-agent#73344 | `f228e145ba35cbbf785eded2021ae6682285b91b` | original WAL read-path split (`_get_read_conn` / `_read_ctx`) and main recall/search conversions | ancestor of `35c8564c`; already absorbed |
-| #76895 | `e38055a85e242dd999809155bf4f7d472508102d` | `SessionDB(read_only=True)` / dashboard read-only behavior and FTS capability probing | ancestor of `35c8564c`; already absorbed |
-| #77803 | `67d4bbb812cca491cde220b1e571cbaecc412681` | routes four session-resume/history reads through `_read_ctx()` | ancestor of `35c8564c`; already absorbed |
+**Verified:** #18 is no longer a broad “move FTS MATCH statements off the writer” task. The fork already absorbed the original upstream read-path split, and the principal message/session FTS candidate lanes already use `_read_ctx()`.
 
-These are design baseline / regression history, not pending imports.
+The implementation-ready delta is four ordered nodes:
 
-### Merged upstream and absent from fork — cherry-pick these first
+1. **A — import the accepted bounded read-connection pool first.** The fork still uses one permanent reader per `(SessionDB × thread)`. Sending more call sites through `_read_ctx()` before fixing lifetime increases descriptor exposure.
+2. **B — move the remaining pure search/lookup projection reads** off `self._lock`/`self._conn`, especially `get_compression_tip()` which reintroduces writer contention after the main session picker query has already used `_read_ctx()`.
+3. **C — fix fork-only `SessionDB(read_only=True)` message-CJK serving parity.** The read-only constructor can load `cjk_unicode61` and discovers session-CJK serving state, but never sets message `_fts_cjk_available`, so a healthy cross-profile read-only DB silently loses `messages_fts_cjk`.
+4. **D — add RED-first contention, lifecycle, and semantic regression coverage.** This must prove the target reads do not require the writer lock under WAL, while preserving the conservative non-WAL fallback and exact result semantics.
 
-Upstream PR #83406 is merged, but the PR is a **bundle** containing unrelated Desktop orphan-reap and runtime `nofile` work. Do **not** cherry-pick the whole PR merge.
+Dependency: **A → B/C → D**. B/C may be implemented independently after A; D closes both.
 
-The relevant accepted contributor commits are the first two commits of #83406, in this order:
+### 2. Current fork read-path baseline
 
-1. `9cc5c463404d18fc3c9628363a44c4e7d7cacd2c` — `state: pool SessionDB read connections instead of leaking one per (SessionDB x thread)`
-2. `5eaabc9e14d8784e7faf26b7491f9da5a73bc94a` — `state: bound PEAK read connections with a permit, not just pooled returns`
+**Verified from `dev@fa5ed679…`:**
 
-Both are required. The first replaces `threading.local()` + the unbounded strong set with a reusable LIFO pool. The second fixes an important flaw in the first revision: queue `maxsize=8` only bounded *returned idle* connections, while a cold burst could still open N simultaneous readers. The follow-up adds a lifetime `BoundedSemaphore`, so open + checked-out readers together are capped at 8; saturation degrades to the existing locked-writer fallback instead of risking `EMFILE`.
+- `SessionDB.__init__` still creates `threading.local()` plus a strong `_read_conns` set.
+- `_get_read_conn()` (`hermes_state.py:L2771…`) opens a `mode=ro` connection only when WAL is active and caches it for the life of that worker thread; failures become a sticky per-thread `failed` flag.
+- `_read_ctx()` (`hermes_state.py:L2824…`) yields that independent reader without `self._lock`, otherwise falls back to `with self._lock: yield self._conn`.
+- every writable-mode read connection applies the fork DB pragmas and loads `cjk_unicode61` when the writer loaded it.
+- `tests/test_session_db_read_path_split.py` still explicitly asserts the old per-thread contract (`test_read_conn_is_per_thread`, `test_read_conn_reused_within_thread`).
+- `tests/test_session_db_read_conn_pool.py` does **not** exist on fork `dev`.
 
-The second commit also closes two failure-path leaks relevant to this fork:
+This means the fork has the concurrency split but not the accepted lifecycle bound.
 
-- if loading the CJK extension fails after opening a read connection, close that partial connection;
-- release the read permit on non-`sqlite3.Error` failures so capacity cannot ratchet down permanently.
+### 3. Search/FTS inventory
 
-Recommended import attempt:
+#### Already on `_read_ctx()` — no conversion required
 
-```bash
-git cherry-pick 9cc5c463404d18fc3c9628363a44c4e7d7cacd2c
-git cherry-pick 5eaabc9e14d8784e7faf26b7491f9da5a73bc94a
-```
+**Verified:** the main read-only search paths already use the split connection, including:
 
-Expected conflict surface: `hermes_state.py` and read-path tests, because the fork has additional session-FTS capability state after the upstream commits diverged.
+- `messages_fts` Unicode MATCH;
+- message trigram and CJK candidate reads;
+- message LIKE fallback and the unindexed rebuild-gap supplement;
+- search-context enrichment reads;
+- `sessions_fts` Unicode metadata candidates;
+- `sessions_fts_trigram` normalized candidates;
+- `sessions_fts_cjk` candidates;
+- canonical metadata LIKE fallback / routed row-id candidate lookup;
+- `get_session()`, `get_session_by_title()`, and primary `list_sessions_rich()` SQL;
+- resume/history reads brought in by upstream #77803.
 
-Conflict-resolution constraints:
+So #18 should **not** touch these merely to produce churn.
 
-- preserve the fork's `apply_database_pragmas(conn, db_label="state.db")` on every newly opened read connection;
-- preserve all fork session-index capability fields (`_sessions_fts_available`, `_sessions_trigram_available`, `_sessions_cjk_worker_operable`, `_sessions_cjk_available`);
-- preserve the fork's CJK extension loading on every pooled read connection;
-- preserve attribution and the upstream two-commit sequence;
-- do not pull the later unrelated #83406 commits merely to make the cherry-pick easier.
+#### Remaining pure reads that are safe to move
 
-### Not accepted upstream — evidence only, not cherry-pick candidates
+All line numbers below are pinned to fork source SHA `fa5ed679…` / the blobs above.
 
-- #73803 remains open. It is useful prior art for broader handoff/read routing but is not an accepted upstream implementation.
-- #86608 (`discard poisoned read-conn on 'file is not a database'`) was closed without merge on 2026-08-15. Do not import it as “official”.
-- upstream issues #86515 and #86516 expose adjacent read-path hazards, but they are open issues, not merged fixes. Keep their cases as robustness test ideas / follow-ups rather than widening #18.
+| Priority | Seam | Current behavior | Why it belongs in #18 | Target |
+|---|---|---|---|---|
+| P0 | `hermes_state.py:L7678-L7737 :: SessionDB.get_compression_tip` | takes `self._lock` for every chain hop and reads `self._conn` | session picker/list projection already got candidates via `_read_ctx()`, then this helper re-enters the global writer convoy once per root/hop | one `_read_ctx()` lease for the walk; optional caller-owned `conn` helper if projection can share the snapshot |
+| P1 | `hermes_state_search.py:L1802… :: SessionDB.list_recent_user_messages` | writer lock + SELECT | `/rewind`/`/undo` are interactive picker/search-adjacent reads | `_read_ctx()` |
+| P1 | `hermes_state.py:L6752-L6777 :: SessionDB.resolve_session_id` prefix fallback | exact branch uses `get_session()` → `_read_ctx()`, prefix branch falls back to writer lock | one resolver currently has two different concurrency semantics | `_read_ctx()` |
+| P1 | `hermes_state.py:L7099… :: SessionDB._like_numbered_variants` | writer-lock LIKE fallback | fallback is entered exactly when FTS is unavailable/unsuitable; fallback must not reintroduce the convoy the FTS lane avoids | `_read_ctx()` |
+| P2 | `hermes_state.py:L6945-L6952 :: SessionDB.get_session_title` | writer-lock point lookup | pure projection read | `_read_ctx()` |
+| P2 | `hermes_state.py:L7635-L7676 :: SessionDB.get_next_title_in_lineage` read half | writer-lock SELECT of existing titles | pure read; the API already releases the lock before any later write, so moving it does not weaken an existing atomicity guarantee | `_read_ctx()`; atomic allocation+write is a different concern |
 
----
+The P0 finding is the high-value seam: an audit that only greps explicit `MATCH` SQL misses the convoy because the expensive re-lock happens in **projection after search**.
 
-## Pinned fork read-path baseline
+#### Must remain writer/transaction coupled
 
-### Current acquisition seam
+Do **not** mechanically replace every `self._lock`:
 
-`hermes_state.py:2771` — `_get_read_conn()`:
+- `get_meta()` when used by rebuild/write flows may need transaction-local/uncommitted state; a WAL reader only sees committed state.
+- `_fts_table_exists()` and schema/capability probes that run inside optimize/rebuild/teardown are coupled to mutation under the same writer critical section.
+- SELECTs inside `_execute_write()` callbacks are read-before-write transaction logic.
+- FTS `optimize`/`rebuild`/`merge`, DDL, `VACUUM`, and checkpoints are writes.
+- non-WAL, unknown-WAL, read-open failure, and pool-saturation paths must retain the locked writer fallback.
+- unrelated pure reads elsewhere in SessionDB are outside #18; do not turn this into a repository-wide lock refactor.
 
-- only creates a separate read connection when `_wal_active` and the instance itself is writable;
-- current implementation caches one connection in `threading.local()` and pins it in `self._read_conns` until `close()`;
-- opens `mode=ro` and applies `apply_database_pragmas()`;
-- loads `cjk_unicode61` when `_fts_cjk_loaded` is true.
+### 4. Fork-only read-only CJK capability gap
 
-`hermes_state.py:2824` — `_read_ctx()`:
+**Verified in `hermes_state.py:L2504…` (`SessionDB(read_only=True)` branch):**
 
-- WAL + available read connection: no `self._lock`;
-- non-WAL / read-open failure: shared writer connection under `self._lock`;
-- `SessionDB(read_only=True)`: `_get_read_conn()` deliberately returns `None`, so `_read_ctx()` uses that instance's already-read-only `_conn` under its own lock. This is fine; a read-only attach does not need a second read pool.
+The constructor SELECT-only probes:
 
-The non-WAL fallback is a correctness boundary and must remain conservative.
+- `messages_fts` → `_fts_enabled`;
+- `messages_fts_trigram` → `_trigram_available`;
+- `sessions_fts`;
+- canonical/owned/non-stale `sessions_fts_trigram`;
+- then loads `cjk_unicode61` onto **this read-only connection** and computes session-CJK serving availability, while correctly keeping `_sessions_cjk_worker_operable = False`.
 
----
+But `_fts_cjk_loaded` and `_fts_cjk_available` are initialized False and are never promoted for this read-only attach. Message CJK search gates on `_fts_cjk_available`, therefore cross-profile `SessionDB(read_only=True)` cannot serve a healthy `messages_fts_cjk` lane even when tokenizer loading succeeded.
 
-## Search/FTS inventory
+Required contract:
 
-### Already on `_read_ctx()` — no #18 conversion needed
+- “can serve CJK from this connection” is separate from “can mutate/build CJK indexes”;
+- read-only attach may advertise **message CJK serving** only after tokenizer + table + durable pending/stale checks succeed;
+- it must never advertise worker operability merely because the tokenizer loaded;
+- failure is fallback, not crash and not a false-positive capability;
+- ideally share a SELECT-only capability helper so writable pooled readers and read-only attach do not drift again.
 
-On the pinned fork, the principal search lanes already use `_read_ctx()`:
+This is fork-specific; upstream cannot directly solve it because upstream does not own the fork's three session-metadata FTS lanes.
 
-- ordinary `messages_fts` MATCH reads;
-- `messages_fts_trigram` reads;
-- `messages_fts_cjk` reads;
-- message LIKE fallback;
-- deferred message rebuild-gap supplement (`_search_unindexed_gap`);
-- search context enrichment reads;
-- session Unicode metadata candidates (`sessions_fts`);
-- session normalized trigram candidates (`sessions_fts_trigram`);
-- session CJK candidates (`sessions_fts_cjk`);
-- metadata canonical-LIKE fallback / routed row-id candidate lookup;
-- `get_session()` / `get_session_by_title()` and the primary `list_sessions_rich()` SQL;
-- resume/history paths previously converted by upstream #77803.
+### 5. Upstream prior art — accepted, superseded, and still open
 
-Therefore the remaining convoy is mostly in helpers wrapped around these lanes, not in the MATCH statements themselves.
+#### Already merged upstream **and already present in the fork**
 
-### Safe-to-move remaining reads
+| PR | State | Meaning for #18 |
+|---|---|---|
+| NousResearch/hermes-agent#73344 | merged | original `_get_read_conn()` / `_read_ctx()` split and major recall/search conversions; fork already absorbed it |
+| #76895 | merged | `SessionDB(read_only=True)`, read-only FTS probing, no read-only checkpoint; fork already absorbed and then extended it |
+| #77803 | merged | resume/history reads moved to `_read_ctx()`; fork already absorbed it |
 
-| priority | pinned source | function / read | current behavior | why safe / why it matters | recommended seam |
-|---|---|---|---|---|---|
-| P0 | `hermes_state.py:7678` | `get_compression_tip()` | each chain hop takes `self._lock` and queries writer `_conn` | pure SELECT; `list_sessions_rich()` calls it once per compression root and potentially multiple hops, so an otherwise lock-free picker/search re-enters the writer convoy in projection | run on `_read_ctx()`; preferably allow caller-supplied `conn` / `_get_compression_tip_on_conn()` so one projection snapshot can service all hops |
-| P1 | `hermes_state_search.py:1802` | `list_recent_user_messages()` | `self._lock` + writer SELECT | pure SELECT used by `/rewind` / `/undo` picker; interactive read can serialize behind unrelated writes | `_read_ctx()` |
-| P1 | `hermes_state.py:6752` | `resolve_session_id()` prefix fallback | exact lookup uses `get_session()` (`_read_ctx`), but prefix fallback returns to writer lock | pure bounded SELECT; inconsistent seam inside one resolver | `_read_ctx()` |
-| P1 | `hermes_state.py:7099` | `_like_numbered_variants()` | fallback title LIKE uses writer lock | pure SELECT and specifically runs when FTS is unavailable/failed; fallback should not reintroduce the convoy the FTS path avoided | `_read_ctx()`; optional caller `conn` if resolver wants one snapshot |
-| P2 | `hermes_state.py:6945` | `get_session_title()` | writer lock | pure point lookup | `_read_ctx()` |
-| P2 | `hermes_state.py:7635` | `get_next_title_in_lineage()` read half | writer lock around existing-title SELECT | pure SELECT. Existing API already releases the lock before any later title write, so moving this read does not weaken an atomicity guarantee that exists today | `_read_ctx()`; allocation+write atomicity would be a separate issue |
+No cherry-pick.
 
-Integrated hot spot: in `list_sessions_rich()` around the compression-tip projection block, the primary/pinned list queries already use `_read_ctx()`, then every compression root calls `get_compression_tip()`. This is the most important #39 finding because merely auditing explicit FTS MATCH statements would miss it.
+#### Accepted upstream **but absent from the fork**
 
-### Must stay on writer / transaction-coupled seam
+**#83406 is merged and its bounded pool is present in current upstream main `fc9cbc872…`.** Current main constructs `_read_pool = queue.LifoQueue(maxsize=_READ_POOL_MAX)`, a lifetime `BoundedSemaphore`, an instance-wide read-open backoff, and a checkout/return lifecycle. Past the cap, reads intentionally degrade to the locked writer connection instead of opening descriptor N+1.
 
-| surface | reason |
-|---|---|
-| `get_meta()` | accepted upstream design intentionally keeps this on `self._lock`: rebuild/write callers can need the writer connection's transaction-local/uncommitted state; a WAL reader sees committed state only |
-| `_fts_table_exists()` when invoked inside optimize/rebuild/teardown | capability/table-existence check is coupled to schema mutation under the same writer critical section; moving the probe to a different read snapshot can race the lifecycle it is validating |
-| SELECTs inside `_execute_write()` callbacks | they are read-before-write transaction logic (title uniqueness, session metadata update, deletion selection, rebuild state, etc.); keep them on the transaction connection |
-| FTS `optimize` / `rebuild` / `merge`, trigger/table DDL, `VACUUM`, WAL checkpoint | mutations, not read-path work |
-| non-WAL fallback | `_read_ctx()` must continue serializing on writer lock when WAL is not known active |
+The SessionDB part of the merged bundle preserves contributor commits that can be imported without dragging unrelated Desktop orphan/nofile work:
 
-Other pure locked reads exist elsewhere in `SessionDB` (Telegram bindings, cleanup counts, etc.), but they are outside #18's search/FTS scope. Do not turn #18 into a repository-wide SQLite lock refactor.
+1. `9cc5c463404d18fc3c9628363a44c4e7d7cacd2c` — pool SessionDB readers instead of one permanent reader per thread.
+2. `5eaabc9e14d8784e7faf26b7491f9da5a73bc94a` — bound **peak live** readers with a permit; fixes partial-open/permit leak paths.
 
----
+Both are required. Commit 1 alone bounds only returned idle connections; a cold N-reader burst can still open N simultaneously. Commit 2 is the load-bearing peak bound.
 
-## Six-index capability / tokenizer audit
+**Recommended import:** cherry-pick those two contributor commits in order, resolve fork-only FTS conflicts, and do not import the unrelated remainder of the #83406 bundle.
 
-Fork-owned search surfaces:
+Preserve during conflict resolution:
 
-1. message Unicode: `messages_fts`
-2. message trigram: `messages_fts_trigram`
-3. message CJK: `messages_fts_cjk` (`cjk_unicode61`, connection-local extension)
-4. session Unicode: `sessions_fts`
-5. session normalized trigram: `sessions_fts_trigram`
-6. session CJK: `sessions_fts_cjk` (`cjk_unicode61`, same connection-local extension)
+- `apply_database_pragmas(..., db_label="state.db")` on every reader;
+- all fork six-index capability state;
+- connection-local CJK tokenizer load;
+- non-WAL/read-open/pool-saturation locked-writer fallback;
+- contributor attribution and commit order.
 
-### Writable `SessionDB` + `_read_ctx()`
+#### Closed unmerged / superseded
 
-Current `_get_read_conn()` is mostly correct for tokenizer parity: each new mode=ro reader applies DB pragmas and, when the writer has `_fts_cjk_loaded`, loads `cjk_unicode61` onto that **specific** read connection. This requirement must survive the upstream pool cherry-pick because loadable FTS tokenizers are connection-local.
+| PR | Classification | Why not import directly |
+|---|---|---|
+| #76700 | closed, unmerged; **salvaged into merged #83406** | original pool implementation is provenance; #83406 is the accepted integration |
+| #81082 | closed, unmerged; explicitly **closed as superseded** | author states current main independently landed the same lifecycle fix and peak bound; no unique diff remained |
 
-Unicode61 and trigram do not require a separate loadable extension.
+These are useful design/test history, not current transplant targets.
 
-### `SessionDB(read_only=True)` gap
+#### Open / not accepted — evidence only
 
-The fork's read-only constructor currently:
+| PR | Current state at audit | Relevance |
+|---|---|---|
+| #73803 | open, unmerged | missed handoff reads and shared-writer error-state race; validates the structural rule but is outside #18 search scope |
+| #90734 | open, unmerged (2026-08-20) | fresher broader evidence: four unlocked reads on the shared writer can surface bare `SystemError` and kill a persisted turn; proposes `_read_ctx()` + a scoped retry defense |
+| #85255 | open, unmerged | pooled read connection poisoning (`file is not a database`) eviction; adjacent lifecycle robustness after the pool, not part of #18 |
+| #87044 | open, unmerged | conservative rule: unknown journal mode must not enable lock-free WAL pool; useful test idea, not accepted upstream yet |
 
-- probes `messages_fts` → `_fts_enabled`;
-- probes `messages_fts_trigram` → `_trigram_available`;
-- probes `sessions_fts`;
-- classifies/probes `sessions_fts_trigram` and its stale state;
-- loads `cjk_unicode61` into the read-only connection;
-- uses that local `cjk_loaded` to probe `sessions_fts_cjk`, while explicitly keeping `_sessions_cjk_worker_operable = False`.
+Do not cherry-pick an open PR merely because it is newer. For #18, current merged main plus the two preserved #83406 contributor commits are the authority.
 
-But it never promotes the **message** CJK serving flags. `_fts_cjk_loaded` / `_fts_cjk_available` start False and remain False on this branch. Search routing later gates `messages_fts_cjk` on `_fts_cjk_available`, so cross-profile `SessionDB(read_only=True)` silently loses the message-CJK lane even if the same connection successfully loaded the tokenizer and the table is healthy.
+### 6. RED-first validation map
 
-Required #18 behavior:
+Implementation must begin with tests that fail on `dev@fa5ed679…` for the intended reason.
 
-- distinguish **can serve this index on this read-only connection** from **can mutate/build/repair it**;
-- allow a healthy read-only connection to advertise message CJK *serving* capability after checking table + durable pending/stale state;
-- never mark a read-only attach as a CJK rebuild worker merely because it loaded the tokenizer;
-- preserve the existing `_sessions_cjk_worker_operable = False` discipline for read-only instances.
+#### A. Bounded-pool contract
 
-This is fork-specific; upstream main cannot be cherry-picked to solve it because upstream does not have the fork's three session metadata FTS surfaces.
+Carry/adapt the accepted upstream regression suite rather than writing weaker lookalikes:
 
----
+- 150 short-lived threads do not retain one reader per historical thread;
+- a simultaneous burst above `_READ_POOL_MAX` peaks at the cap, not N;
+- saturation uses locked-writer fallback instead of opening N+1;
+- pooled readers are exclusively leased and reusable cross-thread;
+- close drains idle readers; an in-flight return cannot repopulate a closed pool;
+- open failure backs off but can recover later;
+- CJK extension failure after open does not leak the connection/permit;
+- unexpected exceptions do not strand a permit;
+- fallback test patches the single checkout seam, not a helper that a warm pool can bypass.
 
-## Ordered implementation plan for #18
+The existing `test_read_conn_reused_within_thread` must be replaced with the post-pool contract (“successive `_read_ctx()` leases can reuse a connection”), not merely deleted.
 
-### Commit 1 — import the accepted bounded read pool
+#### B. Remaining convoy tests
 
-Cherry-pick, in order:
-
-- `9cc5c463404d18fc3c9628363a44c4e7d7cacd2c`
-- `5eaabc9e14d8784e7faf26b7491f9da5a73bc94a`
-
-Resolve only fork-divergence conflicts. Preserve fork pragmas and six-index state. Bring the upstream pool/peak-bound regression tests with the commits rather than rewriting equivalent tests from scratch.
-
-Rationale for ordering: #18 increases `_read_ctx()` usage. The fork's current per-thread strong-set design leaks retained reader connections by historical worker-thread count; fix the acquisition lifetime before sending more call sites through it.
-
-### Commit 2 — remove the remaining search/lookup writer convoys
-
-Convert the P0/P1/P2 pure reads in the table above. For compression projection, prefer a connection-aware helper rather than opening a fresh checkout on each hop:
-
-- `_get_compression_tip_on_conn(conn, session_id)` or `get_compression_tip(..., conn=None)`;
-- `list_sessions_rich()` may hold one read context / explicit snapshot for the projection group where practical;
-- avoid holding a read connection across unrelated Python work longer than needed.
-
-Do not touch transaction-coupled or non-search reads merely because they also use `self._lock`.
-
-### Commit 3 — complete read-only six-index serving parity
-
-Fix `SessionDB(read_only=True)` so message CJK capability is discovered and served safely, using the same durable stale / rebuild-pending semantics as the writable search surface. Keep read-only worker-operability false.
-
-If a shared helper can express “probe serving capability on this connection” without mutating schema, use it to prevent writable/read-only capability rules from drifting again.
-
-### Commit 4 — contention + semantic regressions / cleanup
-
-Add integrated tests, validation docs, and only then any small helper cleanup exposed by the preceding commits.
-
----
-
-## RED tests before implementation
-
-### A. Accepted upstream read-pool contract
-
-Carry upstream tests that prove:
-
-- 150 short-lived reader threads do not leave one reader pinned per historical thread;
-- 64 simultaneous readers peak at `_READ_POOL_MAX`, not 64;
-- pool saturation falls back to the writer connection rather than opening reader N+1;
-- `close()` drains idle readers and in-flight returns cannot repopulate a closed pool;
-- a failed read-only open backs off then self-heals;
-- CJK extension-load failure after open does not leak the connection / permit;
-- an unexpected exception does not strand a permit.
-
-### B. Writer-convoy RED unit tests
-
-Under WAL, manually hold `db._lock` from the test thread, launch another thread for each pure read, and assert the read finishes **while the writer lock is still held**:
+Under WAL, hold `db._lock` from thread A, execute each target read in thread B, and require completion **before releasing** the writer lock:
 
 - `resolve_session_id()` prefix case;
-- `_like_numbered_variants()`;
+- `_like_numbered_variants()` fallback;
 - `get_session_title()`;
+- `get_next_title_in_lineage()` read phase;
 - `list_recent_user_messages()`;
-- `get_next_title_in_lineage()`;
-- `get_compression_tip()`.
+- `get_compression_tip()` including multi-hop chain.
 
-The current pinned tree should block on these paths; the #18 implementation should not.
+For P0, add an integrated session-list/search projection test so a future edit cannot leave the explicit FTS query lock-free while reintroducing a lock in the compression-tip projection.
 
-### C. Integrated picker/projection convoy test
+#### C. Read-only capability parity
 
-Construct a surfaced compression root with a continuation tip and metadata that matches the picker query. Hold `db._lock`, call the searched `list_sessions_rich()` path from another thread, and assert it can complete and return the projected tip before releasing the writer lock.
+Build/seed a database with healthy message Unicode/trigram/CJK and session Unicode/trigram/CJK surfaces, reopen with `SessionDB(read_only=True)`, and assert:
 
-This catches the real regression #39 found: FTS candidates can already be lock-free while `get_compression_tip()` makes the end-to-end picker block anyway.
+- message CJK serving is available when tokenizer/table/state permit it;
+- message CJK search actually returns the CJK row (not merely a flag assertion);
+- read-only attach never marks session CJK worker operable;
+- missing tokenizer, pending rebuild, or stale breadcrumb fail closed to fallback;
+- no DDL/mutation occurs on the mode=ro connection.
 
-### D. Semantic parity tests
+#### D. Semantics and measurement
 
-For each converted helper, pin output semantics:
+Pin result equivalence before/after migration:
 
-- exact / unique-prefix / ambiguous-prefix session ID resolution;
-- numbered-title fallback rejects `"foo #bar"` and accepts integer `#N` continuations;
-- compression-tip child precedence remains unchanged;
-- `/rewind` recent-user list continues excluding bookkeeping `display_kind` rows and respecting `include_inactive`;
-- `get_next_title_in_lineage()` numbering is byte-for-byte unchanged.
+- exact/ambiguous prefix resolution;
+- numbered variant filtering (`#N`, not `#bar`), escaping `%`, `_`, `\\`;
+- compression-chain tip choice;
+- recent-user-message ordering/filtering;
+- read-your-committed-writes;
+- non-WAL locked fallback.
 
-### E. Six-index / connection-local CJK tests
-
-On a host where `cjk_unicode61` is available:
-
-1. create/populate the writable database and all applicable message/session indexes;
-2. reopen with `SessionDB(read_only=True)`;
-3. assert the six search-serving flags reflect healthy present indexes;
-4. run a CJK message query and compare returned IDs with the writable instance;
-5. borrow more than one pooled read connection and verify CJK MATCH works on each connection (tokenizer registration is connection-local).
-
-The CJK-specific test must skip cleanly when the extension is unavailable; absence of the optional extension is a supported degraded environment.
-
-### F. Non-WAL fallback guard
-
-Force / construct a non-WAL case. Holding the writer lock should still block `_read_ctx()` consumers; after release, results must match the WAL case. #18 must not turn “read-only” into “lock-free under every journal mode”.
+For the issue's performance criterion, measure writer latency/contention under concurrent search. A useful acceptance comparison is writer p50/p95/p99 with the target reads hammering in parallel, plus the pool-exhausted fallback arm. The research environment cannot execute the fork, so no new local benchmark number is claimed here.
 
 ---
 
-## Validation commands
+## 查不到什麼
 
-At minimum after implementation:
+1. **No fresh local runtime benchmark was produced.** This research pass has repository/PR access but not a checked-out GitHub worktree connected to the fork runtime. Upstream PR measurements are therefore treated as author-reported evidence, not re-labeled as our measurement.
+2. **Open upstream proposals are not authority.** #73803, #90734, #85255, and #87044 may change or close; their current bodies are useful failure evidence only.
+3. **No repository-wide `docs/research/README.md` / catalog exists on current `dev`.** `docs/research/` itself is the navigation surface. Therefore there is no canonical catalog file to update without inventing a new convention during this ticket.
 
-```bash
-scripts/run_tests.sh tests/test_session_db_read_conn_pool.py
-scripts/run_tests.sh tests/test_session_db_read_path_split.py
-scripts/run_tests.sh tests/test_hermes_state.py
-scripts/run_tests.sh tests/tools/test_session_search.py
-python scripts/check-windows-footguns.py hermes_state.py hermes_state_search.py tests/test_session_db_read_conn_pool.py tests/test_session_db_read_path_split.py
-git diff --check
+## 為什麼查不到
+
+- Executing contention/load tests requires a runnable checkout and platform SQLite behavior; the GitHub connector exposes source/history/PR state, not a runtime process.
+- Merge status is knowable and was checked directly; future disposition of open PRs is not.
+- The repo currently has research notes but no dedicated research index file, so “update catalog” is **not applicable** rather than silently skipped.
+
+---
+
+## 研究者自我檢驗
+
+- **Primary-source first:** current fork source, current upstream source, merged PRs/commits, and PR closure comments were checked directly.
+- **Freshness:** the upstream pin was refreshed on 2026-08-21 to `fc9cbc872…`; the old 2026-08-16 research pin is no longer used for upstream status.
+- **Absorption check:** #73344/#76895/#77803 are baseline, not work items; #83406 pool is absent from fork source; #76700/#81082 are not mistaken for merged authority.
+- **Scope check:** this does not broaden #18 into every locked SQLite read. Transaction/schema reads and unrelated surfaces remain out of scope.
+- **Fork-specific check:** six-index lifecycle research (#27/#33/#34 lineage) was read before deciding the read-only CJK capability rule; session-CJK worker-vs-serving separation is preserved.
+- **Test-quality check:** REDs assert behavior at the public/seam boundary (completion while writer lock is held, real CJK search result, peak simultaneous reader count), not tautological implementation details alone.
+- **Unknowns are explicit:** no local performance number is invented; open upstream work is marked unaccepted.
+
+---
+
+## 結論與下一步
+
+#18 is implementation-ready after `/recon` turns this research into pinned edit seams.
+
+Recommended change tree:
+
+```text
+A. Accepted bounded read pool (#83406 contributor commits)
+├── preserves six-index connection-local capability setup
+├── rewrites old per-thread tests into pool/peak tests
+└── enables safe expansion of _read_ctx usage
+    ├── B. Remaining pure search/projection reads
+    │   └── highest value: get_compression_tip projection convoy
+    └── C. read_only=True message-CJK serving parity
+        └── preserve worker-operable=false
+D. Integrated semantic + contention regressions
 ```
 
-Also run the fork's issue-specific session metadata FTS / picker suites touched by #14/#25/#26/#30, plus the new #18 regression file(s). Do not declare parity from upstream tests alone: upstream does not exercise the fork-only three session indexes.
+Implementation should proceed RED → GREEN in that order. Do **not** start by mass-replacing locks, and do **not** import open upstream proposals as if merged.
 
----
+### Backlinks / handoff
 
-## Explicit non-goals
-
-- no broad replacement of every `self._lock` in `SessionDB`;
-- no change to write-transaction reads;
-- no weakening of non-WAL fallback;
-- no resurrection of retired `simple` tokenizer paths;
-- no redesign of title-allocation atomicity;
-- no import of unrelated #83406 Desktop/runtime changes;
-- no cherry-pick of open or closed-unmerged upstream PRs merely because their patches look useful;
-- no handling of upstream #86515/#86516 beyond noting their risks / possible follow-up tests.
-
-## Bottom line
-
-#18 should be a **small seam-completion change built on a newer accepted upstream read-pool**, not a new FTS architecture. The fork already routes its six candidate/search lanes through `_read_ctx()`; the work left is (a) make `_read_ctx()` safe to use more broadly under long-running thread pools, (b) remove the lookup/projection convoy around those lanes, and (c) finish read-only CJK capability parity for the fork-only index set.
+- requesting issue: https://github.com/Skywind5487/hermes-agent/issues/18
+- exploration issue: https://github.com/Skywind5487/hermes-agent/issues/39
+- research PR: https://github.com/Skywind5487/hermes-agent/pull/94
+- spec path when requested: `/to-spec` should consume this file + `RECON FINAL @ fa5ed679cc6559c619038f327e6276f4b7e8d735`
+- ticket path when requested: `/to-tickets` should consume the same pinned recon; no additional research split is recommended
+- recon backlink: to be added as the #18 issue comment labelled `RECON FINAL @ fa5ed679cc6559c619038f327e6276f4b7e8d735`
