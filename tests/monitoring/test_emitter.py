@@ -35,10 +35,58 @@ def test_process_singleton_stays_dormant_until_subscribed():
         emitter.reset_emitter_for_tests()
 
 
+def test_subscribe_never_starts_dispatch_on_buffered_events():
+    """subscribe() must not start dispatch just because the queue is non-empty.
+
+    Regression for #114: a residual event buffered before any subscriber must
+    survive while gateway subscribers attach one at a time (span streamer
+    first, diagnostic streamer second). Starting dispatch from subscribe()
+    would dequeue it into a partial fan-out set and lose it.
+    """
+    em = MonitoringEmitter(enabled=False)
+    try:
+        em.emit_buffered({"event": "gateway_diagnostic", "name": "early"})
+        assert em.stats()["queued"] == 1
+        assert em._started is False
+
+        # First subscriber attaches with a non-empty queue — still no dispatch.
+        em.subscribe(lambda _batch: None)
+        assert em._started is False
+        assert em.stats()["queued"] == 1
+
+        # The first ordinary emit after subscribe starts dispatch and drains.
+        em.emit({"event": "gateway_health", "name": "snapshot"})
+        em.flush(timeout=1.0)
+        assert em.stats()["queued"] == 0
+    finally:
+        em.close()
 
 
+def test_flush_is_noop_before_dispatcher_starts():
+    """flush() must not wait when a subscriber exists but dispatch never ran.
 
+    Regression for #114: a partial startup path (buffered residual → subscriber
+    attached → initial snapshot never emitted) leaves the dispatcher unstarted.
+    flush() with a subscriber but no dispatcher would block on queue.join()
+    until the timeout, adding an artificial shutdown delay — fail-open requires
+    an instant no-op instead.
+    """
+    em = MonitoringEmitter(enabled=False)
+    try:
+        em.emit_buffered({"event": "gateway_diagnostic", "name": "early"})
+        em.subscribe(lambda _batch: None)
+        assert em._started is False
 
+        start = time.monotonic()
+        em.flush(timeout=2.0)
+        elapsed = time.monotonic() - start
+
+        # Buggy behavior blocks the full 2s timeout; a no-op returns instantly.
+        assert elapsed < 1.0
+        assert em.stats()["queued"] == 1
+        assert em._started is False
+    finally:
+        em.close()
 
 
 def test_unsubscribe_stops_delivery():
