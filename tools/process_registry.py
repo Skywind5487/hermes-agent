@@ -827,8 +827,35 @@ class ProcessRegistry:
         except Exception:
             return 2.0
 
+    @staticmethod
+    def _pid_gone_within(pid: int, wait: float = 2.0) -> bool:
+        """Confirm a PID is no longer alive within a bounded window.
+
+        Termination primitives (``taskkill``, ``os.kill``) can return without
+        the process having actually died yet — or fail silently while the
+        process stays alive.  This is the positive confirmation used by the
+        timeout-cleanup contract: ``True`` only when the PID is confirmed gone
+        (or a zombie, which is already dead).  ``wait`` bounds the poll so a
+        stubborn process cannot block the caller; callers must treat ``False``
+        as "termination not confirmed" and preserve recovery evidence.
+        """
+        import psutil
+
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            try:
+                proc = psutil.Process(pid)
+                if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                    return True
+            except psutil.NoSuchProcess:
+                return True
+            except Exception:
+                pass  # unknown liveness — keep polling (fail closed at deadline)
+            time.sleep(0.05)
+        return False
+
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
+    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> bool:
         """Terminate a host-visible PID and its descendants.
 
         ``expected_start`` is the kernel start time captured when we spawned the
@@ -869,6 +896,13 @@ class ProcessRegistry:
         bare-``os.kill`` fallback covers OSError / PermissionError on
         POSIX and a missing ``taskkill.exe`` on Windows (effectively
         unreachable on real Windows installs, but cheap insurance).
+
+        Returns:
+            True when the PID is confirmed terminated (no longer alive within
+            a bounded window, or a zombie); False when termination was
+            attempted but could not be confirmed.  Callers gated on the
+            timeout-cleanup invariant must treat ``False`` as failure and
+            preserve recovery evidence rather than deleting it.
         """
         if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
             # PID was recycled (start time changed) or is gone — never signal a
@@ -878,10 +912,10 @@ class ProcessRegistry:
                 "Refusing to terminate host pid %d: start-time mismatch — "
                 "PID was recycled onto an unrelated process.", pid,
             )
-            return
+            return False
         if _IS_WINDOWS:
             try:
-                subprocess.run(
+                result = subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     capture_output=True,
                     text=True, encoding='utf-8', errors='replace',
@@ -889,24 +923,30 @@ class ProcessRegistry:
                     creationflags=windows_hide_flags(),
                     stdin=subprocess.DEVNULL,
                 )
+                if result.returncode == 0:
+                    return cls._pid_gone_within(pid)
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (OSError, ProcessLookupError, PermissionError):
-                    pass
-            return
+                pass
+            # taskkill failed or is unavailable — fall back to a direct signal,
+            # then confirm whether the PID actually went away.
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError, PermissionError):
+                pass
+            return cls._pid_gone_within(pid)
 
         import psutil
         try:
             parent = psutil.Process(pid)
         except psutil.NoSuchProcess:
-            return
+            # Already gone — confirmed.
+            return True
         except (OSError, PermissionError):
             try:
                 os.kill(pid, signal.SIGTERM)
             except (OSError, ProcessLookupError, PermissionError):
                 pass
-            return
+            return cls._pid_gone_within(pid)
 
         # Snapshot the whole tree (children before parent) and SIGTERM each.
         try:
@@ -927,33 +967,36 @@ class ProcessRegistry:
         # grace window — a daemon stalled in its signal handler would otherwise
         # leak indefinitely.
         grace = cls._daemon_term_grace_seconds()
-        if grace <= 0:
-            return
-        # Sleep out the grace window, then independently re-probe every target
-        # and SIGKILL any survivor.  We deliberately do NOT trust
-        # ``psutil.wait_procs``'s gone/alive partition here: it reaps via
-        # ``Process.wait()`` and can mis-partition when a target transitions
-        # through a zombie state or when reaping is racy across a parent/child
-        # tree, which left survivors un-killed.  A direct liveness re-probe is
-        # deterministic.
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            if not any(cls._proc_alive(_p) for _p in targets):
-                break
-            time.sleep(0.05)
-        for proc in targets:
-            try:
-                if not cls._proc_alive(proc):
-                    continue
-                proc.kill()  # SIGKILL on POSIX
-                logger.info(
-                    "Escalated to SIGKILL for pid %d (ignored SIGTERM within "
-                    "%.1fs grace)", proc.pid, grace,
-                )
-            except psutil.NoSuchProcess:
-                pass
-            except (psutil.AccessDenied, OSError):
-                pass
+        if grace > 0:
+            # Sleep out the grace window, then independently re-probe every
+            # target and SIGKILL any survivor.  We deliberately do NOT trust
+            # ``psutil.wait_procs``'s gone/alive partition here: it reaps via
+            # ``Process.wait()`` and can mis-partition when a target
+            # transitions through a zombie state or when reaping is racy
+            # across a parent/child tree, which left survivors un-killed.
+            # A direct liveness re-probe is deterministic.
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                if not any(cls._proc_alive(_p) for _p in targets):
+                    break
+                time.sleep(0.05)
+            for proc in targets:
+                try:
+                    if not cls._proc_alive(proc):
+                        continue
+                    proc.kill()  # SIGKILL on POSIX
+                    logger.info(
+                        "Escalated to SIGKILL for pid %d (ignored SIGTERM within "
+                        "%.1fs grace)", proc.pid, grace,
+                    )
+                except psutil.NoSuchProcess:
+                    pass
+                except (psutil.AccessDenied, OSError):
+                    pass
+
+        # Confirmation: destructive cleanup must only proceed when the whole
+        # tree is confirmed gone (verified identity + successful termination).
+        return not any(cls._proc_alive(_p) for _p in targets)
 
     # ----- Spawn -----
 

@@ -341,6 +341,55 @@ def _get_command_timeout() -> int:
     return result
 
 
+# Whether a local browser daemon should be torn down immediately when its CLI
+# command times out.  This is intentionally opt-in: current upstream already
+# has daemon-side idle expiry plus periodic orphan reaping, while some users
+# prefer to keep a live session after a single slow command.
+_cached_terminate_daemon: Optional[bool] = None
+_terminate_daemon_resolved = False
+
+
+def _should_terminate_daemon_on_timeout() -> bool:
+    """Return the config-gated immediate timeout teardown policy.
+
+    ``browser.terminate_daemon_on_timeout`` defaults to false.  Single-profile
+    calls cache the result for the process lifetime; multiplexed profile turns
+    resolve their context-local config on each call.
+    """
+    global _cached_terminate_daemon, _terminate_daemon_resolved
+
+    # The profile multiplexer scopes config with a ContextVar while sharing
+    # this module. Never reuse another profile's timeout-cleanup policy.
+    if get_hermes_home_override() is not None:
+        return _resolve_terminate_daemon_on_timeout()
+
+    if _terminate_daemon_resolved:
+        return bool(_cached_terminate_daemon)
+
+    # Publish the value before the resolved flag, matching command-timeout
+    # cache ordering so concurrent readers never observe a half-filled cache.
+    _cached_terminate_daemon = _resolve_terminate_daemon_on_timeout()
+    _terminate_daemon_resolved = True
+    return _cached_terminate_daemon
+
+
+def _resolve_terminate_daemon_on_timeout() -> bool:
+    """Read the browser timeout-teardown toggle from the active config scope."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        return is_truthy_value(
+            cfg_get(cfg, "browser", "terminate_daemon_on_timeout"),
+            default=False,
+        )
+    except Exception as exc:
+        logger.debug(
+            "Could not read terminate_daemon_on_timeout from config: %s", exc
+        )
+    return False
+
+
 def _safe_command_timeout() -> int:
     """Like ``_get_command_timeout`` but guaranteed non-None.
 
@@ -2765,6 +2814,60 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _cleanup_local_browser_after_timeout(task_id: str, command: str) -> None:
+    """Immediately tear down only browser runtimes whose ownership is proven.
+
+    Ambiguous PID ownership is recovery state, not garbage: keep both the
+    socket directory and in-memory session metadata so the normal lifecycle or
+    periodic orphan reaper can make a later decision with more evidence.
+    """
+    if _is_local_sidecar_key(task_id):
+        session_keys = [task_id]
+    else:
+        session_keys = [task_id]
+        sidecar_key = f"{task_id}{_LOCAL_SUFFIX}"
+        with _cleanup_lock:
+            if sidecar_key in _active_sessions:
+                session_keys.append(sidecar_key)
+
+    for session_key in session_keys:
+        with _cleanup_lock:
+            session_info = _active_sessions.get(session_key)
+        if not session_info:
+            continue
+
+        try:
+            cleaned = _teardown_local_browser_runtime(
+                session_info, require_verified_ownership=True
+            )
+        except Exception as exc:
+            logger.warning(
+                "browser '%s' timed out — preserving session %s after "
+                "teardown error: %s",
+                command,
+                session_key,
+                exc,
+                exc_info=True,
+            )
+            continue
+
+        if not cleaned:
+            logger.warning(
+                "browser '%s' timed out — ownership is ambiguous for %s; "
+                "preserving recovery metadata",
+                command,
+                session_key,
+            )
+            continue
+
+        try:
+            _stop_cdp_supervisor(session_key)
+        finally:
+            _drop_browser_session_state(session_key)
+
+    _prune_last_active_browser_binding(task_id)
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -2988,6 +3091,28 @@ def _run_browser_command(
                 "success": False,
                 "error": _format_browser_timeout_error(command, timeout, stdout, stderr),
             }
+
+            # Preserve upstream's default timeout semantics unless the operator
+            # explicitly opts into immediate local teardown.  Build the timeout
+            # result first so cleanup failures (or socket removal) cannot erase
+            # captured stderr or mask the original diagnostic.
+            if (
+                _should_terminate_daemon_on_timeout()
+                and not session_info.get("cdp_url")
+            ):
+                try:
+                    _cleanup_local_browser_after_timeout(task_id, command)
+                except Exception as exc:
+                    # Defense in depth: the helper contains per-session errors,
+                    # but the timeout result must win even if a future cleanup
+                    # refactor introduces a new failure outside that boundary.
+                    logger.warning(
+                        "Error during browser timeout teardown for task %s: %s",
+                        task_id,
+                        exc,
+                        exc_info=True,
+                    )
+
             # Fall through to fallback check below
         else:
             with open(stdout_path, "r", encoding="utf-8") as f:
@@ -4879,6 +5004,96 @@ def _cleanup_old_recordings(max_age_hours=72):
 # Cleanup and Management Functions
 # ============================================================================
 
+def _drop_browser_session_state(session_key: str) -> None:
+    """Forget one session after its runtime is known to be gone."""
+    with _cleanup_lock:
+        _recording_sessions.discard(session_key)
+        _active_sessions.pop(session_key, None)
+        _session_last_activity.pop(session_key, None)
+
+
+def _prune_last_active_browser_binding(session_key: str) -> None:
+    """Drop a last-active binding only when its concrete session is gone."""
+    task_id = _bare_task_id_for_session_key(session_key)
+    with _cleanup_lock:
+        recorded_key = _last_active_session_key.get(task_id)
+        if not recorded_key:
+            return
+        session_info = _active_sessions.get(recorded_key)
+        if session_info and _session_info_owned_by_task(
+            session_info, task_id, recorded_key
+        ):
+            return
+        _last_active_session_key.pop(task_id, None)
+
+
+def _teardown_local_browser_runtime(
+    session_info: Dict[str, Any], *, require_verified_ownership: bool = False
+) -> bool:
+    """Kill a local daemon and remove its socket directory.
+
+    Normal cleanup keeps its established best-effort semantics. Timeout cleanup
+    sets ``require_verified_ownership`` and becomes fail-closed: missing,
+    malformed, unverified, or unsuccessfully terminated PIDs leave the socket
+    directory untouched for recovery/reaping evidence.
+    """
+    session_name = session_info.get("session_name", "")
+    if not session_name:
+        return not require_verified_ownership
+
+    socket_dir = os.path.join(
+        _socket_safe_tmpdir(), f"agent-browser-{session_name}"
+    )
+    if not os.path.exists(socket_dir):
+        return not require_verified_ownership
+
+    pid_file = os.path.join(socket_dir, f"{session_name}.pid")
+    if not os.path.isfile(pid_file):
+        if require_verified_ownership:
+            return False
+        shutil.rmtree(socket_dir, ignore_errors=True)
+        return True
+
+    try:
+        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        if require_verified_ownership:
+            return False
+        shutil.rmtree(socket_dir, ignore_errors=True)
+        return True
+
+    if require_verified_ownership and not _verify_reapable_browser_daemon(
+        daemon_pid, socket_dir, session_name
+    ):
+        return False
+
+    try:
+        from tools.process_registry import ProcessRegistry
+        terminated = ProcessRegistry._terminate_host_pid(daemon_pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        terminated = False
+    except Exception:
+        if require_verified_ownership:
+            return False
+        raise
+
+    # Verified ownership alone is not enough — the timeout contract also
+    # requires confirmed termination before recovery evidence is removed.
+    if require_verified_ownership and not terminated:
+        return False
+
+    if terminated:
+        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
+    else:
+        logger.debug(
+            "Could not kill daemon pid for %s (already dead or inaccessible)",
+            session_name,
+        )
+
+    shutil.rmtree(socket_dir, ignore_errors=True)
+    return True
+
+
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """
     Clean up browser session(s) for a task.
@@ -4902,27 +5117,26 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     # that includes the cloud/primary key + the local sidecar if one exists.
     if _is_local_sidecar_key(task_id):
         session_keys = [task_id]
-        bare_task_id = task_id[: -len(_LOCAL_SUFFIX)]
     else:
         session_keys = [task_id]
         sidecar_key = f"{task_id}{_LOCAL_SUFFIX}"
         with _cleanup_lock:
             if sidecar_key in _active_sessions:
                 session_keys.append(sidecar_key)
-        bare_task_id = task_id
 
     for session_key in session_keys:
         _cleanup_single_browser_session(session_key)
 
-    # Drop stale last-active ownership. Cleaning a bare task drops its binding;
-    # cleaning a sidecar drops the binding only if that sidecar was still the
-    # recorded owner. This prevents a later click/snapshot from resurrecting a
-    # cleaned sidecar on about:blank while preserving a primary-session binding.
+    # Drop stale last-active ownership.  Cleaning a bare task drops its
+    # binding; cleaning a sidecar drops the binding only if that sidecar was
+    # still the recorded owner.  This prevents a later click/snapshot from
+    # resurrecting a cleaned sidecar on about:blank while preserving a
+    # primary-session binding.
     if _is_local_sidecar_key(task_id):
-        if _last_active_session_key.get(bare_task_id) == task_id:
-            _last_active_session_key.pop(bare_task_id, None)
+        if _last_active_session_key.get(task_id[: -len(_LOCAL_SUFFIX)]) == task_id:
+            _last_active_session_key.pop(task_id[: -len(_LOCAL_SUFFIX)], None)
     else:
-        _last_active_session_key.pop(bare_task_id, None)
+        _last_active_session_key.pop(task_id, None)
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:
@@ -4976,10 +5190,8 @@ def _cleanup_single_browser_session(task_id: str) -> None:
             except Exception as e:
                 logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
-        # Now remove from tracking under lock
-        with _cleanup_lock:
-            _active_sessions.pop(task_id, None)
-            _session_last_activity.pop(task_id, None)
+        # The runtime is now on the normal cleanup path; forget its tracking.
+        _drop_browser_session_state(task_id)
 
         # Cloud mode: close the cloud browser session via provider API.
         # Local sidecars have bb_session_id=None so this no-ops for them.
@@ -4991,22 +5203,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
                 except Exception as e:
                     logger.warning("Could not close cloud browser session: %s", e)
 
-        # Kill the daemon process and clean up socket directory
-        session_name = session_info.get("session_name", "")
-        if session_name:
-            socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
-            if os.path.exists(socket_dir):
-                # agent-browser writes {session}.pid in the socket dir
-                pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-                if os.path.isfile(pid_file):
-                    try:
-                        from tools.process_registry import ProcessRegistry
-                        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
-                        ProcessRegistry._terminate_host_pid(daemon_pid)
-                        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
-                    except (ProcessLookupError, ValueError, PermissionError, OSError):
-                        logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
-                shutil.rmtree(socket_dir, ignore_errors=True)
+        _teardown_local_browser_runtime(session_info)
 
         logger.debug("Removed task %s from active sessions", task_id)
     else:
@@ -5034,6 +5231,7 @@ def cleanup_all_browsers() -> None:
     # Reset cached lookups so they are re-evaluated on next use.
     global _cached_agent_browser, _agent_browser_resolved
     global _cached_command_timeout, _command_timeout_resolved
+    global _cached_terminate_daemon, _terminate_daemon_resolved
     global _cached_chromium_installed
     global _cached_browser_engine, _browser_engine_resolved
     _cached_agent_browser = None
@@ -5043,6 +5241,8 @@ def cleanup_all_browsers() -> None:
     # reader never sees ``resolved=True`` with ``cache=None`` (#14331).
     _command_timeout_resolved = False
     _cached_command_timeout = None
+    _terminate_daemon_resolved = False
+    _cached_terminate_daemon = None
     _cached_chromium_installed = None
     global _chromium_autoinstall_attempted
     _chromium_autoinstall_attempted = False
