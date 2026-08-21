@@ -78,12 +78,25 @@ def apply_llm_request_middleware(
     request: Dict[str, Any],
     **context: Any,
 ) -> RequestMiddlewareResult:
-    """Apply registered LLM request middleware.
+    """Apply registered LLM request middleware transactionally.
 
-    Middleware may return ``{"request": {...}}`` to replace the effective
-    provider kwargs before Hermes sends them.
+    Callbacks run in registration order on isolated copies of the complete
+    provider request. A replacement commits only after it can be deep-copied.
+    If the original request cannot be isolated, middleware is skipped and the
+    original request is returned unchanged.
     """
-    if not _has_middleware(LLM_REQUEST_MIDDLEWARE):
+    # Plugin discovery is normally triggered as an import side effect of
+    # model_tools, but this seam must not depend on which surface imported
+    # Hermes first (dashboards, TUI slash workers, query mode, cron). Ensure
+    # first-use discovery has run before snapshotting callbacks so a
+    # configured plugin in a fresh process is not mistaken for "no middleware".
+    # discover_plugins() is idempotent.
+    from hermes_cli.plugins import discover_plugins
+
+    discover_plugins()
+
+    callbacks = _get_middleware_callbacks(LLM_REQUEST_MIDDLEWARE)
+    if not callbacks:
         return RequestMiddlewareResult(
             payload=request,
             original_payload=request,
@@ -91,22 +104,71 @@ def apply_llm_request_middleware(
             trace=[],
         )
 
-    original_request = _safe_copy(request)
-    current_request = _safe_copy(original_request)
+    try:
+        original_request = deepcopy(request)
+    except Exception as exc:
+        logger.warning(
+            "Middleware 'llm_request' skipped: request payload could not be "
+            "isolated transactionally: %s",
+            exc,
+        )
+        return RequestMiddlewareResult(
+            payload=request,
+            original_payload=request,
+            changed=False,
+            trace=[],
+        )
+
+    current_request = original_request
     trace: List[Dict[str, Any]] = []
 
-    for result in _invoke_middleware(
-        LLM_REQUEST_MIDDLEWARE,
-        request=current_request,
-        original_request=original_request,
-        **context,
-    ):
+    # ponytail: keep the transaction boundary inline until a second request
+    # chain actually needs the same abstraction.
+    for callback in callbacks:
+        try:
+            callback_request = deepcopy(current_request)
+            callback_original = deepcopy(original_request)
+        except Exception as exc:
+            logger.warning(
+                "Middleware 'llm_request' callback %s skipped: request payload "
+                "could not be isolated transactionally: %s",
+                getattr(callback, "__name__", repr(callback)),
+                exc,
+            )
+            continue
+
+        try:
+            result = callback(
+                **middleware_payload(
+                    **context,
+                    request=callback_request,
+                    original_request=callback_original,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Middleware 'llm_request' callback %s raised: %s",
+                getattr(callback, "__name__", repr(callback)),
+                exc,
+            )
+            continue
+
         if not isinstance(result, dict):
             continue
         next_request = result.get("request")
         if not isinstance(next_request, dict):
             continue
-        current_request = _safe_copy(next_request)
+
+        try:
+            current_request = deepcopy(next_request)
+        except Exception as exc:
+            logger.warning(
+                "Middleware 'llm_request' callback %s returned a request that "
+                "could not be isolated transactionally: %s",
+                getattr(callback, "__name__", repr(callback)),
+                exc,
+            )
+            continue
         trace.append(_trace_entry(result))
 
     return RequestMiddlewareResult(
