@@ -90,3 +90,25 @@ def _ensure_utf8():
 
 
 _ensure_utf8()
+
+
+def _install_runtime_observability_boundary() -> None:
+    """Install dormant process-lifetime residual diagnostics, fail-open.
+
+    ``hermes_cli`` is imported before the runtime components that #114
+    observes: the gateway imports ``hermes_cli.config`` during module startup,
+    and ``hermes_state`` imports ``hermes_cli.sqlite_runtime`` before SessionDB
+    construction. Installing the dormant handler here therefore closes the
+    pre-first-session startup gap without making observability a runtime
+    dependency or forcing configuration I/O at package import time.
+    """
+    try:
+        from .observability.runtime_observability import install
+
+        install()
+    except Exception:
+        # Import/bootstrap diagnostics can never decide whether Hermes starts.
+        pass
+
+
+_install_runtime_observability_boundary()
