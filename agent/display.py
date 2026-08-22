@@ -1332,6 +1332,71 @@ def _trim_error(msg: str) -> str:
     return msg
 
 
+def resolve_reasoning_max_lines(config: dict | None, surface_default: int) -> int:
+    """Resolve the effective reasoning display line cap.
+
+    Reads ``display.reasoning_max_lines`` from *config* (a resolved config
+    dict — CLI_CONFIG or gateway config) and returns the cap to use.
+
+    Semantics:
+      - key absent → *surface_default* (5/10/15 per surface)
+      - explicit ``0`` → unlimited (returns ``sys.maxsize``)
+      - positive int → that cap
+      - missing / invalid / negative / boolean → *surface_default*
+
+    This is the single production seam for reasoning_max_lines resolution.
+    Both CLI and gateway callers must use this function rather than
+    re-implementing the parsing logic.
+    """
+    if not config:
+        return surface_default
+    display = config.get("display", {}) if isinstance(config, dict) else {}
+    if not isinstance(display, dict):
+        return surface_default
+    raw = display.get("reasoning_max_lines")
+    if raw is None:
+        return surface_default
+    # bool is subclass of int — reject it explicitly
+    if isinstance(raw, bool):
+        return surface_default
+    # Accept int or integer-like string
+    if isinstance(raw, str):
+        try:
+            raw = int(raw)
+        except (ValueError, TypeError):
+            return surface_default
+    if not isinstance(raw, int):
+        return surface_default
+    if raw < 0:
+        return surface_default
+    if raw == 0:
+        return sys.maxsize
+    return raw
+
+
+def _truncate_reasoning_lines(text: str, max_lines: int, suffix_template: str) -> str:
+    """Truncate reasoning text to max_lines, appending a formatted suffix.
+
+    Pure formatting helper — does not escape code fences or apply any
+    other transformation. Callers compose this with escape_code_fences_for_display
+    as needed (truncate first, then escape).
+
+    Args:
+        text: Reasoning text (will be stripped).
+        max_lines: Maximum number of lines to keep.
+        suffix_template: Format string with {n} placeholder for remaining line count.
+
+    Returns:
+        Truncated text with suffix appended if truncation occurred, otherwise
+        the stripped input unchanged.
+    """
+    lines = text.strip().splitlines()
+    if len(lines) <= max_lines:
+        return text.strip()
+    kept = "\n".join(lines[:max_lines])
+    return kept + suffix_template.format(n=len(lines) - max_lines)
+
+
 def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
     """Inspect a tool result string for signs of failure.
 
