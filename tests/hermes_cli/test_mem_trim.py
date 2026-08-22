@@ -10,9 +10,18 @@ import hermes_cli.mem_trim as mem_trim
 @pytest.fixture(autouse=True)
 def _reset_trim_state(monkeypatch):
     monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 0.0)
+    monkeypatch.setattr(mem_trim, "_last_gc_monotonic", 0.0)
     monkeypatch.setattr(mem_trim, "_probe_done", True)
     monkeypatch.setattr(mem_trim, "_malloc_trim", None)
     monkeypatch.setattr(mem_trim, "_trim_call_count", 0)
+
+
+def _snapshot(rss_kib=4096, rss_anon_kib=3072):
+    return {
+        "rss_kib": rss_kib,
+        "rss_anon_kib": rss_anon_kib,
+        "thread_count": 3,
+    }
 
 
 def test_unsupported_allocator_is_noop_without_gc(monkeypatch):
@@ -54,6 +63,46 @@ def test_default_config_declares_memory_trim_controls():
     assert isinstance(settings["cooldown_seconds"], float)
 
 
+def test_config_policy_controls_have_safe_fallbacks(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "context": {
+                "memory_trim": {
+                    "enabled": True,
+                    "cooldown_seconds": "bad",
+                    "gc_cooldown_seconds": "bad",
+                    "threshold_mb": "bad",
+                    "log_every_n": "bad",
+                    "info_log_min_delta_mb": "bad",
+                }
+            }
+        },
+    )
+
+    assert mem_trim._config_settings() == (True, 60.0, 300.0, 1, 0.0, None)
+
+
+def test_config_policy_controls_accept_valid_values(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "context": {
+                "memory_trim": {
+                    "enabled": True,
+                    "cooldown_seconds": 30,
+                    "gc_cooldown_seconds": 180,
+                    "threshold_mb": 256,
+                    "log_every_n": 4,
+                    "info_log_min_delta_mb": 2.5,
+                }
+            }
+        },
+    )
+
+    assert mem_trim._config_settings() == (True, 30.0, 180.0, 4, 2.5, 256.0)
+
+
 def test_collect_memory_snapshot_parses_linux_proc_status(monkeypatch):
     # No ``sys.platform`` pin: the only platform check lives inside
     # ``_read_proc_status``, which is replaced below — the subject here is
@@ -84,18 +133,14 @@ def test_success_collects_then_trims(monkeypatch):
     assert mem_trim.trim_memory(reason="turn", cooldown_seconds=60) is True
     assert calls == ["gc", ("trim", 0)]
     assert mem_trim._last_trim_monotonic == 100.0
+    assert mem_trim._last_gc_monotonic == 100.0
 
 
 def test_success_logs_memory_snapshot_and_trim_result(monkeypatch, caplog):
     monkeypatch.setattr(mem_trim.gc, "collect", lambda: None)
     monkeypatch.setattr(mem_trim, "_malloc_trim", lambda _pad: 1)
     monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
-    snapshots = iter(
-        (
-            {"rss_kib": 4096, "rss_anon_kib": 3072, "thread_count": 3},
-            {"rss_kib": 2048, "rss_anon_kib": 1024, "thread_count": 3},
-        )
-    )
+    snapshots = iter((_snapshot(4096, 3072), _snapshot(2048, 1024)))
     monkeypatch.setattr(mem_trim, "collect_memory_snapshot", lambda: next(snapshots))
 
     with caplog.at_level("INFO", logger="hermes_cli.mem_trim"):
@@ -109,16 +154,14 @@ def test_success_logs_memory_snapshot_and_trim_result(monkeypatch, caplog):
 def test_force_logs_even_when_periodic_log_sampling_skips(monkeypatch, caplog):
     monkeypatch.setattr(mem_trim.gc, "collect", lambda: None)
     monkeypatch.setattr(mem_trim, "_malloc_trim", lambda _pad: 1)
-    monkeypatch.setattr(mem_trim, "_config_settings", lambda: (True, 0.0, 99, 1.0))
+    monkeypatch.setattr(
+        mem_trim, "_config_settings", lambda: (True, 0.0, 300.0, 99, 1.0, None)
+    )
     # Two ticks: the forced call comes after the 5s force floor so it runs
     # (the floor exists to coalesce burst closes, not to mute logging).
-    _ticks = iter([100.0, 110.0])
+    _ticks = iter([100.0, 100.0, 110.0, 110.0])
     monkeypatch.setattr(mem_trim.time, "monotonic", lambda: next(_ticks, 110.0))
-    monkeypatch.setattr(
-        mem_trim,
-        "collect_memory_snapshot",
-        lambda: {"rss_kib": 4096, "rss_anon_kib": 3072, "thread_count": 3},
-    )
+    monkeypatch.setattr(mem_trim, "collect_memory_snapshot", lambda: _snapshot())
 
     with caplog.at_level("INFO", logger="hermes_cli.mem_trim"):
         assert mem_trim.trim_memory(reason="periodic") is True
@@ -161,6 +204,106 @@ def test_config_cooldown_controls_rate_limit(monkeypatch):
     trim.assert_not_called()
 
 
+def test_rss_low_water_skips_without_consuming_attempt(monkeypatch):
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(
+        mem_trim, "_config_settings", lambda: (True, 0.0, 300.0, 1, 0.0, 300.0)
+    )
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        mem_trim, "collect_memory_snapshot", lambda: _snapshot(299 * 1024)
+    )
+
+    assert mem_trim.trim_memory(reason="housekeeping") is False
+    collect.assert_not_called()
+    trim.assert_not_called()
+    assert mem_trim._last_trim_monotonic == 0.0
+    assert mem_trim._last_gc_monotonic == 0.0
+
+
+def test_missing_rss_fails_open_through_low_water(monkeypatch):
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(
+        mem_trim, "_config_settings", lambda: (True, 0.0, 300.0, 1, 0.0, 300.0)
+    )
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        mem_trim,
+        "collect_memory_snapshot",
+        lambda: _snapshot(rss_kib=None, rss_anon_kib=None),
+    )
+
+    assert mem_trim.trim_memory(reason="housekeeping") is True
+    collect.assert_called_once_with()
+    trim.assert_called_once_with(0)
+
+
+def test_gc_cooldown_does_not_suppress_allocator_trim(monkeypatch):
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(mem_trim, "_last_gc_monotonic", 90.0)
+    monkeypatch.setattr(
+        mem_trim, "_config_settings", lambda: (True, 0.0, 300.0, 1, 0.0, None)
+    )
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(mem_trim, "collect_memory_snapshot", lambda: _snapshot())
+
+    assert mem_trim.trim_memory(reason="housekeeping") is True
+    collect.assert_not_called()
+    trim.assert_called_once_with(0)
+    assert mem_trim._last_trim_monotonic == 100.0
+    assert mem_trim._last_gc_monotonic == 90.0
+
+
+def test_force_bypasses_low_water_and_gc_cooldown(monkeypatch):
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(mem_trim, "_last_gc_monotonic", 99.0)
+    monkeypatch.setattr(
+        mem_trim, "_config_settings", lambda: (True, 60.0, 300.0, 1, 0.0, 900.0)
+    )
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        mem_trim, "collect_memory_snapshot", lambda: _snapshot(100 * 1024)
+    )
+
+    assert mem_trim.trim_memory(force=True, reason="close") is True
+    collect.assert_called_once_with()
+    trim.assert_called_once_with(0)
+
+
+def test_low_water_skip_does_not_block_following_forced_trim(monkeypatch):
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(
+        mem_trim, "_config_settings", lambda: (True, 60.0, 300.0, 1, 0.0, 300.0)
+    )
+    ticks = iter([100.0, 101.0, 101.0])
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: next(ticks, 101.0))
+    monkeypatch.setattr(
+        mem_trim, "collect_memory_snapshot", lambda: _snapshot(200 * 1024)
+    )
+
+    assert mem_trim.trim_memory(reason="housekeeping") is False
+    assert mem_trim._last_trim_monotonic == 0.0
+
+    assert mem_trim.trim_memory(force=True, reason="close") is True
+    collect.assert_called_once_with()
+    trim.assert_called_once_with(0)
+
+
 def test_legacy_environment_switch_does_not_control_behavior(monkeypatch):
     trim = Mock(return_value=1)
     monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
@@ -193,12 +336,10 @@ def test_force_floor_coalesces_burst_closes(monkeypatch):
     trim = Mock(return_value=1)
     monkeypatch.setattr(mem_trim.gc, "collect", collect)
     monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
-    monkeypatch.setattr(mem_trim, "_config_settings", lambda: (True, 0.0, 1, 0.0))
     monkeypatch.setattr(
-        mem_trim,
-        "collect_memory_snapshot",
-        lambda: {"rss_kib": 4096, "rss_anon_kib": 3072, "thread_count": 3},
+        mem_trim, "_config_settings", lambda: (True, 0.0, 300.0, 1, 0.0, None)
     )
+    monkeypatch.setattr(mem_trim, "collect_memory_snapshot", lambda: _snapshot())
     monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 0.0)
 
     # t=100: first forced close runs.
