@@ -1,0 +1,315 @@
+{
+  "intents": {
+    "capability:session-fts-storage-v2": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_fts_storage_v2_settlement.py.",
+        "Frozen upstream has no session six-index storage-v2 settlement state machine."
+      ],
+      "behavioral_contracts": [
+        "One predicate defines required-index settlement; startup and foreground paths use it.",
+        "Incomplete or interrupted required settlement refuses serving; reopen/resume reaches an explicit terminal state.",
+        "Optional indexes do not silently become required blockers."
+      ]
+    },
+    "capability:session-fts-lifecycle": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_fts_lifecycle_registry.py.",
+        "Frozen upstream has message FTS primitives but no equivalent session six-index lifecycle boundary."
+      ],
+      "behavioral_contracts": [
+        "The registry covers messages_fts, messages_fts_trigram, messages_fts_cjk, sessions_fts, sessions_fts_cjk, and sessions_fts_trigram.",
+        "Maintenance, health, read-only discovery, repair, and degraded runtime iterate the same descriptors.",
+        "Unknown or incomplete trigger state fails closed for serving."
+      ]
+    },
+    "non-capability:production-evidence": {
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "evidence": [
+        "Survives as docs/research and research/recovery artifacts.",
+        "No code-level equivalence is claimed from operational documents."
+      ],
+      "behavioral_contracts": [
+        "Operational records remain durable evidence and are not mistaken for code-level equivalence."
+      ]
+    },
+    "capability:session-search-routing": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_search.py, web session/profile routers, desktop picker code and routing tests.",
+        "Frozen upstream has session ID/title primitives but no equivalent metadata-index router."
+      ],
+      "behavioral_contracts": [
+        "Unicode, CJK, and infix queries select their intended index; LIKE is bounded fallback.",
+        "FTS narrows IDs before lineage hydration; only empty successful FTS triggers fallback.",
+        "Visibility, archive/pin/source filters, lineage, branch markers, whole-store scope, and limits remain correct."
+      ]
+    },
+    "capability:headroom-retrieval": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in plugins/headroom, tools_config.py, plugin.yaml and plugin tests.",
+        "No equivalent retrieval tool is present in frozen upstream."
+      ],
+      "behavioral_contracts": [
+        "The retrieval tool has a stable schema.",
+        "It is auto-enabled only when compression is active and returns bounded context.",
+        "Registration failures are explicit and warning-visible."
+      ]
+    },
+    "capability:session-fts-cjk": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_session_metadata_cjk_fts.py.",
+        "Frozen upstream has no session CJK metadata index or equivalent optional lifecycle."
+      ],
+      "behavioral_contracts": [
+        "CJK search covers title, id, and display_name through external-content FTS.",
+        "Unavailable tokenizer/index state degrades safely without hiding the base path.",
+        "Guard and MATCH run against one SQLite snapshot; rebuild is independent and resumable."
+      ]
+    },
+    "non-capability:integration-merge": {
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "evidence": [
+        "Integrated behavior is represented by capability records on either side.",
+        "Merge topology is provenance, not semantic upstream evidence."
+      ],
+      "behavioral_contracts": [
+        "A merge event is not silently omitted merely because it has no patch-id or changed-file payload."
+      ]
+    },
+    "capability:lifecycle-sqlite-telemetry": {
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "medium",
+      "evidence": [
+        "Survives across lifecycle_telemetry.py, sqlite_native_telemetry.py, turn_context.py, gateway code and tests.",
+        "Frozen upstream comparison was not completed per telemetry surface; absence is not treated as proof."
+      ],
+      "behavioral_contracts": [
+        "Important boundaries emit structured telemetry rather than only ad-hoc logs.",
+        "SQLite lock/owner and stream/tool failures remain diagnosable."
+      ]
+    },
+    "capability:session-fts-simple-eol": {
+      "upstream_status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py sanitizer/repair logic and the #19/#87 research and tests.",
+        "Frozen upstream has no load_simple_extension/simple-tokenizer compatibility shim; the legacy debt is already absent there."
+      ],
+      "behavioral_contracts": [
+        "Supported post-#12 databases do not require simple-tokenizer loading or repair branches.",
+        "Unsupported legacy residue is sanitized or rejected explicitly rather than silently kept writable.",
+        "Modern trigram/CJK lifecycle remains the canonical path."
+      ]
+    },
+    "capability:session-fts-trigram": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py and tests/test_session_metadata_trigram_fts.py.",
+        "Frozen upstream has no sessions_fts_trigram external-content index; generic message trigram is not equivalent."
+      ],
+      "behavioral_contracts": [
+        "The external-content source normalizes title/display_name and keeps raw id searchable.",
+        "Serving requires complete trigger/namespace ownership; unknown same-name objects fail closed.",
+        "Recovery markers support resumable rebuild without treating a partial index as healthy."
+      ]
+    },
+    "capability:session-search-lineage": {
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "SPLIT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state_search.py and session-search tools/tests, including bounded winner hydration.",
+        "Frozen upstream has _lineage_root_id/basic lookup but not the stronger resolver, memo, B-boundary, or explicit truncation contract."
+      ],
+      "behavioral_contracts": [
+        "Only positive compression edges are followed; branch/delegate markers and tool children do not become roots.",
+        "Missing/cyclic lineage fails closed; query-local memo/path compression is bounded by B=2000 successful uncached row fetches.",
+        "B exhaustion returns truncated/warning without poisoned memo; one snapshot, early-K and deferred hydration are preserved."
+      ]
+    },
+    "capability:headroom-compression": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in plugins/headroom, tools_config.py, plugin.yaml, pyproject.toml/uv.lock and plugin tests.",
+        "Frozen upstream has no headroom ContentRouter/SmartCrusher implementation."
+      ],
+      "behavioral_contracts": [
+        "Compression activates only at configured thresholds and does not expand tool-result metadata.",
+        "Failures degrade with warning/logging and preserve usable content.",
+        "Plugin registration and schema remain valid when active."
+      ]
+    },
+    "capability:request-transform-hook": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in agent/conversation_loop.py, hermes_cli/hooks.py, hermes_cli/plugins.py and run-agent tests.",
+        "Frozen upstream has pre_llm_call but not a full-payload transform hook at dispatch."
+      ],
+      "behavioral_contracts": [
+        "transform_api_request receives and returns the complete payload at a documented boundary.",
+        "The hook is optional and preserves the request when absent.",
+        "Hook errors are explicit and do not dispatch partial data."
+      ]
+    },
+    "capability:session-fts-unicode": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py, hermes_state_schema.py, hermes_state_search.py, hermes_cli/session_recovery.py and tests/test_session_metadata_fts.py.",
+        "Frozen upstream has messages_fts but no equivalent sessions_fts metadata index."
+      ],
+      "behavioral_contracts": [
+        "Stable sessions.row_id is retained across hidden rows and gaps.",
+        "External-content FTS indexes title, id, and display_name with resumable high-water backfill.",
+        "Backfill and triggers preserve delete correctness and never expose hidden sessions."
+      ]
+    },
+    "capability:outbound-code-fence-safety": {
+      "upstream_status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "evidence": [
+        "Survives in gateway/stream_consumer.py and Discord adapter/tests.",
+        "Frozen upstream already has escape_code_fences_for_display, ensure_closed_code_fences, and chunk balancing with equivalent behavior."
+      ],
+      "behavioral_contracts": [
+        "Untrusted backticks are escaped before outer wrapping.",
+        "Chunk balancing and truncation close open triple-backtick and inline-code spans.",
+        "Discord edit/truncation preserves the same user-visible balance guarantee."
+      ]
+    },
+    "non-capability:incidental-hardening": {
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "medium",
+      "evidence": [
+        "Record-specific survival is visible in the frozen tree.",
+        "No equivalence claim is made without focused comparison."
+      ],
+      "behavioral_contracts": [
+        "The safety invariant remains visible in record subject/files while capability ownership is unresolved."
+      ]
+    },
+    "non-capability:performance-validation": {
+      "upstream_status": "NEEDS_REVIEW",
+      "disposition": "NEEDS_REVIEW",
+      "confidence": "high",
+      "evidence": [
+        "Benchmark and query-shape changes remain visible in history.",
+        "No upstream equivalence is inferred from local measurements."
+      ],
+      "behavioral_contracts": [
+        "A benchmark supports a decision but does not prove equivalence or impose an unreviewed target."
+      ]
+    },
+    "capability:configurable-reasoning-display": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in cli.py/config parsing and gateway display code.",
+        "Frozen upstream hardcodes the first 15 lines and has no reasoning_max_lines seam."
+      ],
+      "behavioral_contracts": [
+        "reasoning_max_lines controls display truncation.",
+        "Invalid or absent configuration falls back safely.",
+        "Fence escaping remains applied before wrapping."
+      ]
+    },
+    "capability:browser-timeout-cleanup": {
+      "upstream_status": "FORK_ONLY",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in tools/browser_tool.py and timeout cleanup/daemon tests.",
+        "Frozen upstream has timeout cleanup/orphan reaping but not terminate_daemon_on_timeout configuration behavior."
+      ],
+      "behavioral_contracts": [
+        "Timeout cleanup clears in-memory browser state in a finally-equivalent path.",
+        "Daemon termination is opt-in/config-gated.",
+        "Cleanup failures are contained and test-covered."
+      ]
+    },
+    "capability:session-title-safety": {
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "SPLIT",
+      "confidence": "high",
+      "evidence": [
+        "Survives in hermes_state.py, hermes_state_common.py and title/metadata tests.",
+        "Frozen upstream escapes LIKE but does not enforce the fork's strict numeric suffix filter."
+      ],
+      "behavioral_contracts": [
+        "Escape SQL LIKE literals independently from Python literals.",
+        "Only strict ASCII #N suffixes are variants; %, _, \\, #, CJK, and literal titles stay exact and safe.",
+        "The public resolution API and root/current exclusion semantics remain unchanged."
+      ]
+    },
+    "capability:cron-nul-safety": {
+      "upstream_status": "SEMANTIC_UPSTREAM",
+      "disposition": "DROP",
+      "confidence": "high",
+      "evidence": [
+        "Survives in cron/lifecycle_guard.py and tools/terminal_tool.py.",
+        "Frozen upstream contains the corresponding NUL/binary-safe guard and terminal fallback."
+      ],
+      "behavioral_contracts": [
+        "NUL-bearing input does not reach unsafe process/lifecycle calls.",
+        "Terminal fallback returns a clear failure rather than truncating at NUL."
+      ]
+    },
+    "capability:memory-trim-policy": {
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "PORT",
+      "confidence": "high",
+      "evidence": [
+        "Frozen fork hermes_cli/mem_trim.py adds threshold_mb and gc_cooldown_seconds policy gates.",
+        "Frozen upstream hermes_cli/mem_trim.py has a general trim cooldown but no RSS low-water gate or independent GC cooldown."
+      ],
+      "behavioral_contracts": [
+        "RSS below threshold_mb skips the expensive trim work on housekeeping ticks.",
+        "gc.collect() runs at most once per gc_cooldown_seconds while malloc_trim remains eligible on the normal trim cadence.",
+        "Force behavior and invalid configuration retain explicit safe fallbacks."
+      ]
+    },
+    "capability:memory-trim-diagnostics": {
+      "upstream_status": "PARTIAL_UPSTREAM",
+      "disposition": "KEEP",
+      "confidence": "medium",
+      "evidence": [
+        "Frozen fork splits gc_ms and trim_ms, records VmSwap, and measures malloc_info fragmentation.",
+        "Frozen upstream has basic RSS/RssAnon snapshots and trim logging but not the fork's attribution diagnostics."
+      ],
+      "behavioral_contracts": [
+        "gc_ms versus trim_ms identifies the freeze mechanism without changing the policy decision.",
+        "Fragmentation and VmSwap are best-effort diagnostics and never block memory recovery."
+      ]
+    }
+  }
+}
