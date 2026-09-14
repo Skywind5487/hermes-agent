@@ -107,6 +107,12 @@ class ContextEngine(ABC):
     context_length: int = 0
     compression_count: int = 0
 
+    # Optional result status set by ``compress()`` for the current attempt.
+    # The host clears it before dispatch, so a plugin-reported ``"noop"``
+    # cannot suppress a later successful compression transition. Older engines
+    # may expose the same status as ``_last_compression_status``.
+    last_compression_status: str = ""
+
     # -- Compaction parameters (read by run_agent.py for preflight) --------
     #
     # These control the preflight compression check.  Subclasses may
