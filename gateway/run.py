@@ -17586,7 +17586,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _show_reasoning_effective and response and not _intentional_silence:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
-                    from gateway.stream_consumer import escape_code_fences_for_display
+                    from gateway.stream_consumer import (
+                        escape_code_fences_for_display,
+                        escape_markdown_inline,
+                    )
                     # Collapse long reasoning to keep messages readable
                     lines = last_reasoning.strip().splitlines()
                     if len(lines) > 15:
@@ -17608,11 +17611,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         _reasoning_style = "code"
                     if _reasoning_style == "subtext":
+                        # Escape inline markdown first: a stray ``` or mention
+                        # inside the reasoning body would render and break the
+                        # subtext formatting (#128945 family).
+                        display_reasoning = escape_markdown_inline(display_reasoning)
                         _quoted = "\n".join(
                             f"-# {ln}" if ln else "-#" for ln in display_reasoning.splitlines()
                         )
                         response = f"-# 💭 Reasoning\n{_quoted}\n\n{response}"
                     elif _reasoning_style == "blockquote":
+                        display_reasoning = escape_markdown_inline(display_reasoning)
                         _quoted = "\n".join(
                             f"> {ln}" if ln else ">" for ln in display_reasoning.splitlines()
                         )

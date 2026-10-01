@@ -56,6 +56,37 @@ _COMMENTARY = object()
 _FLUSH = object()
 
 
+def escape_markdown_inline(text: str) -> str:
+    """Escape inline Discord markdown so reasoning renders as literal text.
+
+    A ``-# `` (subtext) or ``> `` (blockquote) prefix only styles the LINE —
+    inline markdown inside the line still renders normally.  Reasoning text
+    routinely contains ``` (6 of the last 8 assistant turns on this host), and
+    a stray fence opens a code block that swallows the rest of the message,
+    destroying the subtext formatting.  Bold markers, spoilers and user
+    mentions leak the same way.  Escape the characters Discord treats as
+    markup so the reasoning body shows as plain text.
+
+    ``<@``/``<#``/``<:`` are neutralised with a zero-width space rather than a
+    backslash: Discord does not reliably honour backslash escapes for mention
+    syntax, and an unescaped mention both renders as a pill and pings the user.
+
+    Returns:
+        The input text with markdown delimiters escaped.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    # Backslash first, otherwise the escapes we add get escaped again.
+    text = text.replace("\\", "\\\\")
+    for _ch in ("`", "*", "_", "~", "|"):
+        text = text.replace(_ch, "\\" + _ch)
+    # Zero-width space after '<' breaks mention/channel/emoji syntax without
+    # adding a visible glyph.
+    for _seq in ("<@", "<#", "<:"):
+        text = text.replace(_seq, "<\u200b" + _seq[1:])
+    return text
+
+
 def escape_code_fences_for_display(text: str) -> str:
     """Escape triple-backtick markers so text can be safely wrapped
     inside an outer ``` code block without breaking the fence.
